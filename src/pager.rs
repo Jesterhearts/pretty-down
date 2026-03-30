@@ -243,10 +243,11 @@ pub fn run(
 
     let mut scroll_offset: usize = 0;
     let mut needs_redraw = true;
+    let mut scrolled_down = false; // track if last action was downward
 
     loop {
         if needs_redraw {
-            draw_screen(
+            let overflow = draw_screen(
                 &mut stdout,
                 &lines,
                 scroll_offset,
@@ -254,6 +255,22 @@ pub fn run(
                 term_rows,
                 watching,
             );
+            // After a downward scroll, if a sixel caused auto-scroll,
+            // advance scroll_offset to account for the rows that were
+            // pushed off screen. Don't redraw — the screen already
+            // shows the correct post-scroll state.
+            if scrolled_down && overflow > 0 {
+                let mut rows_to_skip = overflow;
+                while rows_to_skip > 0 && scroll_offset < lines.len() {
+                    let r = lines[scroll_offset].rows();
+                    if r > rows_to_skip {
+                        break;
+                    }
+                    scroll_offset += 1;
+                    rows_to_skip -= r;
+                }
+            }
+            scrolled_down = false;
             needs_redraw = false;
         }
 
@@ -310,13 +327,16 @@ pub fn run(
                     code: KeyCode::Esc, ..
                 } => break,
 
+                // Scroll down
                 KeyEvent {
                     code: KeyCode::Char('j') | KeyCode::Down,
                     ..
                 } => {
                     scroll_offset = advance_lines(&lines, scroll_offset, 1);
+                    scrolled_down = true;
                     needs_redraw = true;
                 }
+                // Scroll up
                 KeyEvent {
                     code: KeyCode::Char('k') | KeyCode::Up,
                     ..
@@ -324,6 +344,7 @@ pub fn run(
                     scroll_offset = retreat_lines(scroll_offset, 1);
                     needs_redraw = true;
                 }
+                // Half page down
                 KeyEvent {
                     code: KeyCode::Char('d'),
                     modifiers: KeyModifiers::CONTROL,
@@ -339,8 +360,10 @@ pub fn run(
                 } => {
                     let half = (viewport_rows / 2) as usize;
                     scroll_offset = advance_lines(&lines, scroll_offset, half);
+                    scrolled_down = true;
                     needs_redraw = true;
                 }
+                // Half page up
                 KeyEvent {
                     code: KeyCode::Char('u'),
                     modifiers: KeyModifiers::CONTROL,
@@ -358,6 +381,7 @@ pub fn run(
                     scroll_offset = retreat_lines(scroll_offset, half);
                     needs_redraw = true;
                 }
+                // Top
                 KeyEvent {
                     code: KeyCode::Char('g'),
                     ..
@@ -369,6 +393,7 @@ pub fn run(
                     scroll_offset = 0;
                     needs_redraw = true;
                 }
+                // Bottom
                 KeyEvent {
                     code: KeyCode::Char('G'),
                     ..
@@ -377,13 +402,16 @@ pub fn run(
                     code: KeyCode::End, ..
                 } => {
                     scroll_offset = scroll_to_end(&lines, viewport_rows);
+                    scrolled_down = true;
                     needs_redraw = true;
                 }
+                // Space = page down
                 KeyEvent {
                     code: KeyCode::Char(' '),
                     ..
                 } => {
                     scroll_offset = advance_lines(&lines, scroll_offset, viewport_rows as usize);
+                    scrolled_down = true;
                     needs_redraw = true;
                 }
                 KeyEvent {
@@ -430,6 +458,9 @@ pub fn print_output(output: &RenderOutput) {
 }
 
 /// Draw the current view.
+///
+/// Returns the number of rows the terminal auto-scrolled due to a sixel
+/// image overflowing the viewport (0 if no overflow occurred).
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
@@ -437,7 +468,7 @@ fn draw_screen(
     viewport_rows: u16,
     term_rows: u16,
     watching: bool,
-) {
+) -> u16 {
     // Begin synchronized update — terminal buffers all output until the
     // matching end sequence, eliminating flicker.
     write!(stdout, "\x1b[?2026h").unwrap();
@@ -495,6 +526,8 @@ fn draw_screen(
     // End synchronized update — terminal flushes the buffered frame at once.
     write!(stdout, "\x1b[?2026l").unwrap();
     stdout.flush().unwrap();
+
+    rows_used.saturating_sub(viewport_rows)
 }
 
 fn advance_lines(
