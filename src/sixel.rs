@@ -233,7 +233,8 @@ pub fn encode_image_file_async(
     })
 }
 
-/// Synchronous image encoding (used by block HTML).
+/// Synchronous image encoding.
+#[allow(dead_code)]
 pub fn encode_image_file(
     path: &std::path::Path,
     max_width: u32,

@@ -36,6 +36,7 @@ enum ImageGroup {
 }
 
 /// A display line.
+#[derive(Clone)]
 enum Line {
     /// A regular text line (may contain ANSI escapes).
     Text(String),
@@ -193,7 +194,153 @@ fn flatten_blocks(
         lines.pop();
     }
 
+    merge_side_by_side_images(&mut lines);
+
     lines
+}
+
+/// Merge consecutive ImageRow groups into side-by-side preview rows.
+/// Detects runs of ImageRow lines from different groups (separated only by
+/// whitespace-only Text lines) and concatenates their preview texts.
+fn merge_side_by_side_images(lines: &mut Vec<Line>) {
+    let mut i = 0;
+    while i < lines.len() {
+        // Find start of an ImageRow group
+        let Some(first_group) = (match &lines[i] {
+            Line::ImageRow {
+                group,
+                row_in_group: 0,
+                ..
+            } => Some(*group),
+            _ => None,
+        }) else {
+            i += 1;
+            continue;
+        };
+
+        // Count rows in the first group
+        let first_start = i;
+        let first_rows = count_group_rows(&lines[i..], first_group);
+        let end = first_start + first_rows;
+
+        // Look for adjacent image groups (skip whitespace-only text between)
+        let mut adjacent_groups: Vec<(ImageGroup, usize, usize)> = vec![];
+        // (group, start_in_lines, row_count)
+
+        let mut scan = end;
+        while scan < lines.len() {
+            // Skip single whitespace-only text lines (same markdown line)
+            // but NOT empty lines (which indicate a line break)
+            if let Line::Text(t) = &lines[scan] {
+                if !t.is_empty() && t.trim().is_empty() {
+                    scan += 1;
+                    continue;
+                }
+                break; // Empty line or non-whitespace text — stop
+            }
+            // Check for another ImageRow group start
+            if let Line::ImageRow {
+                group,
+                row_in_group: 0,
+                ..
+            } = &lines[scan]
+            {
+                if *group == first_group {
+                    break;
+                }
+                let g = *group;
+                let g_start = scan;
+                let g_rows = count_group_rows(&lines[scan..], g);
+                adjacent_groups.push((g, g_start, g_rows));
+                scan += g_rows;
+                // Skip VideoControls if present after the group
+                if scan < lines.len() && matches!(&lines[scan], Line::VideoControls { .. }) {
+                    scan += 1;
+                }
+                continue;
+            }
+            break;
+        }
+
+        if adjacent_groups.is_empty() {
+            i = end;
+            continue;
+        }
+
+        // Merge: combine preview rows side by side
+        let max_rows = std::iter::once(first_rows)
+            .chain(adjacent_groups.iter().map(|(_, _, r)| *r))
+            .max()
+            .unwrap_or(0);
+
+        let gap = "  "; // gap between images
+
+        // Collect all preview texts by group
+        let mut all_previews: Vec<Vec<String>> = vec![];
+
+        all_previews.push(extract_preview_texts(
+            &lines[first_start..first_start + first_rows],
+        ));
+        for (_, g_start, g_rows) in &adjacent_groups {
+            all_previews.push(extract_preview_texts(&lines[*g_start..*g_start + g_rows]));
+        }
+
+        // Build merged rows
+        let mut merged_rows = Vec::new();
+        for row in 0..max_rows {
+            let mut combined = String::new();
+            for (g_idx, previews) in all_previews.iter().enumerate() {
+                if g_idx > 0 {
+                    combined.push_str(gap);
+                }
+                if let Some(text) = previews.get(row) {
+                    combined.push_str(text);
+                }
+            }
+            merged_rows.push(Line::ImageRow {
+                group: first_group, // Use first group for sixel rendering
+                row_in_group: row as u16,
+                total_rows: max_rows as u16,
+                preview_text: combined,
+            });
+        }
+
+        // Replace the range [first_start..scan) with merged rows
+        // Also keep any VideoControls that were after any group
+        let extras: Vec<Line> = lines[first_start..scan]
+            .iter()
+            .filter(|l| matches!(l, Line::VideoControls { .. }))
+            .cloned()
+            .collect();
+
+        let drain_end = scan.min(lines.len());
+        lines.splice(
+            first_start..drain_end,
+            merged_rows.into_iter().chain(extras),
+        );
+
+        i = first_start + max_rows;
+    }
+}
+
+fn extract_preview_texts(lines: &[Line]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|l| match l {
+            Line::ImageRow { preview_text, .. } => Some(preview_text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn count_group_rows(
+    lines: &[Line],
+    group: ImageGroup,
+) -> usize {
+    lines
+        .iter()
+        .take_while(|l| matches!(l, Line::ImageRow { group: g, .. } if *g == group))
+        .count()
 }
 
 /// Compute indices of lines that are visible given the current collapsed state.
