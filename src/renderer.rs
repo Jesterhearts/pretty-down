@@ -541,6 +541,7 @@ fn handle_inline_html(
     tag_str: &str,
     state: &mut RenderState,
     out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
 ) {
     let mut reader = XmlReader::from_str(tag_str);
     reader.config_mut().check_end_names = false;
@@ -549,7 +550,7 @@ fn handle_inline_html(
     while let Ok(event) = reader.read_event() {
         match event {
             XmlEvent::Start(ref e) | XmlEvent::Empty(ref e) => {
-                handle_html_open_tag(&xml_tag_name(e), e, state, out);
+                handle_html_open_tag(&xml_tag_name(e), e, state, out, blocks);
             }
             XmlEvent::End(ref e) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
@@ -567,6 +568,7 @@ fn handle_html_open_tag(
     tag: &quick_xml::events::BytesStart<'_>,
     state: &mut RenderState,
     out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
 ) {
     match name {
         "b" | "strong" => {
@@ -607,14 +609,11 @@ fn handle_html_open_tag(
                 out.push('\n');
             }
         }
-        "img" => {
+        "img" | "video" => {
             if let Some(src) = xml_attr(tag, b"src")
                 && let Some(path) = resolve_image_path(&src, &state.base_path)
-                && let Some(sixel_data) =
-                    sixel::encode_image_file(&path, sixel::terminal_pixel_width())
             {
-                out.push_str(&sixel_data);
-                out.push('\n');
+                state.emit_image(&path, out, blocks);
             }
         }
         "hr" => {
@@ -796,14 +795,11 @@ fn handle_block_html(
                         out.push_str(&"\u{2500}".repeat(40));
                         out.push('\n');
                     }
-                    "img" => {
+                    "img" | "video" => {
                         if let Some(src) = xml_attr(e, b"src")
                             && let Some(path) = resolve_image_path(&src, &state.base_path)
-                            && let Some(sixel_data) =
-                                sixel::encode_image_file(&path, sixel::terminal_pixel_width())
                         {
-                            out.push_str(&sixel_data);
-                            out.push('\n');
+                            state.emit_image(&path, out, blocks);
                         }
                     }
                     "br" => {
@@ -832,14 +828,11 @@ fn handle_block_html(
                             out.push('\n');
                         }
                     }
-                    "img" => {
+                    "img" | "video" => {
                         if let Some(src) = xml_attr(e, b"src")
                             && let Some(path) = resolve_image_path(&src, &state.base_path)
-                            && let Some(sixel_data) =
-                                sixel::encode_image_file(&path, sixel::terminal_pixel_width())
                         {
-                            out.push_str(&sixel_data);
-                            out.push('\n');
+                            state.emit_image(&path, out, blocks);
                         }
                     }
                     _ => {}
@@ -1515,7 +1508,7 @@ pub fn render(
 
             // ── Inline HTML ──────────────────────────────────────────
             Event::InlineHtml(html) => {
-                handle_inline_html(&html, &mut state, &mut out);
+                handle_inline_html(&html, &mut state, &mut out, &mut blocks);
             }
 
             // ── Block HTML ───────────────────────────────────────────
