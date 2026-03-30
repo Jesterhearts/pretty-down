@@ -302,7 +302,14 @@ pub fn run(
 
     let mut scroll_offset: usize = 0; // index into `visible`
     let mut needs_redraw = true;
-    let mut collapsed: HashSet<usize> = HashSet::new();
+    // Start with all details blocks collapsed (matches GitHub behavior)
+    let mut collapsed: HashSet<usize> = lines
+        .iter()
+        .filter_map(|l| match l {
+            Line::DetailsSummary { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
     let mut visible = visible_indices(&lines, &collapsed);
 
     #[derive(Clone, Copy, PartialEq)]
