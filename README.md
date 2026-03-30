@@ -1,8 +1,12 @@
 # pretty-down
 
 > **Fair warning:** This was vibe-coded for my own personal use. It works for me,
-> but your mileage may vary. Don't expect polish, comprehensive error handling, or
-> broad platform support.
+> but your mileage may vary.
+> 
+> I only test on linux as that is my current environment. If anyone is aware of similar
+> projects/prior art, please let me know so I can link them here. The goal of this was to have
+> in-terminal pretty rendering of markdown files which goes beyond syntax highlighting and is closer
+> to what you would get rendering with a browser or with e.g. vscode's markdown preview.
 
 A CLI tool that renders markdown in the terminal using [Sixel](https://en.wikipedia.org/wiki/Sixel)
 graphics. Headings are rendered as actual rasterized text with larger fonts, and
