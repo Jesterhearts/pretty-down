@@ -119,6 +119,23 @@ mod ansi {
     }
 }
 
+/// Crop an RGBA pixel buffer to a maximum width, keeping the left portion.
+fn crop_pixels_width(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    max_w: u32,
+) -> (u32, Vec<u8>) {
+    let new_w = max_w.min(w);
+    let mut out = Vec::with_capacity((new_w * h * 4) as usize);
+    for y in 0..h {
+        let row_start = (y * w * 4) as usize;
+        let row_end = row_start + (new_w * 4) as usize;
+        out.extend_from_slice(&pixels[row_start..row_end]);
+    }
+    (new_w, out)
+}
+
 /// Heading font sizes in pixels for h1..h6
 const HEADING_SIZES: [u32; 6] = [48, 40, 32, 28, 24, 20];
 
@@ -222,11 +239,12 @@ impl RenderState {
         out: &mut String,
     ) {
         // Try GIF first (returns None for non-GIF files), fall back to static
-        if let Some(pending) = sixel::encode_gif_async(path, 800) {
+        let max_w = sixel::terminal_pixel_width();
+        if let Some(pending) = sixel::encode_gif_async(path, max_w) {
             let id = self.pending_gifs.len();
             out.push_str(&format!("\x00GIF:{id}:{}\x00\n", pending.estimated_rows));
             self.pending_gifs.push(pending);
-        } else if let Some(pending) = sixel::encode_image_file_async(path, 800) {
+        } else if let Some(pending) = sixel::encode_image_file_async(path, max_w) {
             let id = self.pending_images.len();
             out.push_str(&format!("\x00IMG:{id}:{}\x00\n", pending.estimated_rows));
             self.pending_images.push(pending);
@@ -510,7 +528,8 @@ fn handle_html_open_tag(
         "img" => {
             if let Some(src) = xml_attr(tag, b"src")
                 && let Some(path) = state.resolve_image_path(&src)
-                && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
+                && let Some(sixel_data) =
+                    sixel::encode_image_file(&path, sixel::terminal_pixel_width())
             {
                 out.push_str(&sixel_data);
                 out.push('\n');
@@ -696,7 +715,8 @@ fn handle_block_html(
                     "img" => {
                         if let Some(src) = xml_attr(e, b"src")
                             && let Some(path) = state.resolve_image_path(&src)
-                            && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
+                            && let Some(sixel_data) =
+                                sixel::encode_image_file(&path, sixel::terminal_pixel_width())
                         {
                             out.push_str(&sixel_data);
                             out.push('\n');
@@ -731,7 +751,8 @@ fn handle_block_html(
                     "img" => {
                         if let Some(src) = xml_attr(e, b"src")
                             && let Some(path) = state.resolve_image_path(&src)
-                            && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
+                            && let Some(sixel_data) =
+                                sixel::encode_image_file(&path, sixel::terminal_pixel_width())
                         {
                             out.push_str(&sixel_data);
                             out.push('\n');
@@ -803,6 +824,12 @@ fn emit_block(
                 let color = theme.heading_color(level);
                 let (w, h, pixels) =
                     crate::font::render_text(font, &text, HEADING_SIZES[idx], color);
+                let max_w = sixel::terminal_pixel_width();
+                let (w, pixels) = if w > max_w {
+                    crop_pixels_width(&pixels, w, h, max_w)
+                } else {
+                    (w, pixels)
+                };
                 if w > 0 && h > 0 {
                     out.push_str(&sixel::encode_rgba(w, h, &pixels));
                 }
@@ -976,6 +1003,12 @@ pub fn render(
                     let color = theme.heading_color(state.heading_level);
                     let text = std::mem::take(&mut state.heading_text);
                     let (w, h, pixels) = crate::font::render_text(font, &text, size, color);
+                    let max_w = sixel::terminal_pixel_width();
+                    let (w, pixels) = if w > max_w {
+                        crop_pixels_width(&pixels, w, h, max_w)
+                    } else {
+                        (w, pixels)
+                    };
                     if w > 0 && h > 0 {
                         out.push_str(&sixel::encode_rgba(w, h, &pixels));
                     }
