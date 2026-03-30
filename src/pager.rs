@@ -229,17 +229,25 @@ fn merge_side_by_side_images(lines: &mut Vec<Line>) {
         // (group, start_in_lines, row_count)
 
         let mut scan = end;
+        let mut saw_separator = false;
         while scan < lines.len() {
             // Skip single whitespace-only text lines (same markdown line)
             // but NOT empty lines (which indicate a line break)
             if let Line::Text(t) = &lines[scan] {
                 if !t.is_empty() && t.trim().is_empty() {
+                    saw_separator = true;
                     scan += 1;
                     continue;
                 }
-                break; // Empty line or non-whitespace text — stop
+                break;
             }
-            // Check for another ImageRow group start
+            // Only merge if there was a whitespace separator between groups
+            // (= images on the same markdown line). Adjacent ImageRow groups
+            // with no text separator are from different blocks/lines.
+            if !saw_separator {
+                break;
+            }
+            saw_separator = false;
             if let Line::ImageRow {
                 group,
                 row_in_group: 0,
