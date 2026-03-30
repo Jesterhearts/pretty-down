@@ -219,6 +219,8 @@ struct RenderState {
     link_url: Option<String>,
     /// Whether we are inside a code block
     in_code_block: bool,
+    /// Blockquote nesting depth
+    blockquote_depth: usize,
     /// Language of the current code block (for syntax highlighting)
     code_lang: Option<String>,
     /// Accumulated code block content (for syntax highlighting)
@@ -270,6 +272,7 @@ impl RenderState {
             strikethrough: false,
             link_url: None,
             in_code_block: false,
+            blockquote_depth: 0,
             code_lang: None,
             code_buf: String::new(),
             list_stack: Vec::new(),
@@ -1148,9 +1151,29 @@ pub fn render(
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
                 out.push_str(ansi::RESET);
-                // Word-wrap the paragraph text
-                let wrapped = ansi::wrap(&std::mem::take(&mut out), state.term_width);
-                out.push_str(&wrapped);
+                if state.blockquote_depth > 0 {
+                    // Apply blockquote prefix to each wrapped line
+                    let prefix = format!(
+                        "{}{}",
+                        theme.blockquote.to_ansi(),
+                        "  \u{2502} ".repeat(state.blockquote_depth)
+                    );
+                    let indent_width = 4 * state.blockquote_depth as u16; // "  │ " = 4 chars
+                    let wrap_width = state.term_width.saturating_sub(indent_width);
+                    let raw = std::mem::take(&mut out);
+                    let wrapped = ansi::wrap(&raw, wrap_width);
+                    for (i, line) in wrapped.lines().enumerate() {
+                        if i > 0 {
+                            out.push('\n');
+                        }
+                        out.push_str(&prefix);
+                        out.push_str(line);
+                        out.push_str(ansi::RESET);
+                    }
+                } else {
+                    let wrapped = ansi::wrap(&std::mem::take(&mut out), state.term_width);
+                    out.push_str(&wrapped);
+                }
                 out.push_str("\n\n");
             }
 
@@ -1339,11 +1362,10 @@ pub fn render(
 
             // ── Block quote ──────────────────────────────────────────
             Event::Start(Tag::BlockQuote(_)) => {
-                out.push_str(&theme.blockquote.to_ansi());
-                out.push_str("  \u{2502} ");
+                state.blockquote_depth += 1;
             }
             Event::End(TagEnd::BlockQuote(_)) => {
-                out.push_str(ansi::RESET);
+                state.blockquote_depth = state.blockquote_depth.saturating_sub(1);
             }
 
             // ── Horizontal rule ──────────────────────────────────────
