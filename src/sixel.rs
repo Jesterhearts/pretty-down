@@ -375,7 +375,7 @@ pub fn encode_video_async(
 
     let input = ffmpeg::format::input(path).ok()?;
     let stream = input.streams().best(ffmpeg::media::Type::Video)?;
-    let stream_index = stream.index();
+    let _stream_index = stream.index();
 
     // Get frame rate and dimensions
     let rate = stream.avg_frame_rate();
@@ -386,7 +386,7 @@ pub fn encode_video_async(
     };
 
     let codec_params = stream.parameters();
-    let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)
+    let decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)
         .ok()?
         .decoder()
         .video()
@@ -395,7 +395,6 @@ pub fn encode_video_async(
     let src_width = decoder.width();
     let src_height = decoder.height();
 
-    // Compute scaled dimensions
     let (dst_width, dst_height) = if src_width > max_width {
         let h = (src_height as f64 * max_width as f64 / src_width as f64) as u32;
         (max_width, h)
@@ -404,63 +403,7 @@ pub fn encode_video_async(
     };
 
     let estimated_rows = pixel_height_to_rows(dst_height);
-
-    // Generate preview from first decoded frame
-    let mut scaler = ffmpeg::software::scaling::context::Context::get(
-        decoder.format(),
-        src_width,
-        src_height,
-        ffmpeg::format::Pixel::RGBA,
-        dst_width,
-        dst_height,
-        ffmpeg::software::scaling::Flags::BILINEAR,
-    )
-    .ok()?;
-
-    // Decode just the first frame for preview
-    let mut preview = Vec::new();
-    let mut got_preview = false;
-    let mut first_input = ffmpeg::format::input(path).ok()?;
-
-    for (s, packet) in first_input.packets() {
-        if s.index() != stream_index {
-            continue;
-        }
-        decoder.send_packet(&packet).ok()?;
-        let mut decoded = ffmpeg::frame::Video::empty();
-        if decoder.receive_frame(&mut decoded).is_ok() {
-            let mut rgb_frame = ffmpeg::frame::Video::empty();
-            scaler.run(&decoded, &mut rgb_frame).ok()?;
-
-            if let Some(img) = RgbaImage::from_raw(
-                dst_width,
-                dst_height,
-                rgb_frame.data(0)[..dst_width as usize * dst_height as usize * 4].to_vec(),
-            ) {
-                let cell_w = crossterm::terminal::window_size()
-                    .ok()
-                    .and_then(|ws| {
-                        if ws.width > 0 && ws.columns > 0 {
-                            Some(ws.width as u32 / ws.columns as u32)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(8);
-                let preview_cols = (dst_width / cell_w).max(1);
-                preview = half_block_preview(&img, preview_cols, estimated_rows);
-            }
-            got_preview = true;
-            break;
-        }
-    }
-
-    if !got_preview {
-        return None;
-    }
-
-    // Reset decoder for full playback
-    drop(first_input);
+    let preview = Vec::new();
 
     let frames = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(OnceLock::new());
