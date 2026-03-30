@@ -80,6 +80,8 @@ enum Line {
         row_in_group: u16,
         /// Total rows in the image group. 0 means no image group tracking.
         total_rows: u16,
+        /// Video controls to render on this row: (col, width, gif_id).
+        video_controls: Vec<(u16, u16, usize)>,
     },
     /// Video playback control bar (play/pause + progress).
     VideoControls { gif_id: usize },
@@ -201,7 +203,7 @@ fn flatten_blocks(
                 flatten_side_by_side(items, output, &mut lines);
             }
             OutputBlock::Table(table) => {
-                flatten_table(table, &mut lines);
+                flatten_table(table, &output.pending_gifs, &mut lines);
             }
             OutputBlock::DetailsStart { id } => {
                 lines.push(Line::DetailsStart { id: *id });
@@ -341,12 +343,14 @@ fn flatten_side_by_side(
             sixels,
             row_in_group: row_idx,
             total_rows: max_rows,
+            video_controls: vec![],
         });
     }
 }
 
 fn flatten_table(
     table: &crate::renderer::RenderedTable,
+    pending_gifs: &[crate::sixel::PendingGif],
     lines: &mut Vec<Line>,
 ) {
     use pulldown_cmark::Alignment;
@@ -359,6 +363,7 @@ fn flatten_table(
         sixels: vec![],
         row_in_group: 0,
         total_rows: 0,
+        video_controls: vec![],
     });
 
     let all_rows: Vec<(&Vec<crate::renderer::RenderedTableCell>, bool)> = table
@@ -473,6 +478,47 @@ fn flatten_table(
                 sixels,
                 row_in_group: if has_images { line_idx as u16 } else { 0 },
                 total_rows: if has_images { row_height as u16 } else { 0 },
+                video_controls: vec![],
+            });
+        }
+
+        // Emit video controls row for cells that contain videos
+        let mut vid_controls: Vec<(u16, u16, usize)> = Vec::new();
+        let mut col_off: u16 = 1; // after leading │
+        for (col, width) in w.iter().enumerate() {
+            col_off += 1; // space padding
+            if let Some(cell) = row.get(col) {
+                if let Some(gif_id) = cell.gif_id {
+                    if pending_gifs.get(gif_id).is_some_and(|g| g.is_video) {
+                        vid_controls.push((col_off, *width as u16, gif_id));
+                    }
+                }
+            }
+            col_off += *width as u16 + 1; // cell width + trailing space
+            if col < w.len() - 1 {
+                col_off += 1; // separator ┆
+            }
+        }
+        if !vid_controls.is_empty() {
+            let mut ctrl_content = String::new();
+            ctrl_content.push('│');
+            for (col, width) in w.iter().enumerate() {
+                ctrl_content.push(' ');
+                for _ in 0..*width {
+                    ctrl_content.push(' ');
+                }
+                ctrl_content.push(' ');
+                if col < w.len() - 1 {
+                    ctrl_content.push('┆');
+                }
+            }
+            ctrl_content.push('│');
+            lines.push(Line::TableRow {
+                content: ctrl_content,
+                sixels: vec![],
+                row_in_group: 0,
+                total_rows: 0,
+                video_controls: vid_controls,
             });
         }
 
@@ -483,6 +529,7 @@ fn flatten_table(
                 sixels: vec![],
                 row_in_group: 0,
                 total_rows: 0,
+                video_controls: vec![],
             });
         }
     }
@@ -493,6 +540,7 @@ fn flatten_table(
         sixels: vec![],
         row_in_group: 0,
         total_rows: 0,
+        video_controls: vec![],
     });
 }
 
@@ -1393,6 +1441,7 @@ fn draw_screen(
                 sixels,
                 row_in_group,
                 total_rows,
+                video_controls,
             } => {
                 // Check if this is the start of an image group and all rows fit
                 let render_sixels = !sixels.is_empty()
@@ -1480,6 +1529,20 @@ fn draw_screen(
                 // No sixel overlay — just render content (preview text shows)
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{content}\r").unwrap();
+                // Render video controls inline
+                for &(col, w, gif_id) in video_controls {
+                    render_table_video_controls(
+                        stdout,
+                        col,
+                        w,
+                        gif_id,
+                        rows_used,
+                        gifs,
+                        gif_frames,
+                        video_paused,
+                    );
+                    video_control_rows.push((rows_used, gif_id));
+                }
                 rows_used += 1;
             }
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {
@@ -1628,6 +1691,39 @@ fn first_visible_details(
         }
     }
     None
+}
+
+fn render_table_video_controls(
+    stdout: &mut io::Stdout,
+    col: u16,
+    width: u16,
+    gif_id: usize,
+    row: u16,
+    gifs: &[crate::sixel::PendingGif],
+    gif_frames: &HashMap<usize, usize>,
+    video_paused: &HashSet<usize>,
+) {
+    let paused = video_paused.contains(&gif_id);
+    let btn = if paused { "\u{25B6}" } else { "\u{23F8}" };
+    let frame_idx = gif_frames.get(&gif_id).copied().unwrap_or(0);
+    let cycle = gifs.get(gif_id).map(|g| g.cycle_length()).unwrap_or(0);
+    let bar_width = (width as usize).saturating_sub(4); // " ⏸ " prefix
+    let progress_pos = if cycle > 1 && bar_width > 0 {
+        let pos_in_cycle = frame_idx % cycle;
+        (pos_in_cycle * bar_width / cycle).min(bar_width - 1)
+    } else {
+        0
+    };
+    let mut bar = String::new();
+    for i in 0..bar_width {
+        if i == progress_pos {
+            bar.push('\u{25CF}');
+        } else {
+            bar.push('\u{2500}');
+        }
+    }
+    crossterm::execute!(stdout, cursor::MoveTo(col, row)).unwrap();
+    write!(stdout, "\x1b[2m{btn}  {bar}\x1b[0m").unwrap();
 }
 
 /// Find which code block (if any) occupies the given terminal row.
