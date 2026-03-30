@@ -918,9 +918,17 @@ fn emit_block(
                     (w, pixels)
                 };
                 if w > 0 && h > 0 {
-                    let data = sixel::encode_rgba(w, h, &pixels);
-                    let height = sixel::pixel_height_to_rows(h);
-                    let preview = sixel::preview_from_pixels(&pixels, w, h, height);
+                    let snapped_h = sixel::snap_height_to_cells(h);
+                    let pixels = if snapped_h > h {
+                        let mut padded = pixels;
+                        padded.resize((w * snapped_h * 4) as usize, 0);
+                        padded
+                    } else {
+                        pixels
+                    };
+                    let data = sixel::encode_rgba(w, snapped_h, &pixels);
+                    let height = sixel::pixel_height_to_rows(snapped_h);
+                    let preview = sixel::preview_from_pixels(&pixels, w, snapped_h, height);
                     flush_text(out, blocks);
                     blocks.push(OutputBlock::Sixel {
                         data,
@@ -1125,9 +1133,19 @@ fn render_heading_sixel(
         (w, pixels)
     };
     if w > 0 && h > 0 {
-        let data = sixel::encode_rgba(w, h, &pixels);
-        let height = sixel::pixel_height_to_rows(h);
-        let preview = sixel::preview_from_pixels(&pixels, w, h, height);
+        // Pad pixel height to a cell boundary so the sixel occupies
+        // exactly the predicted number of rows (no fractional overflow).
+        let snapped_h = sixel::snap_height_to_cells(h);
+        let pixels = if snapped_h > h {
+            let mut padded = pixels;
+            padded.resize((w * snapped_h * 4) as usize, 0);
+            padded
+        } else {
+            pixels
+        };
+        let data = sixel::encode_rgba(w, snapped_h, &pixels);
+        let height = sixel::pixel_height_to_rows(snapped_h);
+        let preview = sixel::preview_from_pixels(&pixels, w, snapped_h, height);
         flush_text(out, blocks);
         blocks.push(OutputBlock::Sixel {
             data,
