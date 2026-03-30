@@ -136,7 +136,7 @@ fn main() {
             })
         } else {
             Box::new(|| renderer::RenderOutput {
-                text: String::new(),
+                blocks: Vec::new(),
                 pending_images: Vec::new(),
                 pending_gifs: Vec::new(),
                 code_blocks: Vec::new(),

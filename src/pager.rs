@@ -64,76 +64,66 @@ impl Line {
     }
 }
 
-/// Split rendered output into display lines.
-///
-/// Sixel sequences (delimited by `\x1bP` .. `\x1b\`) are kept as atomic
-/// blocks. Image placeholders (`\x00IMG:id:rows\x00`) become PendingImage
-/// lines. Everything else is split on newlines.
-fn split_lines(output: &str) -> Vec<Line> {
+/// Flatten output blocks into display lines for the pager.
+fn flatten_blocks(output: &crate::renderer::RenderOutput) -> Vec<Line> {
+    use crate::renderer::OutputBlock;
+
     let mut lines = Vec::new();
-    let mut rest = output;
 
-    while !rest.is_empty() {
-        // Find the next special sequence: \x00 marker or \x1bP sixel
-        let marker_pos = rest.find('\x00');
-        let sixel_pos = rest.find("\x1bP");
-
-        let next = match (marker_pos, sixel_pos) {
-            (Some(m), Some(s)) if m < s => Some(("marker", m)),
-            (_, Some(s)) => Some(("sixel", s)),
-            (Some(m), None) => Some(("marker", m)),
-            (None, None) => None,
-        };
-
-        match next {
-            Some(("marker", pos)) => {
-                // Text before the marker
-                let before = &rest[..pos];
-                for text_line in before.split('\n') {
-                    lines.push(Line::Text(text_line.to_string()));
-                }
-
-                let after = &rest[pos..];
-                if let Some(end) = after[1..].find('\x00') {
-                    let marker = &after[1..end + 1];
-                    parse_marker(marker, &mut lines);
-                    rest = &after[end + 2..];
-                    if rest.starts_with('\n') {
-                        rest = &rest[1..];
-                    }
-                } else {
-                    rest = &after[1..];
+    for block in &output.blocks {
+        match block {
+            OutputBlock::Text(text) => {
+                for line in text.split('\n') {
+                    lines.push(Line::Text(line.to_string()));
                 }
             }
-            Some(("sixel", pos)) => {
-                let before = &rest[..pos];
-                for text_line in before.split('\n') {
-                    lines.push(Line::Text(text_line.to_string()));
-                }
-
-                let after_start = &rest[pos..];
-                let end = after_start
-                    .find("\x1b\\")
-                    .map(|i| i + 2)
-                    .unwrap_or(after_start.len());
-
-                let sixel_data = &after_start[..end];
-                let height = estimate_sixel_rows(sixel_data);
+            OutputBlock::Sixel { data, height } => {
                 lines.push(Line::Sixel {
-                    data: sixel_data.to_string(),
-                    height,
+                    data: data.clone(),
+                    height: *height,
                 });
-
-                rest = &after_start[end..];
-                if rest.starts_with('\n') {
-                    rest = &rest[1..];
-                }
             }
-            _ => {
-                for text_line in rest.split('\n') {
-                    lines.push(Line::Text(text_line.to_string()));
-                }
-                break;
+            OutputBlock::Image(id) => {
+                let rows = output
+                    .pending_images
+                    .get(*id)
+                    .map(|p| p.estimated_rows)
+                    .unwrap_or(1);
+                lines.push(Line::PendingImage {
+                    id: *id,
+                    estimated_rows: rows,
+                });
+            }
+            OutputBlock::Gif(id) => {
+                let rows = output
+                    .pending_gifs
+                    .get(*id)
+                    .map(|g| g.estimated_rows)
+                    .unwrap_or(1);
+                lines.push(Line::Gif {
+                    id: *id,
+                    estimated_rows: rows,
+                });
+            }
+            OutputBlock::Code(id) => {
+                let height = output
+                    .code_blocks
+                    .get(*id)
+                    .map(|b| b.lines.len() as u16 + 1) // +1 for scrollbar
+                    .unwrap_or(1);
+                lines.push(Line::CodeBlock { id: *id, height });
+            }
+            OutputBlock::DetailsStart { id } => {
+                lines.push(Line::DetailsStart { id: *id });
+            }
+            OutputBlock::DetailsSummary { id, text } => {
+                lines.push(Line::DetailsSummary {
+                    id: *id,
+                    text: text.clone(),
+                });
+            }
+            OutputBlock::DetailsEnd { id } => {
+                lines.push(Line::DetailsEnd { id: *id });
             }
         }
     }
@@ -144,51 +134,6 @@ fn split_lines(output: &str) -> Vec<Line> {
     }
 
     lines
-}
-
-/// Parse a `\x00...\x00` marker into Line variants.
-fn parse_marker(
-    marker: &str,
-    lines: &mut Vec<Line>,
-) {
-    let parts: Vec<&str> = marker.splitn(3, ':').collect();
-    match parts.first().copied() {
-        Some("IMG") if parts.len() == 3 => {
-            let id: usize = parts[1].parse().unwrap_or(0);
-            let rows: u16 = parts[2].parse().unwrap_or(3);
-            lines.push(Line::PendingImage {
-                id,
-                estimated_rows: rows,
-            });
-        }
-        Some("DETAILS") if parts.len() >= 2 => {
-            let id: usize = parts[1].parse().unwrap_or(0);
-            lines.push(Line::DetailsStart { id });
-        }
-        Some("SUMMARY") if parts.len() >= 3 => {
-            let id: usize = parts[1].parse().unwrap_or(0);
-            let text = parts[2].to_string();
-            lines.push(Line::DetailsSummary { id, text });
-        }
-        Some("GIF") if parts.len() == 3 => {
-            let id: usize = parts[1].parse().unwrap_or(0);
-            let rows: u16 = parts[2].parse().unwrap_or(3);
-            lines.push(Line::Gif {
-                id,
-                estimated_rows: rows,
-            });
-        }
-        Some("CODE") if parts.len() == 3 => {
-            let id: usize = parts[1].parse().unwrap_or(0);
-            let height: u16 = parts[2].parse().unwrap_or(1);
-            lines.push(Line::CodeBlock { id, height });
-        }
-        Some("/DETAILS") if parts.len() >= 2 => {
-            let id: usize = parts[1].parse().unwrap_or(0);
-            lines.push(Line::DetailsEnd { id });
-        }
-        _ => {}
-    }
 }
 
 /// Compute indices of lines that are visible given the current collapsed state.
@@ -293,9 +238,10 @@ pub fn run(
     watch_path: Option<&Path>,
     render_fn: &dyn Fn() -> RenderOutput,
 ) {
-    let mut lines = split_lines(&output.text);
+    let mut lines = flatten_blocks(output);
     let mut pending = &output.pending_images;
     let mut pending_gifs = &output.pending_gifs;
+    let mut code_blocks = &output.code_blocks;
     // Owned storage for when we re-render
     #[allow(unused_assignments)]
     let mut current_output: Option<RenderOutput> = None;
@@ -393,7 +339,7 @@ pub fn run(
                 &collapsed,
                 pending_gifs,
                 &gif_frames,
-                &output.code_blocks,
+                code_blocks,
                 &code_h_scroll,
                 scroll_offset,
                 viewport_rows,
@@ -458,11 +404,12 @@ pub fn run(
             while rx.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(50));
             let new_output = render_fn();
-            lines = split_lines(&new_output.text);
+            lines = flatten_blocks(&new_output);
             visible = visible_indices(&lines, &collapsed);
             current_output = Some(new_output);
             pending = &current_output.as_ref().unwrap().pending_images;
             pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
+            code_blocks = &current_output.as_ref().unwrap().code_blocks;
             gif_state.clear();
             if scroll_offset >= visible.len() {
                 scroll_offset = visible.len().saturating_sub(1);
@@ -510,11 +457,12 @@ pub fn run(
             // Invalidate cached pixel width so re-render picks up new size
             crate::sixel::invalidate_terminal_size();
             let new_output = render_fn();
-            lines = split_lines(&new_output.text);
+            lines = flatten_blocks(&new_output);
             visible = visible_indices(&lines, &collapsed);
             current_output = Some(new_output);
             pending = &current_output.as_ref().unwrap().pending_images;
             pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
+            code_blocks = &current_output.as_ref().unwrap().code_blocks;
             gif_state.clear();
             // Update viewport dimensions
             viewport_rows = new_viewport;
@@ -558,13 +506,13 @@ pub fn run(
             if let Some(block_id) = find_code_block_at_row(
                 &lines,
                 &visible,
-                &output.code_blocks,
+                code_blocks,
                 scroll_offset,
                 viewport_rows,
                 row,
             ) {
                 let entry = code_h_scroll.entry(block_id).or_insert(0);
-                let max = output.code_blocks[block_id]
+                let max = code_blocks[block_id]
                     .max_width
                     .saturating_sub(term_cols as usize);
                 if matches!(
@@ -714,11 +662,12 @@ pub fn run(
                     ..
                 } => {
                     let new_output = render_fn();
-                    lines = split_lines(&new_output.text);
+                    lines = flatten_blocks(&new_output);
                     visible = visible_indices(&lines, &collapsed);
                     current_output = Some(new_output);
                     pending = &current_output.as_ref().unwrap().pending_images;
                     pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
+                    code_blocks = &current_output.as_ref().unwrap().code_blocks;
                     gif_state.clear();
                     if scroll_offset >= visible.len() {
                         scroll_offset = visible.len().saturating_sub(1);
@@ -763,7 +712,7 @@ pub fn run(
 
 /// Print output directly, resolving pending images synchronously.
 pub fn print_output(output: &RenderOutput) {
-    let lines = split_lines(&output.text);
+    let lines = flatten_blocks(output);
     let pending = &output.pending_images;
     for line in &lines {
         match line {

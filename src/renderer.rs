@@ -300,21 +300,23 @@ impl RenderState {
         !self.table_alignments.is_empty()
     }
 
-    /// Emit a placeholder for a pending image or GIF.
+    /// Start background encoding for an image or GIF and emit an output block.
     fn emit_image(
         &mut self,
         path: &std::path::Path,
         out: &mut String,
+        blocks: &mut Vec<OutputBlock>,
     ) {
-        // Try GIF first (returns None for non-GIF files), fall back to static
         let max_w = sixel::terminal_pixel_width();
         if let Some(pending) = sixel::encode_gif_async(path, max_w) {
             let id = self.pending_gifs.len();
-            out.push_str(&format!("\x00GIF:{id}:{}\x00\n", pending.estimated_rows));
+            flush_text(out, blocks);
+            blocks.push(OutputBlock::Gif(id));
             self.pending_gifs.push(pending);
         } else if let Some(pending) = sixel::encode_image_file_async(path, max_w) {
             let id = self.pending_images.len();
-            out.push_str(&format!("\x00IMG:{id}:{}\x00\n", pending.estimated_rows));
+            flush_text(out, blocks);
+            blocks.push(OutputBlock::Image(id));
             self.pending_images.push(pending);
         }
     }
@@ -741,6 +743,7 @@ fn handle_block_html(
     html: &str,
     state: &mut RenderState,
     out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
     font: &Font,
     theme: &crate::theme::Theme,
 ) {
@@ -774,7 +777,8 @@ fn handle_block_html(
                     "details" => {
                         let id = state.next_details_id;
                         state.next_details_id += 1;
-                        out.push_str(&format!("\x00DETAILS:{id}\x00\n"));
+                        flush_text(out, blocks);
+                        blocks.push(OutputBlock::DetailsStart { id });
                     }
                     "hr" => {
                         out.push_str(&"\u{2500}".repeat(40));
@@ -843,9 +847,10 @@ fn handle_block_html(
                 if name == "details" {
                     // Emit end-of-details marker
                     let id = state.next_details_id.saturating_sub(1);
-                    out.push_str(&format!("\x00/DETAILS:{id}\x00\n"));
+                    flush_text(out, blocks);
+                    blocks.push(OutputBlock::DetailsEnd { id });
                 } else if block_tag.as_deref() == Some(&name) {
-                    emit_block(&name, &text_buf, state, out, font, theme, in_pre);
+                    emit_block(&name, &text_buf, state, out, blocks, font, theme, in_pre);
                     block_tag = None;
                     text_buf.clear();
                     in_pre = false;
@@ -860,7 +865,7 @@ fn handle_block_html(
     // If there's leftover text with no block wrapper, output it
     if !text_buf.is_empty() {
         if let Some(tag) = &block_tag {
-            emit_block(tag, &text_buf, state, out, font, theme, in_pre);
+            emit_block(tag, &text_buf, state, out, blocks, font, theme, in_pre);
         } else {
             out.push_str(&text_buf);
             out.push('\n');
@@ -869,11 +874,13 @@ fn handle_block_html(
 }
 
 /// Emit a completed block element.
+#[allow(clippy::too_many_arguments)]
 fn emit_block(
     tag: &str,
     text: &str,
     state: &mut RenderState,
     out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
     font: &Font,
     theme: &crate::theme::Theme,
     in_pre: bool,
@@ -933,7 +940,11 @@ fn emit_block(
                 // Emit a summary marker — the pager renders this with a
                 // disclosure triangle and handles expand/collapse.
                 let id = state.next_details_id.saturating_sub(1);
-                out.push_str(&format!("\x00SUMMARY:{id}:{text}\x00\n"));
+                flush_text(out, blocks);
+                blocks.push(OutputBlock::DetailsSummary {
+                    id,
+                    text: text.to_string(),
+                });
             }
         }
         _ => {
@@ -1032,20 +1043,44 @@ pub struct CodeBlock {
     pub max_width: usize,
 }
 
+/// A block of rendered output.
+pub enum OutputBlock {
+    /// ANSI-styled text (may contain newlines).
+    Text(String),
+    /// A sixel image (e.g. a heading).
+    Sixel { data: String, height: u16 },
+    /// Index into `pending_images`.
+    Image(usize),
+    /// Index into `pending_gifs`.
+    Gif(usize),
+    /// Index into `code_blocks`.
+    Code(usize),
+    /// Start of a collapsible details section.
+    DetailsStart { id: usize },
+    /// Summary line for a details section.
+    DetailsSummary { id: usize, text: String },
+    /// End of a collapsible details section.
+    DetailsEnd { id: usize },
+}
+
 pub struct RenderOutput {
-    pub text: String,
+    pub blocks: Vec<OutputBlock>,
     pub pending_images: Vec<sixel::PendingImage>,
     pub pending_gifs: Vec<sixel::PendingGif>,
     pub code_blocks: Vec<CodeBlock>,
 }
 
-/// Render markdown to a string containing ANSI escape codes, sixel sequences,
-/// and image placeholders.
-///
-/// Headings are rendered as sixel images using the provided font.
-/// Body text uses ANSI terminal styling. Links use OSC 8 hyperlinks.
-/// Images are encoded in background threads — their placeholders
-/// (`\x00IMG:id:rows\x00`) are resolved by the pager when scrolled into view.
+/// Flush the text buffer into a Text block if non-empty.
+fn flush_text(
+    out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
+) {
+    if !out.is_empty() {
+        blocks.push(OutputBlock::Text(std::mem::take(out)));
+    }
+}
+
+/// Render markdown into a sequence of output blocks.
 pub fn render(
     markdown: &str,
     font: &Font,
@@ -1057,6 +1092,7 @@ pub fn render(
     let parser = Parser::new_ext(markdown, options);
 
     let mut out = String::new();
+    let mut blocks: Vec<OutputBlock> = Vec::new();
     let mut state = RenderState::new(base_path.map(|p| p.to_path_buf()));
 
     for event in parser {
@@ -1087,9 +1123,11 @@ pub fn render(
                         (w, pixels)
                     };
                     if w > 0 && h > 0 {
-                        out.push_str(&sixel::encode_rgba(w, h, &pixels));
+                        let data = sixel::encode_rgba(w, h, &pixels);
+                        let height = sixel::pixel_height_to_rows(h);
+                        flush_text(&mut out, &mut blocks);
+                        blocks.push(OutputBlock::Sixel { data, height });
                     }
-                    out.push_str("\n\n");
                     state.heading_level = 0;
                 }
             }
@@ -1142,14 +1180,14 @@ pub fn render(
                     .unwrap_or(0);
 
                 let id = state.code_blocks.len();
-                let height = styled_lines.len();
+                let _height = styled_lines.len();
                 state.code_blocks.push(CodeBlock {
                     lines: styled_lines,
                     max_width,
                 });
 
-                // +1 for the scrollbar row
-                out.push_str(&format!("\x00CODE:{id}:{}\x00\n", height + 1));
+                flush_text(&mut out, &mut blocks);
+                blocks.push(OutputBlock::Code(id));
                 state.code_lang = None;
             }
 
@@ -1232,7 +1270,7 @@ pub fn render(
             // ── Images ───────────────────────────────────────────────
             Event::Start(Tag::Image { dest_url, .. }) => {
                 if let Some(path) = state.resolve_image_path(&dest_url) {
-                    state.emit_image(&path, &mut out);
+                    state.emit_image(&path, &mut out, &mut blocks);
                 }
             }
             Event::End(TagEnd::Image) => {}
@@ -1382,7 +1420,7 @@ pub fn render(
             }
             Event::End(TagEnd::HtmlBlock) => {
                 let html = std::mem::take(&mut state.html_block_buf);
-                handle_block_html(&html, &mut state, &mut out, font, theme);
+                handle_block_html(&html, &mut state, &mut out, &mut blocks, font, theme);
             }
             Event::Html(html) => {
                 state.html_block_buf.push_str(&html);
@@ -1393,8 +1431,11 @@ pub fn render(
         }
     }
 
+    // Flush any remaining text
+    flush_text(&mut out, &mut blocks);
+
     RenderOutput {
-        text: out,
+        blocks,
         pending_images: state.pending_images,
         pending_gifs: state.pending_gifs,
         code_blocks: state.code_blocks,
