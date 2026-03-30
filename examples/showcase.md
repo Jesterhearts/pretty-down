@@ -43,11 +43,73 @@ Gifs can also be used:
 
 ## Code Blocks
 
+Syntax highlighting is applied automatically when a language is specified.
+
+### Rust
+
 ```rust
 fn main() {
-    println!("Hello from pretty-down!");
-    let x = 42;
+    let names = vec!["Alice", "Bob", "Charlie"];
+    for name in &names {
+        println!("Hello, {name}!");
+    }
 }
+```
+
+### Python
+
+```python
+def fibonacci(n: int) -> list[int]:
+    """Generate the first n Fibonacci numbers."""
+    fib = [0, 1]
+    for _ in range(2, n):
+        fib.append(fib[-1] + fib[-2])
+    return fib[:n]
+
+print(fibonacci(10))
+```
+
+### JavaScript
+
+```javascript
+async function fetchUsers() {
+  const response = await fetch('/api/users');
+  const users = await response.json();
+  return users.filter(u => u.active).map(u => u.name);
+}
+```
+
+### Go
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+    ch := make(chan string, 2)
+    ch <- "hello"
+    ch <- "world"
+    fmt.Println(<-ch)
+    fmt.Println(<-ch)
+}
+```
+
+### Shell
+
+```bash
+#!/bin/bash
+for file in *.md; do
+    echo "Rendering: $file"
+    pretty-down "$file" --no-pager > "${file%.md}.txt"
+done
+```
+
+### Plain (no language)
+
+```
+This block has no language tag.
+It uses the theme's code_block style without syntax highlighting.
 ```
 
 ## Blockquotes
