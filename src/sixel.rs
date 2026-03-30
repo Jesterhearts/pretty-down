@@ -103,22 +103,68 @@ pub fn encode_rgba(
     TextEncoder::encode(img)
 }
 
+/// Cap pixel width for sixel encoding — higher resolution just wastes CPU
+/// without visible improvement in terminal output.
+const MAX_SIXEL_WIDTH: u32 = 800;
+
 pub fn scale_image(
     img: RgbaImage,
     max_width: u32,
 ) -> RgbaImage {
+    let cap = max_width.min(MAX_SIXEL_WIDTH);
     let (w, h) = img.dimensions();
-    if w > max_width {
-        let new_h = (h as f64 * max_width as f64 / w as f64) as u32;
-        image::imageops::resize(
-            &img,
-            max_width,
-            new_h,
-            image::imageops::FilterType::Lanczos3,
-        )
+    if w > cap {
+        let new_h = (h as f64 * cap as f64 / w as f64) as u32;
+        image::imageops::resize(&img, cap, new_h, image::imageops::FilterType::Lanczos3)
     } else {
         img
     }
+}
+
+/// Check if a path looks like an SVG file.
+pub fn is_svg(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+}
+
+/// Render an SVG file to an RGBA image, scaling to fit `max_width` pixels.
+pub fn render_svg_file(
+    path: &std::path::Path,
+    max_width: u32,
+) -> Option<RgbaImage> {
+    let data = std::fs::read(path).ok()?;
+    render_svg_bytes(&data, max_width)
+}
+
+/// Render SVG from raw bytes to an RGBA image, scaling to fit `max_width`
+/// pixels.
+pub fn render_svg_bytes(
+    data: &[u8],
+    max_width: u32,
+) -> Option<RgbaImage> {
+    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default()).ok()?;
+    let svg_size = tree.size();
+
+    let width = max_width.min(MAX_SIXEL_WIDTH);
+    let scale = width as f32 / svg_size.width();
+    let height = (svg_size.height() * scale) as u32;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // tiny_skia uses premultiplied RGBA; convert to straight RGBA
+    let mut pixels = pixmap.take();
+    for chunk in pixels.chunks_exact_mut(4) {
+        let a = chunk[3] as f32 / 255.0;
+        if a > 0.0 {
+            chunk[0] = (chunk[0] as f32 / a).min(255.0) as u8;
+            chunk[1] = (chunk[1] as f32 / a).min(255.0) as u8;
+            chunk[2] = (chunk[2] as f32 / a).min(255.0) as u8;
+        }
+    }
+
+    RgbaImage::from_raw(width, height, pixels)
 }
 
 /// A handle to an image being encoded to sixel in a background thread.

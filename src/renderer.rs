@@ -1189,7 +1189,10 @@ fn encode_media_url(
     let (pending, rows_handle, preview_handle) = sixel::PendingImage::new_deferred(result);
 
     std::thread::spawn(move || {
-        let bytes = match reqwest::blocking::get(&url).and_then(|r| r.bytes()) {
+        let bytes = match ureq::get(&url)
+            .call()
+            .and_then(|resp| resp.into_body().read_to_vec())
+        {
             Ok(b) => b,
             Err(_) => {
                 let _ = result_clone.set(String::new());
@@ -1197,15 +1200,28 @@ fn encode_media_url(
             }
         };
 
-        let img = match image::load_from_memory(&bytes) {
-            Ok(img) => img.to_rgba8(),
-            Err(_) => {
-                let _ = result_clone.set(String::new());
-                return;
+        // Try SVG first (check URL extension or XML content sniffing)
+        let is_svg = url.ends_with(".svg")
+            || url.contains(".svg?")
+            || bytes.starts_with(b"<?xml")
+            || bytes.starts_with(b"<svg");
+        let img = if is_svg {
+            match sixel::render_svg_bytes(&bytes, max_width) {
+                Some(img) => img,
+                None => {
+                    let _ = result_clone.set(String::new());
+                    return;
+                }
+            }
+        } else {
+            match image::load_from_memory(&bytes) {
+                Ok(img) => sixel::scale_image(img.to_rgba8(), max_width),
+                Err(_) => {
+                    let _ = result_clone.set(String::new());
+                    return;
+                }
             }
         };
-
-        let img = sixel::scale_image(img, max_width);
         let rows = sixel::pixel_height_to_rows(img.height());
         let preview = sixel::half_block_preview(&img, sixel::preview_columns(img.width()), rows);
 
@@ -1234,10 +1250,38 @@ fn encode_media(
     if let Some(pending) = sixel::encode_gif_async(path, max_width) {
         return Some(EncodedMedia::Gif(pending));
     }
+    if sixel::is_svg(path) {
+        return encode_svg_file(path, max_width);
+    }
     if let Some(pending) = sixel::encode_image_file_async(path, max_width) {
         return Some(EncodedMedia::Image(pending));
     }
     None
+}
+
+/// Render an SVG file to pixels and encode as a static image.
+fn encode_svg_file(
+    path: &std::path::Path,
+    max_width: u32,
+) -> Option<EncodedMedia> {
+    let img = sixel::render_svg_file(path, max_width)?;
+    let estimated_rows = sixel::pixel_height_to_rows(img.height());
+    let preview =
+        sixel::half_block_preview(&img, sixel::preview_columns(img.width()), estimated_rows);
+
+    let result = std::sync::Arc::new(std::sync::OnceLock::new());
+    let result_clone = result.clone();
+
+    std::thread::spawn(move || {
+        let encoded = sixel::encode_rgba(img.width(), img.height(), img.as_raw());
+        let _ = result_clone.set(encoded);
+    });
+
+    Some(EncodedMedia::Image(sixel::PendingImage::new(
+        result,
+        estimated_rows,
+        preview,
+    )))
 }
 
 /// Push encoded media into the appropriate pending vec and emit an output

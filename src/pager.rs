@@ -1216,35 +1216,40 @@ pub fn print_output(output: &RenderOutput) {
                 println!("{content}");
             }
             Line::ImageStrip {
-                content, sixels, ..
+                sixels,
+                row_in_group,
+                ..
             } => {
-                print!("{content}");
-                for s in sixels {
-                    match s {
-                        PositionedSixel::Static { col, data, .. } => {
-                            print!("\x1b[{col}G{data}");
-                        }
-                        PositionedSixel::Pending { col, image_id, .. } => {
-                            if let Some(p) = output.pending_images.get(*image_id) {
-                                let sixel = p.wait();
-                                if !sixel.is_empty() {
-                                    print!("\x1b[{col}G{sixel}");
+                if *row_in_group == 0 {
+                    // Emit sixels on first row (they render downward)
+                    for s in sixels {
+                        match s {
+                            PositionedSixel::Static { col, data, .. } => {
+                                print!("\x1b[{col}G{data}");
+                            }
+                            PositionedSixel::Pending { col, image_id, .. } => {
+                                if let Some(p) = output.pending_images.get(*image_id) {
+                                    let sixel = p.wait();
+                                    if !sixel.is_empty() {
+                                        print!("\x1b[{col}G{sixel}");
+                                    }
                                 }
                             }
-                        }
-                        PositionedSixel::Gif { col, gif_id, .. } => {
-                            if let Some(gif) = output.pending_gifs.get(*gif_id) {
-                                while !gif.is_done() && gif.frame_count() == 0 {
-                                    std::thread::sleep(Duration::from_millis(10));
-                                }
-                                if let Some(frame) = gif.frame(0) {
-                                    print!("\x1b[{col}G{}", frame.sixel);
+                            PositionedSixel::Gif { col, gif_id, .. } => {
+                                if let Some(gif) = output.pending_gifs.get(*gif_id) {
+                                    while !gif.is_done() && gif.frame_count() == 0 {
+                                        std::thread::sleep(Duration::from_millis(10));
+                                    }
+                                    if let Some(frame) = gif.frame(0) {
+                                        print!("\x1b[{col}G{}", frame.sixel);
+                                    }
                                 }
                             }
                         }
                     }
+                    println!();
                 }
-                println!();
+                // Subsequent rows: skip — sixel from row 0 covers them
             }
         }
     }

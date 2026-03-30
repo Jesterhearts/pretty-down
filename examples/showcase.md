@@ -36,9 +36,9 @@ Images are loaded and rendered inline as sixel graphics:
 
 ### Remote Images
 
-Images can also be loaded from URLs:
+Images can also be loaded from URLs (including SVGs):
 
-![Ferris](https://rustacean.net/assets/rustacean-flat-noshadow.png)
+![Ferris](https://rustacean.net/assets/rustacean-flat-noshadow.png) ![Rust logo](https://www.rust-lang.org/logos/rust-logo-512x512.png)
 
 ## Gifs
 
