@@ -1242,7 +1242,8 @@ pub fn render(
     theme: &crate::theme::Theme,
     highlighter: &crate::highlight::Highlighter,
 ) -> RenderOutput {
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(markdown, options);
 
     let mut out = String::new();
@@ -1521,6 +1522,15 @@ pub fn render(
             }
             Event::Html(html) => {
                 state.html_block_buf.push_str(&html);
+            }
+
+            // ── Task list checkboxes ───────────────────────────────
+            Event::TaskListMarker(checked) => {
+                if checked {
+                    out.push_str("\x1b[32m\u{2611}\x1b[0m "); // ☑ green
+                } else {
+                    out.push_str("\x1b[2m\u{2610}\x1b[0m "); // ☐ dim
+                }
             }
 
             // Ignore everything else (footnotes, etc.)
