@@ -1047,12 +1047,11 @@ fn draw_screen(
                 let paused = video_paused.contains(gif_id);
                 let btn = if paused { "\u{25B6}" } else { "\u{23F8}" }; // ▶ or ⏸
                 let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
-                let total = gifs.get(*gif_id).map(|g| g.frame_count()).unwrap_or(0);
+                let cycle = gifs.get(*gif_id).map(|g| g.cycle_length()).unwrap_or(0);
                 let bar_width = term_cols.saturating_sub(10) as usize;
-                let progress_pos = if total > 1 && bar_width > 0 {
-                    // Use modulo so position wraps on video loop
-                    let pos_in_cycle = frame_idx % total;
-                    (pos_in_cycle * bar_width / total).min(bar_width - 1)
+                let progress_pos = if cycle > 1 && bar_width > 0 {
+                    let pos_in_cycle = frame_idx % cycle;
+                    (pos_in_cycle * bar_width / cycle).min(bar_width - 1)
                 } else {
                     0
                 };

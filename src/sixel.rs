@@ -247,8 +247,13 @@ pub struct GifFrame {
 pub struct PendingGif {
     /// Frames encoded so far. The thread appends to this as it goes.
     frames: Arc<Mutex<Vec<GifFrame>>>,
-    /// Set to true when all frames are encoded.
+    /// Set to true when all frames are encoded (or first loop complete for
+    /// videos).
     done: Arc<OnceLock<()>>,
+    /// Number of frames in one full cycle. Set after the first loop completes.
+    /// For GIFs this equals frame_count() once done. For videos this is set
+    /// by the thread when it reaches the end of the first pass.
+    pub cycle_len: Arc<std::sync::atomic::AtomicUsize>,
     /// The index of the frame currently being displayed by the pager.
     pub playback_idx: Arc<std::sync::atomic::AtomicUsize>,
     /// Estimated terminal rows.
@@ -266,9 +271,20 @@ impl PendingGif {
         self.frames.lock().unwrap().len()
     }
 
-    /// Whether all frames have been encoded.
+    /// Whether all frames have been encoded (or first loop done for videos).
     pub fn is_done(&self) -> bool {
         self.done.get().is_some()
+    }
+
+    /// Number of frames in one full playback cycle (0 if not yet known).
+    pub fn cycle_length(&self) -> usize {
+        let v = self.cycle_len.load(std::sync::atomic::Ordering::Relaxed);
+        if v > 0 {
+            v
+        } else {
+            // Not known yet — use frame_count as estimate
+            self.frame_count()
+        }
     }
 
     /// Get the sixel data for a specific frame (if available).
@@ -351,6 +367,7 @@ pub fn encode_gif_async(
     Some(PendingGif {
         frames,
         done,
+        cycle_len: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         playback_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         estimated_rows,
         preview,
@@ -495,9 +512,11 @@ pub fn encode_video_async(
 
     let frames = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(OnceLock::new());
+    let cycle_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let playback_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let frames_clone = frames.clone();
     let done_clone = done.clone();
+    let cycle_len_clone = cycle_len.clone();
     let playback_clone = playback_idx.clone();
     let path = path.to_owned();
 
@@ -587,6 +606,12 @@ pub fn encode_video_async(
                 }
             }
 
+            // Record cycle length after first pass
+            let count = frames_clone.lock().unwrap().len();
+            if cycle_len_clone.load(std::sync::atomic::Ordering::Relaxed) == 0 && count > 0 {
+                cycle_len_clone.store(count, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Video ended — loop by seeking back to the start
             if input.seek(0, ..).is_err() {
                 break;
@@ -600,6 +625,7 @@ pub fn encode_video_async(
     Some(PendingGif {
         frames,
         done,
+        cycle_len,
         playback_idx,
         estimated_rows,
         preview,
