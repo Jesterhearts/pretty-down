@@ -28,6 +28,12 @@ This document demonstrates all supported rendering features.
 2. Second
 3. Third
 
+## Images
+
+Images are loaded and rendered inline as sixel graphics:
+
+![Mountain landscape](example_image.png)
+
 ## Code Blocks
 
 ```rust
