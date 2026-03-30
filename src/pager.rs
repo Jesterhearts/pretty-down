@@ -324,32 +324,7 @@ pub fn run(
     let mut video_paused: HashSet<usize> = HashSet::new();
 
     loop {
-        // Advance any GIFs whose frame deadline has passed
-        let now = std::time::Instant::now();
-        let mut any_advanced = false;
-        for (id, (frame_idx, deadline)) in gif_state.iter_mut() {
-            if now >= *deadline
-                && !video_paused.contains(id)
-                && let Some(gif) = pending_gifs.get(*id)
-            {
-                let count = gif.frame_count();
-                if count > 1 {
-                    *frame_idx += 1;
-                    // For GIFs, loop. For videos, the thread loops.
-                    if gif.is_done() {
-                        *frame_idx %= count;
-                    }
-                    // Update playback position for throttling
-                    gif.playback_idx
-                        .store(*frame_idx, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(frame) = gif.frame(*frame_idx) {
-                        *deadline = now + Duration::from_millis(frame.delay_ms as u64);
-                    }
-                    any_advanced = true;
-                }
-            }
-        }
-        if any_advanced {
+        if advance_gif_frames(&mut gif_state, pending_gifs, &video_paused) {
             needs_redraw = true;
         }
 
@@ -422,34 +397,8 @@ pub fn run(
             continue;
         }
 
-        // Check if any pending images that are visible just became ready
-        let has_pending = lines.iter().any(|l| {
-            matches!(
-                l,
-                Line::ImageRow {
-                    group: ImageGroup::PendingImage(_),
-                    ..
-                }
-            )
-        });
-        if has_pending {
-            let mut rows = 0u16;
-            for &vi in &visible[scroll_offset..] {
-                if rows >= viewport_rows {
-                    break;
-                }
-                if let Line::ImageRow {
-                    group: ImageGroup::PendingImage(id),
-                    row_in_group: 0,
-                    ..
-                } = &lines[vi]
-                    && pending.get(*id).is_some_and(|p| p.is_ready())
-                {
-                    needs_redraw = true;
-                    break;
-                }
-                rows += lines[vi].rows();
-            }
+        if check_visible_images_ready(&lines, &visible, pending, scroll_offset, viewport_rows) {
+            needs_redraw = true;
         }
 
         // Find the earliest GIF frame deadline
@@ -872,6 +821,74 @@ struct DrawResult {
 /// `scroll_offset` indexes into `visible`, which maps to actual line indices.
 /// Try to render a full sixel image for an image group. Returns true if
 /// rendered.
+fn advance_gif_frames(
+    gif_state: &mut HashMap<usize, (usize, std::time::Instant)>,
+    pending_gifs: &[crate::sixel::PendingGif],
+    video_paused: &HashSet<usize>,
+) -> bool {
+    let now = std::time::Instant::now();
+    let mut any_advanced = false;
+    for (id, (frame_idx, deadline)) in gif_state.iter_mut() {
+        if now >= *deadline
+            && !video_paused.contains(id)
+            && let Some(gif) = pending_gifs.get(*id)
+        {
+            let count = gif.frame_count();
+            if count > 1 {
+                *frame_idx += 1;
+                if gif.is_done() {
+                    *frame_idx %= count;
+                }
+                gif.playback_idx
+                    .store(*frame_idx, std::sync::atomic::Ordering::Relaxed);
+                if let Some(frame) = gif.frame(*frame_idx) {
+                    *deadline = now + Duration::from_millis(frame.delay_ms as u64);
+                }
+                any_advanced = true;
+            }
+        }
+    }
+    any_advanced
+}
+
+fn check_visible_images_ready(
+    lines: &[Line],
+    visible: &[usize],
+    pending: &[crate::sixel::PendingImage],
+    scroll_offset: usize,
+    viewport_rows: u16,
+) -> bool {
+    let has_pending = lines.iter().any(|l| {
+        matches!(
+            l,
+            Line::ImageRow {
+                group: ImageGroup::PendingImage(_),
+                ..
+            }
+        )
+    });
+    if !has_pending {
+        return false;
+    }
+    let mut rows = 0u16;
+    for &vi in &visible[scroll_offset..] {
+        if rows >= viewport_rows {
+            break;
+        }
+        if let Line::ImageRow {
+            group: ImageGroup::PendingImage(id),
+            row_in_group: 0,
+            ..
+        } = &lines[vi]
+            && pending.get(*id).is_some_and(|p| p.is_ready())
+        {
+            return true;
+        }
+        rows += lines[vi].rows();
+    }
+    false
+}
+
 fn try_render_full_image(
     stdout: &mut io::Stdout,
     group: ImageGroup,

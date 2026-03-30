@@ -330,39 +330,41 @@ impl RenderState {
             self.pending_images.push(pending);
         }
     }
+}
 
-    fn push_style(
-        &self,
-        out: &mut String,
-    ) {
-        if self.bold {
-            out.push_str(ansi::BOLD);
-        }
-        if self.italic {
-            out.push_str(ansi::ITALIC);
-        }
-        if self.strikethrough {
-            out.push_str(ansi::STRIKETHROUGH);
-        }
+fn push_active_styles(
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    out: &mut String,
+) {
+    if bold {
+        out.push_str(ansi::BOLD);
     }
-
-    fn list_indent(&self) -> String {
-        "  ".repeat(self.list_stack.len().saturating_sub(1))
+    if italic {
+        out.push_str(ansi::ITALIC);
     }
+    if strikethrough {
+        out.push_str(ansi::STRIKETHROUGH);
+    }
+}
 
-    fn resolve_image_path(
-        &self,
-        src: &str,
-    ) -> Option<std::path::PathBuf> {
-        if src.starts_with("http://") || src.starts_with("https://") {
-            return None;
-        }
-        let p = Path::new(src);
-        if p.is_absolute() {
-            Some(p.to_path_buf())
-        } else {
-            self.base_path.as_ref().map(|bp| bp.join(p))
-        }
+fn list_indent(depth: usize) -> String {
+    "  ".repeat(depth.saturating_sub(1))
+}
+
+fn resolve_image_path(
+    src: &str,
+    base_path: &Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if src.starts_with("http://") || src.starts_with("https://") {
+        return None;
+    }
+    let p = Path::new(src);
+    if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else {
+        base_path.as_ref().map(|bp| bp.join(p))
     }
 }
 
@@ -607,7 +609,7 @@ fn handle_html_open_tag(
         }
         "img" => {
             if let Some(src) = xml_attr(tag, b"src")
-                && let Some(path) = state.resolve_image_path(&src)
+                && let Some(path) = resolve_image_path(&src, &state.base_path)
                 && let Some(sixel_data) =
                     sixel::encode_image_file(&path, sixel::terminal_pixel_width())
             {
@@ -684,40 +686,40 @@ fn handle_html_close_tag(
             state.bold = false;
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
         "i" | "em" | "var" | "cite" => {
             state.italic = false;
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
         "del" | "s" | "strike" => {
             state.strikethrough = false;
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
         "code" | "sup" | "sub" => {
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
         "u" | "ins" | "mark" => {
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
         "kbd" | "samp" => {
             if state.heading_level == 0 {
                 out.push(' ');
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
         "a" => {
@@ -731,14 +733,14 @@ fn handle_html_close_tag(
         "span" | "div" => {
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
         _ => {
             // Reset after any unknown styled element
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
-                state.push_style(out);
+                push_active_styles(state.bold, state.italic, state.strikethrough, out);
             }
         }
     }
@@ -796,7 +798,7 @@ fn handle_block_html(
                     }
                     "img" => {
                         if let Some(src) = xml_attr(e, b"src")
-                            && let Some(path) = state.resolve_image_path(&src)
+                            && let Some(path) = resolve_image_path(&src, &state.base_path)
                             && let Some(sixel_data) =
                                 sixel::encode_image_file(&path, sixel::terminal_pixel_width())
                         {
@@ -832,7 +834,7 @@ fn handle_block_html(
                     }
                     "img" => {
                         if let Some(src) = xml_attr(e, b"src")
-                            && let Some(path) = state.resolve_image_path(&src)
+                            && let Some(path) = resolve_image_path(&src, &state.base_path)
                             && let Some(sixel_data) =
                                 sixel::encode_image_file(&path, sixel::terminal_pixel_width())
                         {
@@ -1101,6 +1103,126 @@ fn flush_text(
     }
 }
 
+fn render_heading_sixel(
+    state: &mut RenderState,
+    out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
+    font: &Font,
+    theme: &crate::theme::Theme,
+) {
+    if state.heading_level == 0 {
+        return;
+    }
+    let idx = (state.heading_level - 1).min(5);
+    let size = HEADING_SIZES[idx];
+    let color = theme.heading_color(state.heading_level);
+    let text = std::mem::take(&mut state.heading_text);
+    let (w, h, pixels) = crate::font::render_text(font, &text, size, color);
+    let max_w = sixel::terminal_pixel_width();
+    let (w, pixels) = if w > max_w {
+        crop_pixels_width(&pixels, w, h, max_w)
+    } else {
+        (w, pixels)
+    };
+    if w > 0 && h > 0 {
+        let data = sixel::encode_rgba(w, h, &pixels);
+        let height = sixel::pixel_height_to_rows(h);
+        let preview = sixel::preview_from_pixels(&pixels, w, h, height);
+        flush_text(out, blocks);
+        blocks.push(OutputBlock::Sixel {
+            data,
+            height,
+            preview,
+        });
+    }
+    state.heading_level = 0;
+}
+
+fn end_paragraph(
+    state: &mut RenderState,
+    out: &mut String,
+    theme: &crate::theme::Theme,
+) {
+    out.push_str(ansi::RESET);
+    if state.blockquote_depth > 0 {
+        let prefix = format!(
+            "{}{}",
+            theme.blockquote.to_ansi(),
+            "  \u{2502} ".repeat(state.blockquote_depth)
+        );
+        let indent_width = 4 * state.blockquote_depth as u16;
+        let wrap_width = state.term_width.saturating_sub(indent_width);
+        let raw = std::mem::take(out);
+        let wrapped = ansi::wrap(&raw, wrap_width);
+        for (i, line) in wrapped.lines().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&prefix);
+            out.push_str(line);
+            out.push_str(ansi::RESET);
+        }
+    } else {
+        let wrapped = ansi::wrap(&std::mem::take(out), state.term_width);
+        out.push_str(&wrapped);
+    }
+    out.push_str("\n\n");
+}
+
+fn end_code_block(
+    state: &mut RenderState,
+    out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
+    theme: &crate::theme::Theme,
+    highlighter: &crate::highlight::Highlighter,
+) {
+    state.in_code_block = false;
+    let code = std::mem::take(&mut state.code_buf);
+
+    let highlighted = state
+        .code_lang
+        .as_deref()
+        .and_then(|lang| highlighter.highlight(&code, lang));
+
+    let styled_lines: Vec<String> = if let Some(colored) = highlighted {
+        let bg_escape = if colored.starts_with("\x1b[48;") {
+            colored
+                .find('m')
+                .map(|i| colored[..=i].to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        colored
+            .lines()
+            .map(|l| {
+                if !bg_escape.is_empty() && !l.starts_with(&bg_escape) {
+                    format!("{bg_escape}{l}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect()
+    } else {
+        let style = theme.code_block.to_ansi();
+        code.lines().map(|l| format!("{style}{l}\x1b[0m")).collect()
+    };
+
+    let max_width = styled_lines
+        .iter()
+        .map(|l| ansi::visible_len(l))
+        .max()
+        .unwrap_or(0);
+
+    flush_text(out, blocks);
+    blocks.push(OutputBlock::Code(state.code_blocks.len()));
+    state.code_blocks.push(CodeBlock {
+        lines: styled_lines,
+        max_width,
+    });
+    state.code_lang = None;
+}
+
 /// Render markdown into a sequence of output blocks.
 pub fn render(
     markdown: &str,
@@ -1131,60 +1253,12 @@ pub fn render(
                 state.heading_text.clear();
             }
             Event::End(TagEnd::Heading(_)) => {
-                if state.heading_level > 0 {
-                    let idx = (state.heading_level - 1).min(5);
-                    let size = HEADING_SIZES[idx];
-                    let color = theme.heading_color(state.heading_level);
-                    let text = std::mem::take(&mut state.heading_text);
-                    let (w, h, pixels) = crate::font::render_text(font, &text, size, color);
-                    let max_w = sixel::terminal_pixel_width();
-                    let (w, pixels) = if w > max_w {
-                        crop_pixels_width(&pixels, w, h, max_w)
-                    } else {
-                        (w, pixels)
-                    };
-                    if w > 0 && h > 0 {
-                        let data = sixel::encode_rgba(w, h, &pixels);
-                        let height = sixel::pixel_height_to_rows(h);
-                        let preview = sixel::preview_from_pixels(&pixels, w, h, height);
-                        flush_text(&mut out, &mut blocks);
-                        blocks.push(OutputBlock::Sixel {
-                            data,
-                            height,
-                            preview,
-                        });
-                    }
-                    state.heading_level = 0;
-                }
+                render_heading_sixel(&mut state, &mut out, &mut blocks, font, theme);
             }
 
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
-                out.push_str(ansi::RESET);
-                if state.blockquote_depth > 0 {
-                    // Apply blockquote prefix to each wrapped line
-                    let prefix = format!(
-                        "{}{}",
-                        theme.blockquote.to_ansi(),
-                        "  \u{2502} ".repeat(state.blockquote_depth)
-                    );
-                    let indent_width = 4 * state.blockquote_depth as u16; // "  │ " = 4 chars
-                    let wrap_width = state.term_width.saturating_sub(indent_width);
-                    let raw = std::mem::take(&mut out);
-                    let wrapped = ansi::wrap(&raw, wrap_width);
-                    for (i, line) in wrapped.lines().enumerate() {
-                        if i > 0 {
-                            out.push('\n');
-                        }
-                        out.push_str(&prefix);
-                        out.push_str(line);
-                        out.push_str(ansi::RESET);
-                    }
-                } else {
-                    let wrapped = ansi::wrap(&std::mem::take(&mut out), state.term_width);
-                    out.push_str(&wrapped);
-                }
-                out.push_str("\n\n");
+                end_paragraph(&mut state, &mut out, theme);
             }
 
             // ── Code blocks ──────────────────────────────────────────
@@ -1197,58 +1271,7 @@ pub fn render(
                 };
             }
             Event::End(TagEnd::CodeBlock) => {
-                state.in_code_block = false;
-                let code = std::mem::take(&mut state.code_buf);
-
-                // Build highlighted lines
-                let highlighted = state
-                    .code_lang
-                    .as_deref()
-                    .and_then(|lang| highlighter.highlight(&code, lang));
-
-                let styled_lines: Vec<String> = if let Some(colored) = highlighted {
-                    // Extract the background escape (if any) to prepend to each line,
-                    // since splitting on newlines loses it from all but the first.
-                    let bg_escape = if colored.starts_with("\x1b[48;") {
-                        colored
-                            .find('m')
-                            .map(|i| colored[..=i].to_string())
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    colored
-                        .lines()
-                        .map(|l| {
-                            if !bg_escape.is_empty() && !l.starts_with(&bg_escape) {
-                                format!("{bg_escape}{l}")
-                            } else {
-                                l.to_string()
-                            }
-                        })
-                        .collect()
-                } else {
-                    let style = theme.code_block.to_ansi();
-                    code.lines().map(|l| format!("{style}{l}\x1b[0m")).collect()
-                };
-
-                // Compute max visible width
-                let max_width = styled_lines
-                    .iter()
-                    .map(|l| ansi::visible_len(l))
-                    .max()
-                    .unwrap_or(0);
-
-                let id = state.code_blocks.len();
-                let _height = styled_lines.len();
-                state.code_blocks.push(CodeBlock {
-                    lines: styled_lines,
-                    max_width,
-                });
-
-                flush_text(&mut out, &mut blocks);
-                blocks.push(OutputBlock::Code(id));
-                state.code_lang = None;
+                end_code_block(&mut state, &mut out, &mut blocks, theme, highlighter);
             }
 
             // ── Inline styling ───────────────────────────────────────
@@ -1269,7 +1292,7 @@ pub fn render(
                     state.italic = false;
                     if state.heading_level == 0 {
                         out.push_str(ansi::RESET);
-                        state.push_style(&mut out);
+                        push_active_styles(state.bold, state.italic, state.strikethrough, &mut out);
                     }
                 }
             }
@@ -1291,7 +1314,7 @@ pub fn render(
                     state.bold = false;
                     if state.heading_level == 0 {
                         out.push_str(ansi::RESET);
-                        state.push_style(&mut out);
+                        push_active_styles(state.bold, state.italic, state.strikethrough, &mut out);
                     }
                 }
             }
@@ -1306,7 +1329,7 @@ pub fn render(
                 state.strikethrough = false;
                 if state.heading_level == 0 && !state.in_table() {
                     out.push_str(ansi::RESET);
-                    state.push_style(&mut out);
+                    push_active_styles(state.bold, state.italic, state.strikethrough, &mut out);
                 }
             }
 
@@ -1329,7 +1352,7 @@ pub fn render(
 
             // ── Images ───────────────────────────────────────────────
             Event::Start(Tag::Image { dest_url, .. }) => {
-                if let Some(path) = state.resolve_image_path(&dest_url) {
+                if let Some(path) = resolve_image_path(&dest_url, &state.base_path) {
                     state.emit_image(&path, &mut out, &mut blocks);
                 }
             }
@@ -1352,7 +1375,7 @@ pub fn render(
                 }
             }
             Event::Start(Tag::Item) => {
-                let indent = state.list_indent();
+                let indent = list_indent(state.list_stack.len());
                 if let Some(idx) = state.item_index.last_mut() {
                     let prefix = match state.list_stack.last() {
                         Some(Some(start)) => {
@@ -1395,7 +1418,7 @@ pub fn render(
                     out.push_str(&theme.code_inline.to_ansi());
                     out.push_str(&code);
                     out.push_str(ansi::RESET);
-                    state.push_style(&mut out);
+                    push_active_styles(state.bold, state.italic, state.strikethrough, &mut out);
                 }
             }
 

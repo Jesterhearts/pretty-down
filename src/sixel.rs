@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use a_sixel::dither::NoDither;
 use a_sixel::dither::Bayer;
+use a_sixel::dither::NoDither;
 use a_sixel::dither::Sierra;
 use image::RgbaImage;
 
@@ -29,6 +29,25 @@ pub fn cell_pixel_height() -> u32 {
 
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+
+/// Query the terminal's cell pixel width. Falls back to 8px.
+pub fn cell_pixel_width() -> u32 {
+    static CELL_WIDTH: OnceLock<u32> = OnceLock::new();
+    *CELL_WIDTH.get_or_init(|| {
+        if let Ok(ws) = crossterm::terminal::window_size()
+            && ws.width > 0
+            && ws.columns > 0
+        {
+            return ws.width as u32 / ws.columns as u32;
+        }
+        8
+    })
+}
+
+/// Compute the preview column width for an image of the given pixel width.
+pub fn preview_columns(pixel_width: u32) -> u32 {
+    (pixel_width / cell_pixel_width()).max(1)
+}
 
 static CACHED_PIXEL_WIDTH: AtomicU32 = AtomicU32::new(0);
 
@@ -173,18 +192,7 @@ pub fn preview_from_pixels(
     estimated_rows: u16,
 ) -> Vec<String> {
     if let Some(img) = RgbaImage::from_raw(w, h, pixels.to_vec()) {
-        let cell_w = crossterm::terminal::window_size()
-            .ok()
-            .and_then(|ws| {
-                if ws.width > 0 && ws.columns > 0 {
-                    Some(ws.width as u32 / ws.columns as u32)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(8);
-        let preview_cols = (w / cell_w).max(1);
-        half_block_preview(&img, preview_cols, estimated_rows)
+        half_block_preview(&img, preview_columns(w), estimated_rows)
     } else {
         vec![]
     }
@@ -200,19 +208,7 @@ pub fn encode_image_file_async(
 
     let estimated_rows = pixel_height_to_rows(img.height());
 
-    // Compute preview width in columns matching the sixel image's pixel width
-    let cell_w = crossterm::terminal::window_size()
-        .ok()
-        .and_then(|ws| {
-            if ws.width > 0 && ws.columns > 0 {
-                Some(ws.width as u32 / ws.columns as u32)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(8);
-    let preview_cols = (img.width() / cell_w).max(1);
-    let preview = half_block_preview(&img, preview_cols, estimated_rows);
+    let preview = half_block_preview(&img, preview_columns(img.width()), estimated_rows);
 
     let result = Arc::new(OnceLock::new());
     let result_clone = result.clone();
@@ -325,19 +321,7 @@ pub fn encode_gif_async(
     let scaled = scale_image(first_buf.clone(), max_width);
     let estimated_rows = pixel_height_to_rows(scaled.height());
 
-    // Generate half-block preview from first frame
-    let cell_w = crossterm::terminal::window_size()
-        .ok()
-        .and_then(|ws| {
-            if ws.width > 0 && ws.columns > 0 {
-                Some(ws.width as u32 / ws.columns as u32)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(8);
-    let preview_cols = (scaled.width() / cell_w).max(1);
-    let preview = half_block_preview(&scaled, preview_cols, estimated_rows);
+    let preview = half_block_preview(&scaled, preview_columns(scaled.width()), estimated_rows);
 
     let frames = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(OnceLock::new());
@@ -441,18 +425,11 @@ fn decode_first_frame_preview(
                     && let Some(img) =
                         RgbaImage::from_raw(dst_width, dst_height, data[..expected].to_vec())
                 {
-                    let cell_w = crossterm::terminal::window_size()
-                        .ok()
-                        .and_then(|ws| {
-                            if ws.width > 0 && ws.columns > 0 {
-                                Some(ws.width as u32 / ws.columns as u32)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(8);
-                    let preview_cols = (dst_width / cell_w).max(1);
-                    return Some(half_block_preview(&img, preview_cols, estimated_rows));
+                    return Some(half_block_preview(
+                        &img,
+                        preview_columns(dst_width),
+                        estimated_rows,
+                    ));
                 }
             }
         }
