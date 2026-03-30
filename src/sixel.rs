@@ -370,6 +370,29 @@ pub fn is_video(path: &std::path::Path) -> bool {
     })
 }
 
+/// Extract an RGBA image from an ffmpeg frame, accounting for stride padding.
+fn frame_to_rgba(
+    frame: &ffmpeg_next::frame::Video,
+    width: u32,
+    height: u32,
+) -> Option<RgbaImage> {
+    let data = frame.data(0);
+    let stride = frame.stride(0);
+    let row_bytes = width as usize * 4;
+
+    let mut pixels = Vec::with_capacity(row_bytes * height as usize);
+    for y in 0..height as usize {
+        let start = y * stride;
+        let end = start + row_bytes;
+        if end > data.len() {
+            return None;
+        }
+        pixels.extend_from_slice(&data[start..end]);
+    }
+
+    RgbaImage::from_raw(width, height, pixels)
+}
+
 /// Decode the first video frame and generate a half-block preview.
 fn decode_first_frame_preview(
     path: &std::path::Path,
@@ -419,12 +442,7 @@ fn decode_first_frame_preview(
                 if sws.run(&decoded, &mut rgb_frame).is_err() {
                     continue;
                 }
-                let data = rgb_frame.data(0);
-                let expected = dst_width as usize * dst_height as usize * 4;
-                if data.len() >= expected
-                    && let Some(img) =
-                        RgbaImage::from_raw(dst_width, dst_height, data[..expected].to_vec())
-                {
+                if let Some(img) = frame_to_rgba(&rgb_frame, dst_width, dst_height) {
                     return Some(half_block_preview(
                         &img,
                         preview_columns(dst_width),
@@ -556,14 +574,7 @@ pub fn encode_video_async(
                     if sws.run(&decoded, &mut rgb_frame).is_err() {
                         continue;
                     }
-                    let data = rgb_frame.data(0);
-                    let expected = dst_width as usize * dst_height as usize * 4;
-                    if data.len() < expected {
-                        continue;
-                    }
-                    if let Some(img) =
-                        RgbaImage::from_raw(dst_width, dst_height, data[..expected].to_vec())
-                    {
+                    if let Some(img) = frame_to_rgba(&rgb_frame, dst_width, dst_height) {
                         // Throttle: wait if we're too far ahead of playback
                         loop {
                             let count = frames_clone.lock().unwrap().len();
