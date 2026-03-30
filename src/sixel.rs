@@ -97,6 +97,8 @@ pub struct PendingImage {
     result: Arc<OnceLock<String>>,
     /// Estimated terminal rows this image will occupy.
     pub estimated_rows: u16,
+    /// Half-block preview (ANSI-colored text lines).
+    pub preview: Vec<String>,
 }
 
 impl PendingImage {
@@ -114,6 +116,52 @@ impl PendingImage {
     }
 }
 
+/// Generate a half-block (▀) preview of an image.
+///
+/// Each character cell represents 2 vertical pixels: foreground = top pixel,
+/// background = bottom pixel. The image is downscaled with nearest-neighbor
+/// to fit `cols` columns × `rows` character rows.
+fn half_block_preview(
+    img: &RgbaImage,
+    cols: u32,
+    rows: u16,
+) -> Vec<String> {
+    if cols == 0 || rows == 0 || img.width() == 0 || img.height() == 0 {
+        return vec![];
+    }
+
+    let pixel_rows = rows as u32 * 2; // 2 pixel rows per character row
+    let mut lines = Vec::with_capacity(rows as usize);
+
+    for row in 0..rows as u32 {
+        let mut line = String::new();
+        for col in 0..cols {
+            // Map to source pixel coordinates (nearest neighbor)
+            let sx = (col * img.width() / cols).min(img.width() - 1);
+            let sy_top = (row * 2 * img.height() / pixel_rows).min(img.height() - 1);
+            let sy_bot = ((row * 2 + 1) * img.height() / pixel_rows).min(img.height() - 1);
+
+            let top = img.get_pixel(sx, sy_top);
+            let bot = img.get_pixel(sx, sy_bot);
+
+            // Skip fully transparent pixels
+            if top[3] == 0 && bot[3] == 0 {
+                line.push(' ');
+                continue;
+            }
+
+            line.push_str(&format!(
+                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2580}",
+                top[0], top[1], top[2], bot[0], bot[1], bot[2]
+            ));
+        }
+        line.push_str("\x1b[0m");
+        lines.push(line);
+    }
+
+    lines
+}
+
 /// Load an image file and start encoding to sixel in a background thread.
 pub fn encode_image_file_async(
     path: &std::path::Path,
@@ -123,6 +171,12 @@ pub fn encode_image_file_async(
     let img = scale_image(img, max_width);
 
     let estimated_rows = pixel_height_to_rows(img.height());
+
+    // Generate half-block preview before the image is consumed by encoding
+    let term_cols = crossterm::terminal::size()
+        .map(|(c, _)| c as u32)
+        .unwrap_or(80);
+    let preview = half_block_preview(&img, term_cols, estimated_rows);
 
     let result = Arc::new(OnceLock::new());
     let result_clone = result.clone();
@@ -135,6 +189,7 @@ pub fn encode_image_file_async(
     Some(PendingImage {
         result,
         estimated_rows,
+        preview,
     })
 }
 

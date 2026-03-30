@@ -748,7 +748,6 @@ fn draw_screen(
                 }
             }
             Line::PendingImage { id, estimated_rows } => {
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 if let Some(p) = pending_images.get(*id) {
                     if p.is_ready() {
                         let sixel = p.wait();
@@ -757,21 +756,29 @@ fn draw_screen(
                         } else {
                             estimate_sixel_rows(sixel)
                         };
-                        // Only render the sixel if it fits — avoids
-                        // terminal auto-scroll on ready transition.
                         if height > 0 && rows_used + height <= viewport_rows {
+                            // Fits — render the full sixel
+                            crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                             write!(stdout, "{sixel}").unwrap();
                             rows_used += height;
-                        } else if height > 0 {
-                            // Doesn't fit — show size hint, render
-                            // when user scrolls it to the top.
-                            rows_used += 1;
                         } else {
-                            rows_used += estimated_rows;
+                            // Doesn't fit — render half-block preview
+                            let avail = viewport_rows - rows_used;
+                            render_preview(stdout, &p.preview, rows_used, avail);
+                            rows_used += avail.min(*estimated_rows);
                         }
                     } else {
-                        write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
-                        rows_used += 1;
+                        // Still loading — render preview if available,
+                        // otherwise show placeholder
+                        if !p.preview.is_empty() {
+                            let avail = viewport_rows - rows_used;
+                            render_preview(stdout, &p.preview, rows_used, avail);
+                            rows_used += avail.min(*estimated_rows);
+                        } else {
+                            crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                            write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
+                            rows_used += 1;
+                        }
                     }
                 } else {
                     rows_used += estimated_rows;
@@ -933,6 +940,19 @@ fn find_code_block_at_row(
         rows_used += line_rows;
     }
     None
+}
+
+/// Render a half-block image preview, clipped to `avail` rows.
+fn render_preview(
+    stdout: &mut io::Stdout,
+    preview: &[String],
+    start_row: u16,
+    avail: u16,
+) {
+    for (i, line) in preview.iter().enumerate().take(avail as usize) {
+        crossterm::execute!(stdout, cursor::MoveTo(0, start_row + i as u16)).unwrap();
+        write!(stdout, "{line}\x1b[0m\r").unwrap();
+    }
 }
 
 /// Render a horizontal scrollbar for a code block.
