@@ -78,9 +78,11 @@ fn query_pixel_width() -> u32 {
 }
 
 /// Convert a pixel height to terminal rows using the actual cell height.
+/// Adds a +1 safety margin because integer cell height truncation can
+/// cause the actual sixel to occupy one more row than the math predicts.
 pub fn pixel_height_to_rows(pixel_height: u32) -> u16 {
     let cell_h = cell_pixel_height();
-    pixel_height.div_ceil(cell_h).max(1) as u16
+    (pixel_height.div_ceil(cell_h) + 1).max(1) as u16
 }
 
 /// Encode an RGBA pixel buffer as a sixel string, optimized for
