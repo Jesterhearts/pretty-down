@@ -27,18 +27,27 @@ use crossterm::terminal::{
 
 use crate::renderer::RenderOutput;
 
+/// Identifies an image group (for sixel replacement of preview rows).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ImageGroup {
+    Sixel(usize),        // index into a vec of sixel data
+    PendingImage(usize), // index into pending_images
+    Gif(usize),          // index into pending_gifs
+}
+
 /// A display line.
 enum Line {
     /// A regular text line (may contain ANSI escapes).
     Text(String),
-    /// A sixel image block — occupies `height` terminal rows.
-    Sixel {
-        data: String,
-        height: u16,
-        preview: Vec<String>,
+    /// One row of a half-block image preview, belonging to an image group.
+    /// When all rows of the group are visible, the pager replaces them
+    /// with the full sixel image.
+    ImageRow {
+        group: ImageGroup,
+        row_in_group: u16,
+        total_rows: u16,
+        preview_text: String,
     },
-    /// A placeholder for an image being encoded in the background.
-    PendingImage { id: usize, estimated_rows: u16 },
     /// Start of a `<details>` block (invisible marker, zero height).
     #[allow(dead_code)]
     DetailsStart { id: usize },
@@ -46,8 +55,6 @@ enum Line {
     DetailsSummary { id: usize, text: String },
     /// End of a `<details>` block (invisible marker, zero height).
     DetailsEnd { id: usize },
-    /// An animated GIF placeholder.
-    Gif { id: usize, estimated_rows: u16 },
     /// A horizontally scrollable code block.
     CodeBlock { id: usize, height: u16 },
 }
@@ -56,11 +63,7 @@ impl Line {
     /// Number of terminal rows this line occupies.
     fn rows(&self) -> u16 {
         match self {
-            Line::Text(_) => 1,
-            Line::Sixel { height, .. } => *height,
-            Line::PendingImage { estimated_rows, .. } | Line::Gif { estimated_rows, .. } => {
-                *estimated_rows
-            }
+            Line::Text(_) | Line::ImageRow { .. } => 1,
             Line::CodeBlock { height, .. } => *height,
             Line::DetailsSummary { .. } => 1,
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => 0,
@@ -68,11 +71,25 @@ impl Line {
     }
 }
 
+/// Sixel data stored separately, referenced by ImageGroup.
+struct SixelData {
+    data: String,
+    #[allow(dead_code)]
+    height: u16,
+}
+
 /// Flatten output blocks into display lines for the pager.
-fn flatten_blocks(output: &crate::renderer::RenderOutput) -> Vec<Line> {
+/// Each image/sixel is expanded into individual preview rows that scroll
+/// naturally. The draw loop replaces them with the full sixel when all
+/// rows are visible.
+fn flatten_blocks(
+    output: &crate::renderer::RenderOutput,
+    sixel_store: &mut Vec<SixelData>,
+) -> Vec<Line> {
     use crate::renderer::OutputBlock;
 
     let mut lines = Vec::new();
+    sixel_store.clear();
 
     for block in &output.blocks {
         match block {
@@ -86,33 +103,58 @@ fn flatten_blocks(output: &crate::renderer::RenderOutput) -> Vec<Line> {
                 height,
                 preview,
             } => {
-                lines.push(Line::Sixel {
+                let group_id = sixel_store.len();
+                sixel_store.push(SixelData {
                     data: data.clone(),
                     height: *height,
-                    preview: preview.clone(),
                 });
+                let group = ImageGroup::Sixel(group_id);
+                let total = *height;
+                for (i, pline) in preview.iter().enumerate().take(total as usize) {
+                    lines.push(Line::ImageRow {
+                        group,
+                        row_in_group: i as u16,
+                        total_rows: total,
+                        preview_text: pline.clone(),
+                    });
+                }
+                // Pad if preview has fewer lines than height
+                for i in preview.len()..total as usize {
+                    lines.push(Line::ImageRow {
+                        group,
+                        row_in_group: i as u16,
+                        total_rows: total,
+                        preview_text: String::new(),
+                    });
+                }
             }
             OutputBlock::Image(id) => {
-                let rows = output
-                    .pending_images
-                    .get(*id)
-                    .map(|p| p.estimated_rows)
-                    .unwrap_or(1);
-                lines.push(Line::PendingImage {
-                    id: *id,
-                    estimated_rows: rows,
-                });
+                let p = output.pending_images.get(*id);
+                let rows = p.map(|p| p.estimated_rows).unwrap_or(1);
+                let group = ImageGroup::PendingImage(*id);
+                let preview = p.map(|p| &p.preview[..]).unwrap_or(&[]);
+                for i in 0..rows {
+                    let preview_text = preview.get(i as usize).cloned().unwrap_or_default();
+                    lines.push(Line::ImageRow {
+                        group,
+                        row_in_group: i,
+                        total_rows: rows,
+                        preview_text,
+                    });
+                }
             }
             OutputBlock::Gif(id) => {
-                let rows = output
-                    .pending_gifs
-                    .get(*id)
-                    .map(|g| g.estimated_rows)
-                    .unwrap_or(1);
-                lines.push(Line::Gif {
-                    id: *id,
-                    estimated_rows: rows,
-                });
+                let g = output.pending_gifs.get(*id);
+                let rows = g.map(|g| g.estimated_rows).unwrap_or(1);
+                let group = ImageGroup::Gif(*id);
+                for i in 0..rows {
+                    lines.push(Line::ImageRow {
+                        group,
+                        row_in_group: i,
+                        total_rows: rows,
+                        preview_text: String::new(), // GIFs don't have static preview
+                    });
+                }
             }
             OutputBlock::Code(id) => {
                 let height = output
@@ -173,29 +215,6 @@ fn visible_indices(
     visible
 }
 
-/// Estimate how many terminal rows a sixel image occupies.
-fn estimate_sixel_rows(data: &str) -> u16 {
-    if let Some(q_pos) = data.find('q') {
-        let after_q = &data[q_pos + 1..];
-        if let Some(raster) = after_q.strip_prefix('"') {
-            let parts: Vec<&str> = raster.splitn(5, ';').collect();
-            if parts.len() >= 4
-                && let Ok(pv) = parts[3]
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse::<u32>()
-            {
-                return crate::sixel::pixel_height_to_rows(pv);
-            }
-        }
-    }
-
-    let band_count = data.chars().filter(|&c| c == '-').count() as u32 + 1;
-    let pixel_height = band_count * 6;
-    crate::sixel::pixel_height_to_rows(pixel_height)
-}
-
 /// Set up a file watcher.
 fn setup_watcher(path: &Path) -> Option<(mpsc::Receiver<()>, notify::RecommendedWatcher)> {
     use notify::Watcher;
@@ -225,7 +244,8 @@ pub fn run(
     watch_path: Option<&Path>,
     render_fn: &dyn Fn() -> RenderOutput,
 ) {
-    let mut lines = flatten_blocks(output);
+    let mut sixel_store = Vec::new();
+    let mut lines = flatten_blocks(output, &mut sixel_store);
     let mut pending = &output.pending_images;
     let mut pending_gifs = &output.pending_gifs;
     let mut code_blocks = &output.code_blocks;
@@ -244,7 +264,15 @@ pub fn run(
 
     // If content fits and no watch and no pending images, just print directly
     let total_rows: u16 = lines.iter().map(|l| l.rows()).sum();
-    let has_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
+    let has_pending = lines.iter().any(|l| {
+        matches!(
+            l,
+            Line::ImageRow {
+                group: ImageGroup::PendingImage(_),
+                ..
+            }
+        )
+    });
     if total_rows <= viewport_rows && watch_path.is_none() && !has_pending {
         // Print text, resolving any pending images inline
         print_output(output);
@@ -316,6 +344,7 @@ pub fn run(
                 &lines,
                 &visible,
                 &collapsed,
+                &sixel_store,
                 pending,
                 pending_gifs,
                 &gif_frames,
@@ -330,7 +359,12 @@ pub fn run(
 
             // Register any newly visible GIFs that aren't tracked yet
             for &vi in &visible[scroll_offset..] {
-                if let Line::Gif { id, .. } = &lines[vi] {
+                if let Line::ImageRow {
+                    group: ImageGroup::Gif(id),
+                    row_in_group: 0,
+                    ..
+                } = &lines[vi]
+                {
                     gif_state.entry(*id).or_insert_with(|| {
                         let delay = pending_gifs
                             .get(*id)
@@ -354,7 +388,7 @@ pub fn run(
             while rx.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(50));
             let new_output = render_fn();
-            lines = flatten_blocks(&new_output);
+            lines = flatten_blocks(&new_output, &mut sixel_store);
             visible = visible_indices(&lines, &collapsed);
             current_output = Some(new_output);
             pending = &current_output.as_ref().unwrap().pending_images;
@@ -369,14 +403,26 @@ pub fn run(
         }
 
         // Check if any pending images that are visible just became ready
-        let has_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
+        let has_pending = lines.iter().any(|l| {
+            matches!(
+                l,
+                Line::ImageRow {
+                    group: ImageGroup::PendingImage(_),
+                    ..
+                }
+            )
+        });
         if has_pending {
             let mut rows = 0u16;
             for &vi in &visible[scroll_offset..] {
                 if rows >= viewport_rows {
                     break;
                 }
-                if let Line::PendingImage { id, .. } = &lines[vi]
+                if let Line::ImageRow {
+                    group: ImageGroup::PendingImage(id),
+                    row_in_group: 0,
+                    ..
+                } = &lines[vi]
                     && pending.get(*id).is_some_and(|p| p.is_ready())
                 {
                     needs_redraw = true;
@@ -413,7 +459,7 @@ pub fn run(
             // Invalidate cached pixel width so re-render picks up new size
             crate::sixel::invalidate_terminal_size();
             let new_output = render_fn();
-            lines = flatten_blocks(&new_output);
+            lines = flatten_blocks(&new_output, &mut sixel_store);
             visible = visible_indices(&lines, &collapsed);
             current_output = Some(new_output);
             pending = &current_output.as_ref().unwrap().pending_images;
@@ -610,7 +656,7 @@ pub fn run(
                     ..
                 } => {
                     let new_output = render_fn();
-                    lines = flatten_blocks(&new_output);
+                    lines = flatten_blocks(&new_output, &mut sixel_store);
                     visible = visible_indices(&lines, &collapsed);
                     current_output = Some(new_output);
                     pending = &current_output.as_ref().unwrap().pending_images;
@@ -660,30 +706,46 @@ pub fn run(
 
 /// Print output directly, resolving pending images synchronously.
 pub fn print_output(output: &RenderOutput) {
-    let lines = flatten_blocks(output);
-    let pending = &output.pending_images;
+    let mut sixel_store = Vec::new();
+    let lines = flatten_blocks(output, &mut sixel_store);
+    // For non-pager output, print sixel for images at row 0 of each group
+    let mut printed_groups = std::collections::HashSet::new();
     for line in &lines {
         match line {
             Line::Text(t) => println!("{t}"),
-            Line::Sixel { data, .. } => println!("{data}"),
-            Line::PendingImage { id, .. } => {
-                if let Some(p) = pending.get(*id) {
-                    let sixel = p.wait();
-                    if !sixel.is_empty() {
-                        println!("{sixel}");
+            Line::ImageRow {
+                group,
+                row_in_group,
+                ..
+            } => {
+                if *row_in_group == 0 && printed_groups.insert(*group) {
+                    match group {
+                        ImageGroup::Sixel(id) => {
+                            if let Some(sd) = sixel_store.get(*id) {
+                                println!("{}", sd.data);
+                            }
+                        }
+                        ImageGroup::PendingImage(id) => {
+                            if let Some(p) = output.pending_images.get(*id) {
+                                let sixel = p.wait();
+                                if !sixel.is_empty() {
+                                    println!("{sixel}");
+                                }
+                            }
+                        }
+                        ImageGroup::Gif(id) => {
+                            if let Some(gif) = output.pending_gifs.get(*id) {
+                                while !gif.is_done() && gif.frame_count() == 0 {
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                if let Some(frame) = gif.frame(0) {
+                                    println!("{}", frame.sixel);
+                                }
+                            }
+                        }
                     }
                 }
-            }
-            Line::Gif { id, .. } => {
-                // Non-pager: just show first frame
-                if let Some(gif) = output.pending_gifs.get(*id) {
-                    while !gif.is_done() && gif.frame_count() == 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    if let Some(frame) = gif.frame(0) {
-                        println!("{}", frame.sixel);
-                    }
-                }
+                // Skip non-first rows of the group (sixel covers them)
             }
             Line::DetailsSummary { text, .. } => {
                 println!("\x1b[1m\u{25BC} {text}\x1b[0m");
@@ -708,12 +770,56 @@ struct DrawResult {
 
 /// Draw the current view.
 /// `scroll_offset` indexes into `visible`, which maps to actual line indices.
+/// Try to render a full sixel image for an image group. Returns true if
+/// rendered.
+fn try_render_full_image(
+    stdout: &mut io::Stdout,
+    group: ImageGroup,
+    row: u16,
+    sixel_store: &[SixelData],
+    pending_images: &[crate::sixel::PendingImage],
+    gifs: &[crate::sixel::PendingGif],
+    gif_frames: &HashMap<usize, usize>,
+) -> bool {
+    crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
+    match group {
+        ImageGroup::Sixel(id) => {
+            if let Some(sd) = sixel_store.get(id) {
+                write!(stdout, "{}", sd.data).unwrap();
+                return true;
+            }
+        }
+        ImageGroup::PendingImage(id) => {
+            if let Some(p) = pending_images.get(id)
+                && p.is_ready()
+            {
+                let sixel = p.wait();
+                if !sixel.is_empty() {
+                    write!(stdout, "{sixel}").unwrap();
+                    return true;
+                }
+            }
+        }
+        ImageGroup::Gif(id) => {
+            if let Some(gif) = gifs.get(id) {
+                let frame_idx = gif_frames.get(&id).copied().unwrap_or(0);
+                if let Some(frame) = gif.frame(frame_idx) {
+                    write!(stdout, "{}", frame.sixel).unwrap();
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
     visible: &[usize],
     collapsed: &HashSet<usize>,
+    sixel_store: &[SixelData],
     pending_images: &[crate::sixel::PendingImage],
     gifs: &[crate::sixel::PendingGif],
     gif_frames: &HashMap<usize, usize>,
@@ -746,80 +852,51 @@ fn draw_screen(
                 write!(stdout, "{text}\r").unwrap();
                 rows_used += 1;
             }
-            Line::Sixel {
-                data,
-                height,
-                preview,
+            Line::ImageRow {
+                group,
+                row_in_group,
+                total_rows,
+                preview_text,
             } => {
-                if rows_used + height <= viewport_rows {
-                    // Fits — render the full sixel
+                // Check if this is the first row AND all rows of the
+                // group fit — if so, render the full sixel/gif.
+                let render_full = *row_in_group == 0
+                    && rows_used + total_rows <= viewport_rows
+                    && try_render_full_image(
+                        stdout,
+                        *group,
+                        rows_used,
+                        sixel_store,
+                        pending_images,
+                        gifs,
+                        gif_frames,
+                    );
+
+                if render_full {
+                    // Skip the remaining ImageRows of this group
+                    rows_used += total_rows;
+                    vis_idx += 1;
+                    // Advance past remaining rows of this group
+                    while vis_idx < visible.len() {
+                        let next = visible[vis_idx];
+                        if let Line::ImageRow { group: g, .. } = &lines[next]
+                            && g == group
+                        {
+                            vis_idx += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    continue; // skip the vis_idx += 1 at bottom
+                } else {
+                    // Render one preview row
                     crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                    write!(stdout, "{data}").unwrap();
-                    rows_used += height;
-                } else if !preview.is_empty() {
-                    // Doesn't fit — render half-block preview
-                    let avail = viewport_rows - rows_used;
-                    render_preview(stdout, preview, rows_used, avail);
-                    rows_used += avail.min(*height);
-                } else {
+                    if preview_text.is_empty() {
+                        write!(stdout, "\x1b[2m  [loading...]\x1b[0m\r").unwrap();
+                    } else {
+                        write!(stdout, "{preview_text}\x1b[0m\r").unwrap();
+                    }
                     rows_used += 1;
-                }
-            }
-            Line::PendingImage { id, estimated_rows } => {
-                if let Some(p) = pending_images.get(*id) {
-                    if p.is_ready() {
-                        let sixel = p.wait();
-                        let height = if sixel.is_empty() {
-                            0
-                        } else {
-                            estimate_sixel_rows(sixel)
-                        };
-                        if height > 0 && rows_used + height <= viewport_rows {
-                            // Fits — render the full sixel
-                            crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                            write!(stdout, "{sixel}").unwrap();
-                            rows_used += height;
-                        } else {
-                            // Doesn't fit — render half-block preview
-                            let avail = viewport_rows - rows_used;
-                            render_preview(stdout, &p.preview, rows_used, avail);
-                            rows_used += avail.min(*estimated_rows);
-                        }
-                    } else {
-                        // Still loading — render preview if available,
-                        // otherwise show placeholder
-                        if !p.preview.is_empty() {
-                            let avail = viewport_rows - rows_used;
-                            render_preview(stdout, &p.preview, rows_used, avail);
-                            rows_used += avail.min(*estimated_rows);
-                        } else {
-                            crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                            write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
-                            rows_used += 1;
-                        }
-                    }
-                } else {
-                    rows_used += estimated_rows;
-                }
-            }
-            Line::Gif { id, estimated_rows } => {
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                let frame_idx = gif_frames.get(id).copied().unwrap_or(0);
-                if let Some(gif) = gifs.get(*id) {
-                    if let Some(frame) = gif.frame(frame_idx)
-                        && rows_used + estimated_rows <= viewport_rows
-                    {
-                        write!(stdout, "{}", frame.sixel).unwrap();
-                        rows_used += estimated_rows;
-                    } else if gif.frame_count() == 0 {
-                        write!(stdout, "\x1b[2m  [loading gif...]\x1b[0m\r").unwrap();
-                        rows_used += 1;
-                    } else {
-                        // Doesn't fit
-                        rows_used += 1;
-                    }
-                } else {
-                    rows_used += estimated_rows;
                 }
             }
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {
@@ -960,20 +1037,6 @@ fn find_code_block_at_row(
     None
 }
 
-/// Render a half-block image preview, clipped to `avail` rows.
-fn render_preview(
-    stdout: &mut io::Stdout,
-    preview: &[String],
-    start_row: u16,
-    avail: u16,
-) {
-    for (i, line) in preview.iter().enumerate().take(avail as usize) {
-        crossterm::execute!(stdout, cursor::MoveTo(0, start_row + i as u16)).unwrap();
-        write!(stdout, "{line}\x1b[0m\r").unwrap();
-    }
-}
-
-/// Render a horizontal scrollbar for a code block.
 fn render_scrollbar(
     offset: usize,
     content_width: usize,
