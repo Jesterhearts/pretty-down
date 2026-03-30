@@ -500,38 +500,59 @@ pub fn run(
         }
 
         // Handle mouse horizontal scroll on code blocks
-        if let Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight,
-            row,
-            ..
-        }) = ev
+        // Supports native ScrollLeft/ScrollRight and Shift+ScrollDown/ScrollUp
         {
-            // Find which code block the mouse is over
-            if let Some(block_id) = find_code_block_at_row(
-                &lines,
-                &visible,
-                code_blocks,
-                scroll_offset,
-                viewport_rows,
-                row,
-            ) {
-                let entry = code_h_scroll.entry(block_id).or_insert(0);
-                let max = code_blocks[block_id]
-                    .max_width
-                    .saturating_sub(term_cols as usize);
-                if matches!(
-                    ev,
-                    Event::Mouse(MouseEvent {
-                        kind: MouseEventKind::ScrollRight,
-                        ..
-                    })
+            let h_scroll_dir = match &ev {
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollRight,
+                    ..
+                }) => Some((true, None)),
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollLeft,
+                    ..
+                }) => Some((false, None)),
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    row,
+                    modifiers,
+                    ..
+                }) if modifiers.contains(KeyModifiers::SHIFT) => Some((true, Some(*row))),
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    row,
+                    modifiers,
+                    ..
+                }) if modifiers.contains(KeyModifiers::SHIFT) => Some((false, Some(*row))),
+                _ => None,
+            };
+            if let Some((right, row_override)) = h_scroll_dir {
+                let row = row_override.unwrap_or({
+                    if let Event::Mouse(MouseEvent { row, .. }) = &ev {
+                        *row
+                    } else {
+                        0
+                    }
+                });
+                if let Some(block_id) = find_code_block_at_row(
+                    &lines,
+                    &visible,
+                    code_blocks,
+                    scroll_offset,
+                    viewport_rows,
+                    row,
                 ) {
-                    *entry = (*entry + 4).min(max);
-                } else {
-                    *entry = entry.saturating_sub(4);
+                    let entry = code_h_scroll.entry(block_id).or_insert(0);
+                    let max = code_blocks[block_id]
+                        .max_width
+                        .saturating_sub(term_cols as usize);
+                    if right {
+                        *entry = (*entry + 4).min(max);
+                    } else {
+                        *entry = entry.saturating_sub(4);
+                    }
+                    needs_redraw = true;
+                    continue;
                 }
-                needs_redraw = true;
-                continue;
             }
         }
 
@@ -652,6 +673,35 @@ pub fn run(
                 } => {
                     scroll_offset = advance_lines(&visible, scroll_offset, viewport_rows as usize);
                     needs_redraw = true;
+                }
+                // Horizontal scroll code blocks
+                KeyEvent {
+                    code: KeyCode::Char('h') | KeyCode::Left,
+                    ..
+                } => {
+                    if let Some(block_id) =
+                        first_visible_code_block(&lines, &visible, scroll_offset)
+                    {
+                        let entry = code_h_scroll.entry(block_id).or_insert(0);
+                        *entry = entry.saturating_sub(4);
+                        needs_redraw = true;
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('l') | KeyCode::Right,
+                    ..
+                } => {
+                    if let Some(block_id) =
+                        first_visible_code_block(&lines, &visible, scroll_offset)
+                    {
+                        let entry = code_h_scroll.entry(block_id).or_insert(0);
+                        let max = code_blocks
+                            .get(block_id)
+                            .map(|b| b.max_width.saturating_sub(term_cols as usize))
+                            .unwrap_or(0);
+                        *entry = (*entry + 4).min(max);
+                        needs_redraw = true;
+                    }
                 }
                 KeyEvent {
                     code: KeyCode::Char('r'),
@@ -954,8 +1004,8 @@ fn draw_screen(
     };
     let watch_indicator = if watching { " [watching]" } else { "" };
     let status = format!(
-        " [{progress}%]{watch_indicator} j/k:scroll  d/u:half-page  g/G:top/bottom  enter:toggle  \
-         r:reload  q:quit "
+        " [{progress}%]{watch_indicator} j/k:scroll  h/l:code-scroll  d/u:half-page  \
+         g/G:top/bottom  enter:toggle  r:reload  q:quit "
     );
     crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
     write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = 80).unwrap();
@@ -1013,6 +1063,20 @@ fn first_visible_details(
 }
 
 /// Find which code block (if any) occupies the given terminal row.
+/// Find the first visible code block from scroll_offset.
+fn first_visible_code_block(
+    lines: &[Line],
+    visible: &[usize],
+    scroll_offset: usize,
+) -> Option<usize> {
+    for &vi in &visible[scroll_offset..] {
+        if let Line::CodeBlock { id, .. } = &lines[vi] {
+            return Some(*id);
+        }
+    }
+    None
+}
+
 fn find_code_block_at_row(
     lines: &[Line],
     visible: &[usize],
