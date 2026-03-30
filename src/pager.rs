@@ -268,15 +268,7 @@ pub fn run(
         .collect();
     let mut visible = visible_indices(&lines, &collapsed);
 
-    #[derive(Clone, Copy, PartialEq)]
-    enum ScrollDir {
-        None,
-        Down,
-        Up,
-    }
-    let mut scroll_dir = ScrollDir::None;
     let mut last_draw = DrawResult {
-        overflow: None,
         summary_rows: Vec::new(),
     };
     // Per-GIF animation state: (current frame index, next frame deadline)
@@ -343,36 +335,6 @@ pub fn run(
                     });
                 }
             }
-            if let Some(ref ov) = last_draw.overflow {
-                match scroll_dir {
-                    ScrollDir::Down => {
-                        let mut rows_to_skip = ov.rows;
-                        while rows_to_skip > 0 && scroll_offset < visible.len() {
-                            let r = lines[visible[scroll_offset]].rows();
-                            if r > rows_to_skip {
-                                break;
-                            }
-                            scroll_offset += 1;
-                            rows_to_skip -= r;
-                        }
-                    }
-                    ScrollDir::Up => {
-                        let image_vis_idx = ov.vis_idx;
-                        let mut rows = 0u16;
-                        let mut target = image_vis_idx;
-                        while target > 0 {
-                            target -= 1;
-                            rows += lines[visible[target]].rows();
-                            if rows >= viewport_rows {
-                                break;
-                            }
-                        }
-                        scroll_offset = target;
-                    }
-                    ScrollDir::None => {}
-                }
-            }
-            scroll_dir = ScrollDir::None;
             needs_redraw = false;
         }
 
@@ -523,7 +485,6 @@ pub fn run(
         }) = ev
         {
             scroll_offset = advance_lines(&visible, scroll_offset, 3);
-            scroll_dir = ScrollDir::Down;
             needs_redraw = true;
             continue;
         }
@@ -533,7 +494,6 @@ pub fn run(
         }) = ev
         {
             scroll_offset = retreat_lines(scroll_offset, 3);
-            scroll_dir = ScrollDir::Up;
             needs_redraw = true;
             continue;
         }
@@ -559,7 +519,6 @@ pub fn run(
                     ..
                 } => {
                     scroll_offset = advance_lines(&visible, scroll_offset, 1);
-                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 // Scroll up
@@ -568,7 +527,6 @@ pub fn run(
                     ..
                 } => {
                     scroll_offset = retreat_lines(scroll_offset, 1);
-                    scroll_dir = ScrollDir::Up;
                     needs_redraw = true;
                 }
                 // Half page down
@@ -587,7 +545,6 @@ pub fn run(
                 } => {
                     let half = (viewport_rows / 2) as usize;
                     scroll_offset = advance_lines(&visible, scroll_offset, half);
-                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 // Half page up
@@ -606,7 +563,6 @@ pub fn run(
                 } => {
                     let half = (viewport_rows / 2) as usize;
                     scroll_offset = retreat_lines(scroll_offset, half);
-                    scroll_dir = ScrollDir::Up;
                     needs_redraw = true;
                 }
                 // Top
@@ -630,7 +586,6 @@ pub fn run(
                     code: KeyCode::End, ..
                 } => {
                     scroll_offset = scroll_to_end(&lines, &visible, viewport_rows);
-                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 // Space = page down
@@ -639,7 +594,6 @@ pub fn run(
                     ..
                 } => {
                     scroll_offset = advance_lines(&visible, scroll_offset, viewport_rows as usize);
-                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 KeyEvent {
@@ -738,16 +692,7 @@ pub fn print_output(output: &RenderOutput) {
     }
 }
 
-/// Info about a sixel overflow that occurred during drawing.
-struct Overflow {
-    /// Number of rows the terminal auto-scrolled.
-    rows: u16,
-    /// Index into `visible` of the sixel that caused the overflow.
-    vis_idx: usize,
-}
-
 struct DrawResult {
-    overflow: Option<Overflow>,
     /// Maps terminal row → details block ID for click handling.
     summary_rows: Vec<(u16, usize)>,
 }
@@ -782,7 +727,6 @@ fn draw_screen(
 
     let mut rows_used: u16 = 0;
     let mut vis_idx = scroll_offset;
-    let mut overflow: Option<Overflow> = None;
     let mut summary_rows: Vec<(u16, usize)> = Vec::new();
 
     while vis_idx < visible.len() && rows_used < viewport_rows {
@@ -794,16 +738,13 @@ fn draw_screen(
                 rows_used += 1;
             }
             Line::Sixel { data, height } => {
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                write!(stdout, "{data}").unwrap();
-                rows_used += height;
-                if rows_used > viewport_rows {
-                    overflow = Some(Overflow {
-                        rows: rows_used - viewport_rows,
-                        vis_idx,
-                    });
-                    vis_idx += 1;
-                    break;
+                if rows_used + height <= viewport_rows {
+                    crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                    write!(stdout, "{data}").unwrap();
+                    rows_used += height;
+                } else {
+                    // Doesn't fit — skip, will render when scrolled to top
+                    rows_used += 1;
                 }
             }
             Line::PendingImage { id, estimated_rows } => {
@@ -811,18 +752,20 @@ fn draw_screen(
                 if let Some(p) = pending_images.get(*id) {
                     if p.is_ready() {
                         let sixel = p.wait();
-                        if !sixel.is_empty() {
+                        let height = if sixel.is_empty() {
+                            0
+                        } else {
+                            estimate_sixel_rows(sixel)
+                        };
+                        // Only render the sixel if it fits — avoids
+                        // terminal auto-scroll on ready transition.
+                        if height > 0 && rows_used + height <= viewport_rows {
                             write!(stdout, "{sixel}").unwrap();
-                            let height = estimate_sixel_rows(sixel);
                             rows_used += height;
-                            if rows_used > viewport_rows {
-                                overflow = Some(Overflow {
-                                    rows: rows_used - viewport_rows,
-                                    vis_idx,
-                                });
-                                vis_idx += 1;
-                                break;
-                            }
+                        } else if height > 0 {
+                            // Doesn't fit — show size hint, render
+                            // when user scrolls it to the top.
+                            rows_used += 1;
                         } else {
                             rows_used += estimated_rows;
                         }
@@ -838,19 +781,16 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 let frame_idx = gif_frames.get(id).copied().unwrap_or(0);
                 if let Some(gif) = gifs.get(*id) {
-                    if let Some(frame) = gif.frame(frame_idx) {
+                    if let Some(frame) = gif.frame(frame_idx)
+                        && rows_used + estimated_rows <= viewport_rows
+                    {
                         write!(stdout, "{}", frame.sixel).unwrap();
                         rows_used += estimated_rows;
-                        if rows_used > viewport_rows {
-                            overflow = Some(Overflow {
-                                rows: rows_used - viewport_rows,
-                                vis_idx,
-                            });
-                            vis_idx += 1;
-                            break;
-                        }
-                    } else {
+                    } else if gif.frame_count() == 0 {
                         write!(stdout, "\x1b[2m  [loading gif...]\x1b[0m\r").unwrap();
+                        rows_used += 1;
+                    } else {
+                        // Doesn't fit
                         rows_used += 1;
                     }
                 } else {
@@ -920,10 +860,7 @@ fn draw_screen(
     write!(stdout, "\x1b[?2026l").unwrap();
     stdout.flush().unwrap();
 
-    DrawResult {
-        overflow,
-        summary_rows,
-    }
+    DrawResult { summary_rows }
 }
 
 /// Find the details block to toggle.
