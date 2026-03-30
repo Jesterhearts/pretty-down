@@ -438,6 +438,10 @@ fn draw_screen(
     term_rows: u16,
     watching: bool,
 ) {
+    // Begin synchronized update — terminal buffers all output until the
+    // matching end sequence, eliminating flicker.
+    write!(stdout, "\x1b[?2026h").unwrap();
+
     crossterm::execute!(
         stdout,
         terminal::Clear(ClearType::All),
@@ -460,7 +464,6 @@ fn draw_screen(
                 rows_used += height;
             }
             Line::PendingImage { .. } => {
-                // Still loading — show placeholder
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
                 rows_used += 1;
@@ -482,6 +485,9 @@ fn draw_screen(
     );
     crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
     write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = 80).unwrap();
+
+    // End synchronized update — terminal flushes the buffered frame at once.
+    write!(stdout, "\x1b[?2026l").unwrap();
     stdout.flush().unwrap();
 }
 
