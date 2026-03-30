@@ -981,79 +981,172 @@ fn emit_block(
     let _ = state; // avoid unused warning
 }
 
-/// Build a comfy-table from accumulated table state and append to output.
+/// Render a table with Unicode box-drawing borders.
 fn flush_table(
     state: &mut RenderState,
     out: &mut String,
 ) {
-    use comfy_table::Attribute;
-    use comfy_table::Cell;
-    use comfy_table::CellAlignment;
-    use comfy_table::ContentArrangement;
-    use comfy_table::Table;
-    use comfy_table::modifiers::UTF8_ROUND_CORNERS;
-    use comfy_table::presets::UTF8_FULL_CONDENSED;
+    let header = state.table_header.take();
+    let rows = std::mem::take(&mut state.table_rows);
+    let alignments = &state.table_alignments;
 
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL_CONDENSED);
-    table.apply_modifier(UTF8_ROUND_CORNERS);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let all_rows = build_styled_rows(header.as_ref(), &rows);
+    let col_count = alignments
+        .len()
+        .max(all_rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    let col_widths = compute_column_widths(&all_rows, col_count);
 
-    // Set column alignments
-    for (i, align) in state.table_alignments.iter().enumerate() {
-        let ca = match align {
-            Alignment::Left | Alignment::None => CellAlignment::Left,
-            Alignment::Center => CellAlignment::Center,
-            Alignment::Right => CellAlignment::Right,
-        };
-        if let Some(col) = table.column_mut(i) {
-            col.set_cell_alignment(ca);
+    // Top border: ╭─┬─╮
+    render_border(out, &col_widths, '╭', '┬', '╮', '─');
+    out.push('\n');
+
+    for (row_idx, row) in all_rows.iter().enumerate() {
+        let is_header = header.is_some() && row_idx == 0;
+        let row_height = row_height(row);
+
+        for line_idx in 0..row_height {
+            out.push('│');
+            for (col, width) in col_widths.iter().enumerate() {
+                out.push(' ');
+                let cell_text = row.get(col).map(|s| s.as_str()).unwrap_or("");
+                let cell_lines: Vec<&str> = cell_text.split('\n').collect();
+                let line = cell_lines.get(line_idx).copied().unwrap_or("");
+                let vis_len = ansi::visible_len(line);
+                let align = alignments.get(col).copied().unwrap_or(Alignment::None);
+                let padding = width.saturating_sub(vis_len);
+
+                if is_header && line_idx == 0 {
+                    out.push_str(ansi::BOLD);
+                }
+
+                match align {
+                    Alignment::Right => {
+                        for _ in 0..padding {
+                            out.push(' ');
+                        }
+                        out.push_str(line);
+                    }
+                    Alignment::Center => {
+                        let left = padding / 2;
+                        let right = padding - left;
+                        for _ in 0..left {
+                            out.push(' ');
+                        }
+                        out.push_str(line);
+                        for _ in 0..right {
+                            out.push(' ');
+                        }
+                    }
+                    _ => {
+                        out.push_str(line);
+                        for _ in 0..padding {
+                            out.push(' ');
+                        }
+                    }
+                }
+
+                if is_header && line_idx == 0 {
+                    out.push_str(ansi::RESET);
+                }
+
+                out.push(' ');
+                if col < col_widths.len() - 1 {
+                    out.push('┆');
+                }
+            }
+            out.push_str("│\n");
+        }
+
+        // Separator after header: ╞═╪═╡
+        if is_header {
+            render_border(out, &col_widths, '╞', '╪', '╡', '═');
+            out.push('\n');
         }
     }
 
-    // Header row
-    if let Some(header) = state.table_header.take() {
-        let cells: Vec<Cell> = header
-            .into_iter()
-            .map(|(text, _, _, _)| Cell::new(text).add_attribute(Attribute::Bold))
-            .collect();
-        table.set_header(cells);
-    }
-
-    // Data rows
-    for row in std::mem::take(&mut state.table_rows) {
-        let cells: Vec<Cell> = row
-            .into_iter()
-            .enumerate()
-            .map(|(i, (text, bold, italic, code))| {
-                let mut cell = Cell::new(text);
-                if bold {
-                    cell = cell.add_attribute(Attribute::Bold);
-                }
-                if italic {
-                    cell = cell.add_attribute(Attribute::Italic);
-                }
-                if code {
-                    cell = cell.add_attribute(Attribute::Dim);
-                }
-                // Apply column alignment per-cell
-                if let Some(align) = state.table_alignments.get(i) {
-                    cell = cell.set_alignment(match align {
-                        Alignment::Left | Alignment::None => CellAlignment::Left,
-                        Alignment::Center => CellAlignment::Center,
-                        Alignment::Right => CellAlignment::Right,
-                    });
-                }
-                cell
-            })
-            .collect();
-        table.add_row(cells);
-    }
-
-    out.push_str(&table.to_string());
+    // Bottom border: ╰─┴─╯
+    render_border(out, &col_widths, '╰', '┴', '╯', '─');
     out.push_str("\n\n");
 
     state.table_alignments.clear();
+}
+
+fn build_styled_rows(
+    header: Option<&Vec<(String, bool, bool, bool)>>,
+    rows: &[Vec<(String, bool, bool, bool)>],
+) -> Vec<Vec<String>> {
+    let mut all = Vec::new();
+    if let Some(h) = header {
+        all.push(h.iter().map(|(text, _, _, _)| text.clone()).collect());
+    }
+    for row in rows {
+        all.push(
+            row.iter()
+                .map(|(text, bold, italic, code)| {
+                    let mut s = String::new();
+                    if *bold {
+                        s.push_str(ansi::BOLD);
+                    }
+                    if *italic {
+                        s.push_str(ansi::ITALIC);
+                    }
+                    if *code {
+                        s.push_str(ansi::DIM);
+                    }
+                    s.push_str(text);
+                    if *bold || *italic || *code {
+                        s.push_str(ansi::RESET);
+                    }
+                    s
+                })
+                .collect(),
+        );
+    }
+    all
+}
+
+fn compute_column_widths(
+    rows: &[Vec<String>],
+    col_count: usize,
+) -> Vec<usize> {
+    let mut widths = vec![0usize; col_count];
+    for row in rows {
+        for (col, cell) in row.iter().enumerate() {
+            if col < col_count {
+                for line in cell.split('\n') {
+                    widths[col] = widths[col].max(ansi::visible_len(line));
+                }
+            }
+        }
+    }
+    widths
+}
+
+fn row_height(row: &[String]) -> usize {
+    row.iter()
+        .map(|cell| cell.split('\n').count().max(1))
+        .max()
+        .unwrap_or(1)
+}
+
+fn render_border(
+    out: &mut String,
+    widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+    fill: char,
+) {
+    out.push(left);
+    for (i, w) in widths.iter().enumerate() {
+        for _ in 0..w + 2 {
+            out.push(fill);
+        }
+        if i < widths.len() - 1 {
+            out.push(mid);
+        }
+    }
+    out.push(right);
 }
 
 /// Output from rendering markdown, containing the text output and any

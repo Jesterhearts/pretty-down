@@ -30,8 +30,8 @@ images are displayed inline — all without leaving your terminal.
   via [syntect](https://crates.io/crates/syntect) with true-color output
 - **Horizontally scrollable code blocks** — Code doesn't wrap; scroll
   sideways with the mouse
-- **Tables** — Rendered with Unicode box-drawing borders via
-  [comfy-table](https://crates.io/crates/comfy-table)
+- **Tables** — Rendered with Unicode box-drawing borders, with half-block
+  image previews inside cells
 - **Blockquotes** — Styled with `│` prefix on every line, supports nesting
 - **Lists** — Ordered, unordered, nested
 - **Horizontal rules**
@@ -125,7 +125,6 @@ collapsible sections, and styled HTML.
 - [syntect](https://crates.io/crates/syntect) — Syntax highlighting
 - [rustybuzz](https://crates.io/crates/rustybuzz) — Text shaping
 - [raqote](https://crates.io/crates/raqote) — 2D rasterization
-- [comfy-table](https://crates.io/crates/comfy-table) — Table rendering
 - [crossterm](https://crates.io/crates/crossterm) — Terminal interaction
 - [notify](https://crates.io/crates/notify) — File watching
 - [quick-xml](https://crates.io/crates/quick-xml) — HTML tag parsing
