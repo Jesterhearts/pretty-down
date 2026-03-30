@@ -103,8 +103,7 @@ pub fn encode_rgba(
     TextEncoder::encode(img)
 }
 
-/// Scale an image to fit within max_width.
-fn scale_image(
+pub fn scale_image(
     img: RgbaImage,
     max_width: u32,
 ) -> RgbaImage {
@@ -151,7 +150,7 @@ impl PendingImage {
 /// Each character cell represents 2 vertical pixels: foreground = top pixel,
 /// background = bottom pixel. The image is downscaled with nearest-neighbor
 /// to fit `cols` columns × `rows` character rows.
-fn half_block_preview(
+pub fn half_block_preview(
     img: &RgbaImage,
     cols: u32,
     rows: u16,

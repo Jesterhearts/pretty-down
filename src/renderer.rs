@@ -1237,6 +1237,34 @@ fn end_code_block(
     state.code_lang = None;
 }
 
+fn render_image_in_table_cell(
+    path: &std::path::Path,
+    state: &mut RenderState,
+) {
+    let img = match image::open(path) {
+        Ok(img) => img.to_rgba8(),
+        Err(_) => return,
+    };
+
+    // Scale to fit in a reasonable table cell (max 30 columns wide)
+    let max_cols: u32 = 30;
+    let max_px = max_cols * sixel::cell_pixel_width();
+    let img = sixel::scale_image(img, max_px);
+    let cols = sixel::preview_columns(img.width()).min(max_cols);
+    let (w, h) = img.dimensions();
+    let rows = if h > 0 && w > 0 {
+        let aspect = h as f64 / w as f64;
+        // Half-blocks give 2 pixels per row, so halve the aspect ratio
+        ((cols as f64 * aspect) / 2.0).ceil().max(1.0) as u16
+    } else {
+        1
+    };
+    let preview = sixel::half_block_preview(&img, cols, rows);
+
+    let cell_content = preview.join("\n");
+    state.table_cell_buf.push_str(&cell_content);
+}
+
 /// Render markdown into a sequence of output blocks.
 pub fn render(
     markdown: &str,
@@ -1369,7 +1397,11 @@ pub fn render(
             Event::Start(Tag::Image { dest_url, .. }) => {
                 state.in_image = true;
                 if let Some(path) = resolve_image_path(&dest_url, &state.base_path) {
-                    state.emit_image(&path, &mut out, &mut blocks);
+                    if state.in_table() {
+                        render_image_in_table_cell(&path, &mut state);
+                    } else {
+                        state.emit_image(&path, &mut out, &mut blocks);
+                    }
                 }
             }
             Event::End(TagEnd::Image) => {
