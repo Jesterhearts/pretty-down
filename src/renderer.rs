@@ -204,6 +204,24 @@ fn crop_pixels_width(
 /// Heading font sizes in pixels for h1..h6
 const HEADING_SIZES: [u32; 6] = [48, 40, 32, 28, 24, 20];
 
+/// Image data embedded in a table cell.
+struct TableCellImage {
+    sixel: String,
+    /// Half-block preview lines (fallback for non-pager output)
+    preview: Vec<String>,
+    width_cols: u32,
+    height_rows: u16,
+}
+
+/// A table cell — either text with styling, or an image.
+struct TableCell {
+    text: String,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    image: Option<TableCellImage>,
+}
+
 struct RenderState {
     /// Text accumulated for the current heading (rendered as sixel)
     heading_text: String,
@@ -243,11 +261,13 @@ struct RenderState {
     in_table_head: bool,
     /// Accumulated text for the current table cell
     table_cell_buf: String,
-    /// Cells collected for the current row: (text, is_bold, is_italic, is_code)
-    table_row_cells: Vec<(String, bool, bool, bool)>,
+    /// Image data for the current table cell (if any)
+    table_cell_image: Option<TableCellImage>,
+    /// Cells collected for the current row
+    table_row_cells: Vec<TableCell>,
     /// All collected rows: header row (if any) + data rows
-    table_header: Option<Vec<(String, bool, bool, bool)>>,
-    table_rows: Vec<Vec<(String, bool, bool, bool)>>,
+    table_header: Option<Vec<TableCell>>,
+    table_rows: Vec<Vec<TableCell>>,
     /// Track inline styles within table cells
     table_cell_bold: bool,
     table_cell_italic: bool,
@@ -285,6 +305,7 @@ impl RenderState {
             table_alignments: Vec::new(),
             in_table_head: false,
             table_cell_buf: String::new(),
+            table_cell_image: None,
             table_row_cells: Vec::new(),
             table_header: None,
             table_rows: Vec::new(),
@@ -990,63 +1011,35 @@ fn flush_table(
     let rows = std::mem::take(&mut state.table_rows);
     let alignments = &state.table_alignments;
 
-    let all_rows = build_styled_rows(header.as_ref(), &rows);
+    let all_rows: Vec<&Vec<TableCell>> = header.as_ref().into_iter().chain(rows.iter()).collect();
+
     let col_count = alignments
         .len()
         .max(all_rows.iter().map(|r| r.len()).max().unwrap_or(0));
-    let col_widths = compute_column_widths(&all_rows, col_count);
+    let col_widths = compute_column_widths_cells(&all_rows, col_count);
 
-    // Top border: ╭─┬─╮
     render_border(out, &col_widths, '╭', '┬', '╮', '─');
     out.push('\n');
 
     for (row_idx, row) in all_rows.iter().enumerate() {
         let is_header = header.is_some() && row_idx == 0;
-        let row_height = row_height(row);
+        let height = cell_row_height(row);
 
-        for line_idx in 0..row_height {
+        for line_idx in 0..height {
             out.push('│');
             for (col, width) in col_widths.iter().enumerate() {
                 out.push(' ');
-                let cell_text = row.get(col).map(|s| s.as_str()).unwrap_or("");
-                let cell_lines: Vec<&str> = cell_text.split('\n').collect();
-                let line = cell_lines.get(line_idx).copied().unwrap_or("");
-                let vis_len = ansi::visible_len(line);
+                let cell = row.get(col);
                 let align = alignments.get(col).copied().unwrap_or(Alignment::None);
-                let padding = width.saturating_sub(vis_len);
 
-                if is_header && line_idx == 0 {
-                    out.push_str(ansi::BOLD);
-                }
-
-                match align {
-                    Alignment::Right => {
-                        for _ in 0..padding {
-                            out.push(' ');
-                        }
-                        out.push_str(line);
+                if let Some(cell) = cell {
+                    if let Some(ref img) = cell.image {
+                        render_image_cell_line(out, img, line_idx, *width);
+                    } else {
+                        render_text_cell_line(out, cell, is_header, line_idx, *width, align);
                     }
-                    Alignment::Center => {
-                        let left = padding / 2;
-                        let right = padding - left;
-                        for _ in 0..left {
-                            out.push(' ');
-                        }
-                        out.push_str(line);
-                        for _ in 0..right {
-                            out.push(' ');
-                        }
-                    }
-                    _ => {
-                        out.push_str(line);
-                        for _ in 0..padding {
-                            out.push(' ');
-                        }
-                    }
-                }
-
-                if is_header && line_idx == 0 {
-                    out.push_str(ansi::RESET);
+                } else {
+                    pad_spaces(out, *width);
                 }
 
                 out.push(' ');
@@ -1057,64 +1050,107 @@ fn flush_table(
             out.push_str("│\n");
         }
 
-        // Separator after header: ╞═╪═╡
         if is_header {
             render_border(out, &col_widths, '╞', '╪', '╡', '═');
             out.push('\n');
         }
     }
 
-    // Bottom border: ╰─┴─╯
     render_border(out, &col_widths, '╰', '┴', '╯', '─');
     out.push_str("\n\n");
-
     state.table_alignments.clear();
 }
 
-fn build_styled_rows(
-    header: Option<&Vec<(String, bool, bool, bool)>>,
-    rows: &[Vec<(String, bool, bool, bool)>],
-) -> Vec<Vec<String>> {
-    let mut all = Vec::new();
-    if let Some(h) = header {
-        all.push(h.iter().map(|(text, _, _, _)| text.clone()).collect());
+fn render_text_cell_line(
+    out: &mut String,
+    cell: &TableCell,
+    is_header: bool,
+    line_idx: usize,
+    width: usize,
+    align: Alignment,
+) {
+    let styled = styled_cell_text(cell);
+    let cell_lines: Vec<&str> = styled.split('\n').collect();
+    let line = cell_lines.get(line_idx).copied().unwrap_or("");
+    let vis_len = ansi::visible_len(line);
+    let padding = width.saturating_sub(vis_len);
+
+    if is_header && line_idx == 0 {
+        out.push_str(ansi::BOLD);
     }
-    for row in rows {
-        all.push(
-            row.iter()
-                .map(|(text, bold, italic, code)| {
-                    let mut s = String::new();
-                    if *bold {
-                        s.push_str(ansi::BOLD);
-                    }
-                    if *italic {
-                        s.push_str(ansi::ITALIC);
-                    }
-                    if *code {
-                        s.push_str(ansi::DIM);
-                    }
-                    s.push_str(text);
-                    if *bold || *italic || *code {
-                        s.push_str(ansi::RESET);
-                    }
-                    s
-                })
-                .collect(),
-        );
+
+    match align {
+        Alignment::Right => {
+            pad_spaces(out, padding);
+            out.push_str(line);
+        }
+        Alignment::Center => {
+            let left = padding / 2;
+            pad_spaces(out, left);
+            out.push_str(line);
+            pad_spaces(out, padding - left);
+        }
+        _ => {
+            out.push_str(line);
+            pad_spaces(out, padding);
+        }
     }
-    all
+
+    if is_header && line_idx == 0 {
+        out.push_str(ansi::RESET);
+    }
 }
 
-fn compute_column_widths(
-    rows: &[Vec<String>],
+fn render_image_cell_line(
+    out: &mut String,
+    img: &TableCellImage,
+    line_idx: usize,
+    width: usize,
+) {
+    if line_idx == 0 {
+        // First line: save cursor, emit sixel, restore cursor, pad with spaces
+        out.push_str("\x1b[s"); // save cursor
+        out.push_str(&img.sixel);
+        out.push_str("\x1b[u"); // restore cursor
+    }
+    // All lines: pad with spaces to fill the cell width
+    // (the sixel renders over these visually)
+    pad_spaces(out, width);
+}
+
+fn styled_cell_text(cell: &TableCell) -> String {
+    let mut s = String::new();
+    if cell.bold {
+        s.push_str(ansi::BOLD);
+    }
+    if cell.italic {
+        s.push_str(ansi::ITALIC);
+    }
+    if cell.code {
+        s.push_str(ansi::DIM);
+    }
+    s.push_str(&cell.text);
+    if cell.bold || cell.italic || cell.code {
+        s.push_str(ansi::RESET);
+    }
+    s
+}
+
+fn compute_column_widths_cells(
+    rows: &[&Vec<TableCell>],
     col_count: usize,
 ) -> Vec<usize> {
     let mut widths = vec![0usize; col_count];
     for row in rows {
         for (col, cell) in row.iter().enumerate() {
             if col < col_count {
-                for line in cell.split('\n') {
-                    widths[col] = widths[col].max(ansi::visible_len(line));
+                if let Some(ref img) = cell.image {
+                    widths[col] = widths[col].max(img.width_cols as usize);
+                } else {
+                    let styled = styled_cell_text(cell);
+                    for line in styled.split('\n') {
+                        widths[col] = widths[col].max(ansi::visible_len(line));
+                    }
                 }
             }
         }
@@ -1122,11 +1158,26 @@ fn compute_column_widths(
     widths
 }
 
-fn row_height(row: &[String]) -> usize {
+fn cell_row_height(row: &[TableCell]) -> usize {
     row.iter()
-        .map(|cell| cell.split('\n').count().max(1))
+        .map(|cell| {
+            if let Some(ref img) = cell.image {
+                img.height_rows as usize
+            } else {
+                styled_cell_text(cell).split('\n').count().max(1)
+            }
+        })
         .max()
         .unwrap_or(1)
+}
+
+fn pad_spaces(
+    out: &mut String,
+    count: usize,
+) {
+    for _ in 0..count {
+        out.push(' ');
+    }
 }
 
 fn render_border(
@@ -1339,20 +1390,31 @@ fn render_image_in_table_cell(
         Err(_) => return,
     };
 
-    // Scale to fit in a reasonable table cell (max 30 columns wide)
     let max_cols: u32 = 30;
     let max_px = max_cols * sixel::cell_pixel_width();
     let img = sixel::scale_image(img, max_px);
     let cols = sixel::preview_columns(img.width()).min(max_cols);
-    let (w, h) = img.dimensions();
-    let rows = if h > 0 && w > 0 {
-        let aspect = h as f64 / w as f64;
-        ((cols as f64 * aspect) / 2.0).ceil().max(1.0) as u16
-    } else {
-        1
-    };
+
+    // Snap height for clean sixel
+    let snapped_h = sixel::snap_height_to_cells(img.height());
+    let rows = sixel::pixel_height_to_rows(snapped_h);
+
+    let mut padded = img.clone();
+    if snapped_h > padded.height() {
+        let mut new_img = image::RgbaImage::new(padded.width(), snapped_h);
+        image::imageops::overlay(&mut new_img, &padded, 0, 0);
+        padded = new_img;
+    }
+
+    let sixel = sixel::encode_rgba(padded.width(), snapped_h, padded.as_raw());
     let preview = sixel::half_block_preview(&img, cols, rows);
-    state.table_cell_buf.push_str(&preview.join("\n"));
+
+    state.table_cell_image = Some(TableCellImage {
+        sixel,
+        preview,
+        width_cols: cols,
+        height_rows: rows,
+    });
 }
 
 /// Render markdown into a sequence of output blocks.
@@ -1622,18 +1684,21 @@ pub fn render(
             }
             Event::Start(Tag::TableCell) => {
                 state.table_cell_buf.clear();
+                state.table_cell_image = None;
                 state.table_cell_bold = false;
                 state.table_cell_italic = false;
                 state.table_cell_code = false;
             }
             Event::End(TagEnd::TableCell) => {
                 let text = std::mem::take(&mut state.table_cell_buf);
-                state.table_row_cells.push((
+                let image = state.table_cell_image.take();
+                state.table_row_cells.push(TableCell {
                     text,
-                    state.table_cell_bold,
-                    state.table_cell_italic,
-                    state.table_cell_code,
-                ));
+                    bold: state.table_cell_bold,
+                    italic: state.table_cell_italic,
+                    code: state.table_cell_code,
+                    image,
+                });
             }
 
             // ── Inline HTML ──────────────────────────────────────────
