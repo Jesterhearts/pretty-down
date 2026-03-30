@@ -764,17 +764,13 @@ pub fn encode_video_async(
                 }
             }
 
-            // Record cycle length after first pass
+            // First pass complete — record cycle length and stop encoding.
+            // Playback loops through the stored frames; no need to re-encode.
             let count = frames_clone.lock().unwrap().len();
-            if cycle_len_clone.load(std::sync::atomic::Ordering::Relaxed) == 0 && count > 0 {
+            if count > 0 {
                 cycle_len_clone.store(count, std::sync::atomic::Ordering::Relaxed);
             }
-
-            // Video ended — loop by seeking back to the start
-            if input.seek(0, ..).is_err() {
-                break;
-            }
-            decoder.flush();
+            break;
         }
 
         let _ = done_clone.set(());
