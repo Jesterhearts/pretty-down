@@ -903,9 +903,16 @@ fn emit_block(
                     (w, pixels)
                 };
                 if w > 0 && h > 0 {
-                    out.push_str(&sixel::encode_rgba(w, h, &pixels));
+                    let data = sixel::encode_rgba(w, h, &pixels);
+                    let height = sixel::pixel_height_to_rows(h);
+                    let preview = sixel::preview_from_pixels(&pixels, w, h, height);
+                    flush_text(out, blocks);
+                    blocks.push(OutputBlock::Sixel {
+                        data,
+                        height,
+                        preview,
+                    });
                 }
-                out.push('\n');
             }
         }
         "p" => {
@@ -1044,8 +1051,12 @@ pub struct CodeBlock {
 pub enum OutputBlock {
     /// ANSI-styled text (may contain newlines).
     Text(String),
-    /// A sixel image (e.g. a heading).
-    Sixel { data: String, height: u16 },
+    /// A sixel image (e.g. a heading) with half-block preview.
+    Sixel {
+        data: String,
+        height: u16,
+        preview: Vec<String>,
+    },
     /// Index into `pending_images`.
     Image(usize),
     /// Index into `pending_gifs`.
@@ -1122,8 +1133,13 @@ pub fn render(
                     if w > 0 && h > 0 {
                         let data = sixel::encode_rgba(w, h, &pixels);
                         let height = sixel::pixel_height_to_rows(h);
+                        let preview = sixel::preview_from_pixels(&pixels, w, h, height);
                         flush_text(&mut out, &mut blocks);
-                        blocks.push(OutputBlock::Sixel { data, height });
+                        blocks.push(OutputBlock::Sixel {
+                            data,
+                            height,
+                            preview,
+                        });
                     }
                     state.heading_level = 0;
                 }

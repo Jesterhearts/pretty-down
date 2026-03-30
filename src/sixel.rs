@@ -162,6 +162,31 @@ fn half_block_preview(
     lines
 }
 
+/// Generate a half-block preview from raw RGBA pixel data.
+pub fn preview_from_pixels(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    estimated_rows: u16,
+) -> Vec<String> {
+    if let Some(img) = RgbaImage::from_raw(w, h, pixels.to_vec()) {
+        let cell_w = crossterm::terminal::window_size()
+            .ok()
+            .and_then(|ws| {
+                if ws.width > 0 && ws.columns > 0 {
+                    Some(ws.width as u32 / ws.columns as u32)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(8);
+        let preview_cols = (w / cell_w).max(1);
+        half_block_preview(&img, preview_cols, estimated_rows)
+    } else {
+        vec![]
+    }
+}
+
 /// Load an image file and start encoding to sixel in a background thread.
 pub fn encode_image_file_async(
     path: &std::path::Path,

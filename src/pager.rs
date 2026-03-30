@@ -32,7 +32,11 @@ enum Line {
     /// A regular text line (may contain ANSI escapes).
     Text(String),
     /// A sixel image block — occupies `height` terminal rows.
-    Sixel { data: String, height: u16 },
+    Sixel {
+        data: String,
+        height: u16,
+        preview: Vec<String>,
+    },
     /// A placeholder for an image being encoded in the background.
     PendingImage { id: usize, estimated_rows: u16 },
     /// Start of a `<details>` block (invisible marker, zero height).
@@ -77,10 +81,15 @@ fn flatten_blocks(output: &crate::renderer::RenderOutput) -> Vec<Line> {
                     lines.push(Line::Text(line.to_string()));
                 }
             }
-            OutputBlock::Sixel { data, height } => {
+            OutputBlock::Sixel {
+                data,
+                height,
+                preview,
+            } => {
                 lines.push(Line::Sixel {
                     data: data.clone(),
                     height: *height,
+                    preview: preview.clone(),
                 });
             }
             OutputBlock::Image(id) => {
@@ -737,13 +746,22 @@ fn draw_screen(
                 write!(stdout, "{text}\r").unwrap();
                 rows_used += 1;
             }
-            Line::Sixel { data, height } => {
+            Line::Sixel {
+                data,
+                height,
+                preview,
+            } => {
                 if rows_used + height <= viewport_rows {
+                    // Fits — render the full sixel
                     crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                     write!(stdout, "{data}").unwrap();
                     rows_used += height;
+                } else if !preview.is_empty() {
+                    // Doesn't fit — render half-block preview
+                    let avail = viewport_rows - rows_used;
+                    render_preview(stdout, preview, rows_used, avail);
+                    rows_used += avail.min(*height);
                 } else {
-                    // Doesn't fit — skip, will render when scrolled to top
                     rows_used += 1;
                 }
             }
