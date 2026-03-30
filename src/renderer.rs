@@ -1251,41 +1251,15 @@ fn render_image_in_table_cell(
     let max_px = max_cols * sixel::cell_pixel_width();
     let img = sixel::scale_image(img, max_px);
     let cols = sixel::preview_columns(img.width()).min(max_cols);
-
-    // Snap height to cell boundary for clean sixel rendering
-    let snapped_h = sixel::snap_height_to_cells(img.height());
-    let rows = sixel::pixel_height_to_rows(snapped_h);
-
-    // Pad image to snapped height
-    let mut padded_img = img;
-    if snapped_h > padded_img.height() {
-        let mut new_img = image::RgbaImage::new(padded_img.width(), snapped_h);
-        image::imageops::overlay(&mut new_img, &padded_img, 0, 0);
-        padded_img = new_img;
-    }
-
-    // Encode the sixel
-    let sixel_data = sixel::encode_rgba(padded_img.width(), snapped_h, padded_img.as_raw());
-
-    // Build cell content:
-    // 1. Save cursor at the start of the first block line
-    // 2. Render full blocks (█) for comfy-table sizing
-    // 3. Restore cursor back to the saved position
-    // 4. Emit sixel data (renders over the blocks at the correct cell position)
-    let save_cursor = "\x1b[s";
-    let restore_cursor = "\x1b[u";
-    // Use spaces for padding — they inherit the terminal background color
-    let padding_row = " ".repeat(cols as usize);
-
-    let mut cell_lines = Vec::with_capacity(rows as usize + 2);
-    cell_lines.push(format!("{save_cursor}{padding_row}"));
-    for _ in 1..=rows {
-        // +1 extra row to avoid bottom cutoff from sixel height rounding
-        cell_lines.push(padding_row.clone());
-    }
-    cell_lines.push(format!("{restore_cursor}{sixel_data}"));
-
-    state.table_cell_buf.push_str(&cell_lines.join("\n"));
+    let (w, h) = img.dimensions();
+    let rows = if h > 0 && w > 0 {
+        let aspect = h as f64 / w as f64;
+        ((cols as f64 * aspect) / 2.0).ceil().max(1.0) as u16
+    } else {
+        1
+    };
+    let preview = sixel::half_block_preview(&img, cols, rows);
+    state.table_cell_buf.push_str(&preview.join("\n"));
 }
 
 /// Render markdown into a sequence of output blocks.
