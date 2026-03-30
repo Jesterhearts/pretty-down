@@ -29,6 +29,73 @@ mod ansi {
     pub fn link_end() -> String {
         "\x1b]8;;\x1b\\".to_string()
     }
+
+    /// Word-wrap a string that may contain ANSI escape sequences.
+    ///
+    /// Wraps at `width` visible columns, preserving escape sequences
+    /// (which don't consume column space).
+    pub fn wrap(
+        text: &str,
+        width: u16,
+    ) -> String {
+        let width = width as usize;
+        if width == 0 {
+            return text.to_string();
+        }
+
+        let mut result = String::with_capacity(text.len());
+        let mut col = 0usize;
+        // Track the last word boundary: (byte pos in result, visible col at that point)
+        let mut last_break: Option<(usize, usize)> = None;
+        let mut chars = text.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            // Copy escape sequences verbatim (zero visible width)
+            if ch == '\x1b' {
+                result.push(ch);
+                while let Some(&_next) = chars.peek() {
+                    let next = chars.next().unwrap();
+                    result.push(next);
+                    if next.is_ascii_alphabetic() || next == '\\' {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            if ch == '\n' {
+                result.push('\n');
+                col = 0;
+                last_break = None;
+                continue;
+            }
+
+            // Record word boundary (space position)
+            if ch == ' ' {
+                last_break = Some((result.len(), col));
+            }
+
+            result.push(ch);
+            col += 1;
+
+            // Check if we've exceeded the width
+            if col > width {
+                if let Some((break_pos, break_col)) = last_break.take() {
+                    // Replace the space at the break point with a newline
+                    result.replace_range(break_pos..break_pos + 1, "\n");
+                    col -= break_col + 1;
+                } else {
+                    // No word boundary — insert a hard break before this char
+                    let ch_len = ch.len_utf8();
+                    let insert_pos = result.len() - ch_len;
+                    result.insert(insert_pos, '\n');
+                    col = 1;
+                }
+            }
+        }
+
+        result
+    }
 }
 
 /// Heading font sizes in pixels for h1..h6
@@ -86,6 +153,10 @@ struct RenderState {
     table_cell_code: bool,
     /// Pending background image encodes, indexed by placeholder ID.
     pending_images: Vec<sixel::PendingImage>,
+    /// Byte offset in `out` where the current paragraph started (for wrapping).
+    para_start: Option<usize>,
+    /// Terminal width for word wrapping.
+    term_width: u16,
 }
 
 impl RenderState {
@@ -112,6 +183,8 @@ impl RenderState {
             table_cell_italic: false,
             table_cell_code: false,
             pending_images: Vec::new(),
+            para_start: None,
+            term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
         }
     }
 
@@ -643,9 +716,17 @@ pub fn render(
                 }
             }
 
-            Event::Start(Tag::Paragraph) => {}
+            Event::Start(Tag::Paragraph) => {
+                state.para_start = Some(out.len());
+            }
             Event::End(TagEnd::Paragraph) => {
                 out.push_str(ansi::RESET);
+                // Word-wrap the paragraph content
+                if let Some(start) = state.para_start.take() {
+                    let para_text = out[start..].to_string();
+                    out.truncate(start);
+                    out.push_str(&ansi::wrap(&para_text, state.term_width));
+                }
                 out.push_str("\n\n");
             }
 
