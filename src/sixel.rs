@@ -172,11 +172,19 @@ pub fn encode_image_file_async(
 
     let estimated_rows = pixel_height_to_rows(img.height());
 
-    // Generate half-block preview before the image is consumed by encoding
-    let term_cols = crossterm::terminal::size()
-        .map(|(c, _)| c as u32)
-        .unwrap_or(80);
-    let preview = half_block_preview(&img, term_cols, estimated_rows);
+    // Compute preview width in columns matching the sixel image's pixel width
+    let cell_w = crossterm::terminal::window_size()
+        .ok()
+        .and_then(|ws| {
+            if ws.width > 0 && ws.columns > 0 {
+                Some(ws.width as u32 / ws.columns as u32)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(8);
+    let preview_cols = (img.width() / cell_w).max(1);
+    let preview = half_block_preview(&img, preview_cols, estimated_rows);
 
     let result = Arc::new(OnceLock::new());
     let result_clone = result.clone();
