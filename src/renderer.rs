@@ -1158,7 +1158,26 @@ pub fn render(
                     .and_then(|lang| highlighter.highlight(&code, lang));
 
                 let styled_lines: Vec<String> = if let Some(colored) = highlighted {
-                    colored.lines().map(|l| l.to_string()).collect()
+                    // Extract the background escape (if any) to prepend to each line,
+                    // since splitting on newlines loses it from all but the first.
+                    let bg_escape = if colored.starts_with("\x1b[48;") {
+                        colored
+                            .find('m')
+                            .map(|i| colored[..=i].to_string())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    colored
+                        .lines()
+                        .map(|l| {
+                            if !bg_escape.is_empty() && !l.starts_with(&bg_escape) {
+                                format!("{bg_escape}{l}")
+                            } else {
+                                l.to_string()
+                            }
+                        })
+                        .collect()
                 } else {
                     let style = theme.code_block.to_ansi();
                     code.lines().map(|l| format!("{style}{l}\x1b[0m")).collect()
@@ -1269,6 +1288,10 @@ pub fn render(
 
             // ── Lists ────────────────────────────────────────────────
             Event::Start(Tag::List(first_item)) => {
+                if !state.list_stack.is_empty() {
+                    // Nested list — start on a new line
+                    out.push('\n');
+                }
                 state.list_stack.push(first_item);
                 state.item_index.push(0);
             }
