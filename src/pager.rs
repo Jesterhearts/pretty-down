@@ -246,18 +246,14 @@ pub fn run(
 
     loop {
         if needs_redraw {
-            if let Some(snap) = draw_screen(
+            draw_screen(
                 &mut stdout,
                 &lines,
                 scroll_offset,
                 viewport_rows,
                 term_rows,
                 watching,
-            ) {
-                // A sixel overflowed — snap forward so it starts at row 0.
-                // One more scroll-down will then clear it entirely.
-                scroll_offset = snap;
-            }
+            );
             needs_redraw = false;
         }
 
@@ -434,10 +430,6 @@ pub fn print_output(output: &RenderOutput) {
 }
 
 /// Draw the current view.
-///
-/// Returns `Some(new_offset)` if the scroll offset should be snapped
-/// forward because a sixel image overflowed the viewport. This makes the
-/// image start at row 0 so one more scroll clears it.
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
@@ -445,7 +437,7 @@ fn draw_screen(
     viewport_rows: u16,
     term_rows: u16,
     watching: bool,
-) -> Option<usize> {
+) {
     // Begin synchronized update — terminal buffers all output until the
     // matching end sequence, eliminating flicker.
     write!(stdout, "\x1b[?2026h").unwrap();
@@ -459,7 +451,6 @@ fn draw_screen(
 
     let mut rows_used: u16 = 0;
     let mut line_idx = scroll_offset;
-    let mut snap_to: Option<usize> = None;
     while line_idx < lines.len() && rows_used < viewport_rows {
         match &lines[line_idx] {
             Line::Text(text) => {
@@ -471,13 +462,9 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{data}").unwrap();
                 rows_used += height;
+                // If the sixel overflowed, the terminal auto-scrolled.
+                // Stop rendering further lines since positioning is off.
                 if rows_used > viewport_rows {
-                    // Image overflowed — snap scroll so this image starts
-                    // at row 0 on the next redraw. One more scroll-down
-                    // then clears it entirely.
-                    if line_idx > scroll_offset {
-                        snap_to = Some(line_idx);
-                    }
                     line_idx += 1;
                     break;
                 }
@@ -508,8 +495,6 @@ fn draw_screen(
     // End synchronized update — terminal flushes the buffered frame at once.
     write!(stdout, "\x1b[?2026l").unwrap();
     stdout.flush().unwrap();
-
-    snap_to
 }
 
 fn advance_lines(
