@@ -308,6 +308,16 @@ impl RenderState {
         blocks: &mut Vec<OutputBlock>,
     ) {
         let max_w = sixel::terminal_pixel_width();
+        // Try video first, then GIF, then static image
+        if sixel::is_video(path)
+            && let Some(pending) = sixel::encode_video_async(path, max_w)
+        {
+            let id = self.pending_gifs.len();
+            flush_text(out, blocks);
+            blocks.push(OutputBlock::Gif(id));
+            self.pending_gifs.push(pending);
+            return;
+        }
         if let Some(pending) = sixel::encode_gif_async(path, max_w) {
             let id = self.pending_gifs.len();
             flush_text(out, blocks);

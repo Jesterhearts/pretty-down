@@ -348,3 +348,195 @@ pub fn encode_gif_async(
         preview,
     })
 }
+
+/// Check if a path looks like a video file (by extension).
+pub fn is_video(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        matches!(
+            ext.to_ascii_lowercase().to_str(),
+            Some("mp4" | "webm" | "mkv" | "avi" | "mov" | "m4v" | "ogv")
+        )
+    })
+}
+
+/// Load a video file and start decoding/encoding frames in a background thread.
+/// Returns `None` if ffmpeg can't open the file or find a video stream.
+pub fn encode_video_async(
+    path: &std::path::Path,
+    max_width: u32,
+) -> Option<PendingGif> {
+    use ffmpeg_next as ffmpeg;
+
+    ffmpeg::init().ok()?;
+
+    let input = ffmpeg::format::input(path).ok()?;
+    let stream = input.streams().best(ffmpeg::media::Type::Video)?;
+    let stream_index = stream.index();
+
+    // Get frame rate and dimensions
+    let rate = stream.avg_frame_rate();
+    let delay_ms = if rate.numerator() > 0 && rate.denominator() > 0 {
+        (1000 * rate.denominator() as u64 / rate.numerator() as u64) as u32
+    } else {
+        33 // ~30fps fallback
+    };
+
+    let codec_params = stream.parameters();
+    let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)
+        .ok()?
+        .decoder()
+        .video()
+        .ok()?;
+
+    let src_width = decoder.width();
+    let src_height = decoder.height();
+
+    // Compute scaled dimensions
+    let (dst_width, dst_height) = if src_width > max_width {
+        let h = (src_height as f64 * max_width as f64 / src_width as f64) as u32;
+        (max_width, h)
+    } else {
+        (src_width, src_height)
+    };
+
+    let estimated_rows = pixel_height_to_rows(dst_height);
+
+    // Generate preview from first decoded frame
+    let mut scaler = ffmpeg::software::scaling::context::Context::get(
+        decoder.format(),
+        src_width,
+        src_height,
+        ffmpeg::format::Pixel::RGBA,
+        dst_width,
+        dst_height,
+        ffmpeg::software::scaling::Flags::BILINEAR,
+    )
+    .ok()?;
+
+    // Decode just the first frame for preview
+    let mut preview = Vec::new();
+    let mut got_preview = false;
+    let mut first_input = ffmpeg::format::input(path).ok()?;
+
+    for (s, packet) in first_input.packets() {
+        if s.index() != stream_index {
+            continue;
+        }
+        decoder.send_packet(&packet).ok()?;
+        let mut decoded = ffmpeg::frame::Video::empty();
+        if decoder.receive_frame(&mut decoded).is_ok() {
+            let mut rgb_frame = ffmpeg::frame::Video::empty();
+            scaler.run(&decoded, &mut rgb_frame).ok()?;
+
+            if let Some(img) = RgbaImage::from_raw(
+                dst_width,
+                dst_height,
+                rgb_frame.data(0)[..dst_width as usize * dst_height as usize * 4].to_vec(),
+            ) {
+                let cell_w = crossterm::terminal::window_size()
+                    .ok()
+                    .and_then(|ws| {
+                        if ws.width > 0 && ws.columns > 0 {
+                            Some(ws.width as u32 / ws.columns as u32)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(8);
+                let preview_cols = (dst_width / cell_w).max(1);
+                preview = half_block_preview(&img, preview_cols, estimated_rows);
+            }
+            got_preview = true;
+            break;
+        }
+    }
+
+    if !got_preview {
+        return None;
+    }
+
+    // Reset decoder for full playback
+    drop(first_input);
+
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(OnceLock::new());
+    let frames_clone = frames.clone();
+    let done_clone = done.clone();
+    let path = path.to_owned();
+
+    std::thread::spawn(move || {
+        let Ok(mut input) = ffmpeg::format::input(&path) else {
+            let _ = done_clone.set(());
+            return;
+        };
+
+        let stream = input.streams().best(ffmpeg::media::Type::Video);
+        let Some(stream) = stream else {
+            let _ = done_clone.set(());
+            return;
+        };
+        let stream_index = stream.index();
+        let codec_params = stream.parameters();
+
+        let Ok(ctx) = ffmpeg::codec::context::Context::from_parameters(codec_params) else {
+            let _ = done_clone.set(());
+            return;
+        };
+        let Ok(mut decoder) = ctx.decoder().video() else {
+            let _ = done_clone.set(());
+            return;
+        };
+
+        let Ok(mut scaler) = ffmpeg::software::scaling::context::Context::get(
+            decoder.format(),
+            decoder.width(),
+            decoder.height(),
+            ffmpeg::format::Pixel::RGBA,
+            dst_width,
+            dst_height,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        ) else {
+            let _ = done_clone.set(());
+            return;
+        };
+
+        for (s, packet) in input.packets() {
+            if s.index() != stream_index {
+                continue;
+            }
+            if decoder.send_packet(&packet).is_err() {
+                continue;
+            }
+            let mut decoded = ffmpeg::frame::Video::empty();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let mut rgb_frame = ffmpeg::frame::Video::empty();
+                if scaler.run(&decoded, &mut rgb_frame).is_err() {
+                    continue;
+                }
+                let data = rgb_frame.data(0);
+                let expected = dst_width as usize * dst_height as usize * 4;
+                if data.len() < expected {
+                    continue;
+                }
+                if let Some(img) =
+                    RgbaImage::from_raw(dst_width, dst_height, data[..expected].to_vec())
+                {
+                    let sixel = ImageEncoder::encode(img);
+                    frames_clone
+                        .lock()
+                        .unwrap()
+                        .push(GifFrame { sixel, delay_ms });
+                }
+            }
+        }
+
+        let _ = done_clone.set(());
+    });
+
+    Some(PendingGif {
+        frames,
+        done,
+        estimated_rows,
+        preview,
+    })
+}

@@ -22,6 +22,8 @@ images are displayed inline — all without leaving your terminal.
 - **Images** — Loaded from local paths, displayed inline as Sixel with
   half-block previews while loading or partially visible
 - **Animated GIFs** — Decoded and animated in the pager with per-frame timing
+- **Video** — MP4, WebM, MKV, AVI, MOV playback via FFmpeg (requires
+  FFmpeg libraries installed)
 - **Syntax highlighting** — Code blocks with language tags are highlighted
   via [syntect](https://crates.io/crates/syntect) with true-color output
 - **Horizontally scrollable code blocks** — Code doesn't wrap; scroll
@@ -43,6 +45,15 @@ images are displayed inline — all without leaving your terminal.
 
 - A Sixel-capable terminal (e.g. WezTerm, foot, mlterm, xterm with `-ti vt340`)
 - Rust 2024 edition (1.85+)
+- **FFmpeg development libraries** (for video support):
+  ```sh
+  # Debian/Ubuntu
+  sudo apt install libavutil-dev libavformat-dev libavcodec-dev libswscale-dev libavfilter-dev libavdevice-dev pkg-config
+  # Fedora
+  sudo dnf install ffmpeg-devel
+  # macOS
+  brew install ffmpeg pkg-config
+  ```
 
 ## Usage
 
@@ -117,6 +128,7 @@ collapsible sections, and styled HTML.
 - [notify](https://crates.io/crates/notify) — File watching
 - [quick-xml](https://crates.io/crates/quick-xml) — HTML tag parsing
 - [image](https://crates.io/crates/image) — Image loading and GIF decoding
+- [ffmpeg-next](https://crates.io/crates/ffmpeg-next) — Video decoding
 
 ## License
 
