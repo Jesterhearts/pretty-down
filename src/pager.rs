@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::io::{
     self,
@@ -21,8 +22,7 @@ use crossterm::terminal::{
 
 use crate::renderer::RenderOutput;
 
-/// A display line is either a plain text line, a sixel block, or a pending
-/// image.
+/// A display line.
 enum Line {
     /// A regular text line (may contain ANSI escapes).
     Text(String),
@@ -30,6 +30,13 @@ enum Line {
     Sixel { data: String, height: u16 },
     /// A placeholder for an image being encoded in the background.
     PendingImage { id: usize, estimated_rows: u16 },
+    /// Start of a `<details>` block (invisible marker, zero height).
+    #[allow(dead_code)]
+    DetailsStart { id: usize },
+    /// The `<summary>` line for a details block.
+    DetailsSummary { id: usize, text: String },
+    /// End of a `<details>` block (invisible marker, zero height).
+    DetailsEnd { id: usize },
 }
 
 impl Line {
@@ -39,6 +46,8 @@ impl Line {
             Line::Text(_) => 1,
             Line::Sixel { height, .. } => *height,
             Line::PendingImage { estimated_rows, .. } => *estimated_rows,
+            Line::DetailsSummary { .. } => 1,
+            Line::DetailsStart { .. } | Line::DetailsEnd { .. } => 0,
         }
     }
 }
@@ -53,40 +62,30 @@ fn split_lines(output: &str) -> Vec<Line> {
     let mut rest = output;
 
     while !rest.is_empty() {
-        // Look for image placeholder or sixel sequence
-        let placeholder_pos = rest.find("\x00IMG:");
+        // Find the next special sequence: \x00 marker or \x1bP sixel
+        let marker_pos = rest.find('\x00');
         let sixel_pos = rest.find("\x1bP");
 
-        // Find whichever comes first
-        let next = match (placeholder_pos, sixel_pos) {
-            (Some(p), Some(s)) if p < s => Some(("placeholder", p)),
+        let next = match (marker_pos, sixel_pos) {
+            (Some(m), Some(s)) if m < s => Some(("marker", m)),
             (_, Some(s)) => Some(("sixel", s)),
-            (Some(p), None) => Some(("placeholder", p)),
+            (Some(m), None) => Some(("marker", m)),
             (None, None) => None,
         };
 
         match next {
-            Some(("placeholder", pos)) => {
-                // Text before the placeholder
+            Some(("marker", pos)) => {
+                // Text before the marker
                 let before = &rest[..pos];
                 for text_line in before.split('\n') {
                     lines.push(Line::Text(text_line.to_string()));
                 }
 
                 let after = &rest[pos..];
-                // Parse \x00IMG:id:rows\x00
                 if let Some(end) = after[1..].find('\x00') {
-                    let marker = &after[1..end + 1]; // "IMG:id:rows"
-                    let parts: Vec<&str> = marker.splitn(3, ':').collect();
-                    if parts.len() == 3 {
-                        let id: usize = parts[1].parse().unwrap_or(0);
-                        let rows: u16 = parts[2].parse().unwrap_or(3);
-                        lines.push(Line::PendingImage {
-                            id,
-                            estimated_rows: rows,
-                        });
-                    }
-                    rest = &after[end + 2..]; // skip past closing \x00
+                    let marker = &after[1..end + 1];
+                    parse_marker(marker, &mut lines);
+                    rest = &after[end + 2..];
                     if rest.starts_with('\n') {
                         rest = &rest[1..];
                     }
@@ -133,6 +132,38 @@ fn split_lines(output: &str) -> Vec<Line> {
     }
 
     lines
+}
+
+/// Parse a `\x00...\x00` marker into Line variants.
+fn parse_marker(
+    marker: &str,
+    lines: &mut Vec<Line>,
+) {
+    let parts: Vec<&str> = marker.splitn(3, ':').collect();
+    match parts.first().copied() {
+        Some("IMG") if parts.len() == 3 => {
+            let id: usize = parts[1].parse().unwrap_or(0);
+            let rows: u16 = parts[2].parse().unwrap_or(3);
+            lines.push(Line::PendingImage {
+                id,
+                estimated_rows: rows,
+            });
+        }
+        Some("DETAILS") if parts.len() >= 2 => {
+            let id: usize = parts[1].parse().unwrap_or(0);
+            lines.push(Line::DetailsStart { id });
+        }
+        Some("SUMMARY") if parts.len() >= 3 => {
+            let id: usize = parts[1].parse().unwrap_or(0);
+            let text = parts[2].to_string();
+            lines.push(Line::DetailsSummary { id, text });
+        }
+        Some("/DETAILS") if parts.len() >= 2 => {
+            let id: usize = parts[1].parse().unwrap_or(0);
+            lines.push(Line::DetailsEnd { id });
+        }
+        _ => {}
+    }
 }
 
 /// Estimate how many terminal rows a sixel image occupies.
@@ -243,6 +274,7 @@ pub fn run(
 
     let mut scroll_offset: usize = 0;
     let mut needs_redraw = true;
+    let mut collapsed: HashSet<usize> = HashSet::new();
     /// Which direction the last scroll action went, if any.
     #[derive(Clone, Copy, PartialEq)]
     enum ScrollDir {
@@ -257,6 +289,7 @@ pub fn run(
             let overflow = draw_screen(
                 &mut stdout,
                 &lines,
+                &collapsed,
                 scroll_offset,
                 viewport_rows,
                 term_rows,
@@ -457,6 +490,21 @@ pub fn run(
                     needs_redraw = true;
                 }
 
+                // Toggle the first visible details block
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => {
+                    if let Some(id) = first_visible_details(&lines, scroll_offset) {
+                        if collapsed.contains(&id) {
+                            collapsed.remove(&id);
+                        } else {
+                            collapsed.insert(id);
+                        }
+                        needs_redraw = true;
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -482,6 +530,10 @@ pub fn print_output(output: &RenderOutput) {
                     }
                 }
             }
+            Line::DetailsSummary { text, .. } => {
+                println!("\x1b[1m\u{25BC} {text}\x1b[0m");
+            }
+            Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {}
         }
     }
 }
@@ -498,13 +550,12 @@ struct Overflow {
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
+    collapsed: &HashSet<usize>,
     scroll_offset: usize,
     viewport_rows: u16,
     term_rows: u16,
     watching: bool,
 ) -> Option<Overflow> {
-    // Begin synchronized update — terminal buffers all output until the
-    // matching end sequence, eliminating flicker.
     write!(stdout, "\x1b[?2026h").unwrap();
 
     crossterm::execute!(
@@ -517,7 +568,19 @@ fn draw_screen(
     let mut rows_used: u16 = 0;
     let mut line_idx = scroll_offset;
     let mut overflow: Option<Overflow> = None;
+    // Track which details blocks we're inside (for skipping collapsed content)
+    let mut skip_details: Option<usize> = None;
+
     while line_idx < lines.len() && rows_used < viewport_rows {
+        // If we're skipping a collapsed block, look for its end
+        if let Some(skip_id) = skip_details {
+            if matches!(&lines[line_idx], Line::DetailsEnd { id } if *id == skip_id) {
+                skip_details = None;
+            }
+            line_idx += 1;
+            continue;
+        }
+
         match &lines[line_idx] {
             Line::Text(text) => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
@@ -542,6 +605,23 @@ fn draw_screen(
                 write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
                 rows_used += 1;
             }
+            Line::DetailsStart { .. } => {
+                // Invisible marker, zero height
+            }
+            Line::DetailsSummary { id, text } => {
+                let is_collapsed = collapsed.contains(id);
+                let triangle = if is_collapsed { "\u{25B6}" } else { "\u{25BC}" };
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                write!(stdout, "\x1b[1m{triangle} {text}\x1b[0m\r").unwrap();
+                rows_used += 1;
+                if is_collapsed {
+                    // Skip content until the matching DetailsEnd
+                    skip_details = Some(*id);
+                }
+            }
+            Line::DetailsEnd { .. } => {
+                // Invisible marker, zero height
+            }
         }
         line_idx += 1;
     }
@@ -554,8 +634,8 @@ fn draw_screen(
     };
     let watch_indicator = if watching { " [watching]" } else { "" };
     let status = format!(
-        " [{progress}%]{watch_indicator} j/k:scroll  d/u:half-page  g/G:top/bottom  r:reload  \
-         q:quit "
+        " [{progress}%]{watch_indicator} j/k:scroll  d/u:half-page  g/G:top/bottom  enter:toggle  \
+         r:reload  q:quit "
     );
     crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
     write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = 80).unwrap();
@@ -565,6 +645,19 @@ fn draw_screen(
     stdout.flush().unwrap();
 
     overflow
+}
+
+/// Find the first visible `DetailsSummary` from `scroll_offset` onward.
+fn first_visible_details(
+    lines: &[Line],
+    scroll_offset: usize,
+) -> Option<usize> {
+    for line in &lines[scroll_offset..] {
+        if let Line::DetailsSummary { id, .. } = line {
+            return Some(*id);
+        }
+    }
+    None
 }
 
 fn advance_lines(

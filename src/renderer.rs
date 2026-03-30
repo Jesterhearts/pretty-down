@@ -157,6 +157,8 @@ struct RenderState {
     para_start: Option<usize>,
     /// Terminal width for word wrapping.
     term_width: u16,
+    /// Counter for assigning unique IDs to `<details>` blocks.
+    next_details_id: usize,
 }
 
 impl RenderState {
@@ -185,6 +187,7 @@ impl RenderState {
             pending_images: Vec::new(),
             para_start: None,
             term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
+            next_details_id: 0,
         }
     }
 
@@ -438,10 +441,11 @@ fn handle_block_html(
                             in_pre = true;
                         }
                     }
-                    // <details> — for now, always expanded. Just emit a
-                    // visual separator. </details> is handled as an End tag
-                    // with no matching block_tag, so it falls through.
-                    "details" => {}
+                    "details" => {
+                        let id = state.next_details_id;
+                        state.next_details_id += 1;
+                        out.push_str(&format!("\x00DETAILS:{id}\x00\n"));
+                    }
                     "hr" => {
                         out.push_str(&"\u{2500}".repeat(40));
                         out.push('\n');
@@ -504,8 +508,11 @@ fn handle_block_html(
             }
             Ok(XmlEvent::End(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
-                if block_tag.as_deref() == Some(&name) {
-                    // Flush the block
+                if name == "details" {
+                    // Emit end-of-details marker
+                    let id = state.next_details_id.saturating_sub(1);
+                    out.push_str(&format!("\x00/DETAILS:{id}\x00\n"));
+                } else if block_tag.as_deref() == Some(&name) {
                     emit_block(&name, &text_buf, state, out, font, in_pre);
                     block_tag = None;
                     text_buf.clear();
@@ -583,12 +590,10 @@ fn emit_block(
         }
         "summary" => {
             if !text.is_empty() {
-                // Render summary as a bold line with a disclosure triangle
-                out.push_str(ansi::BOLD);
-                out.push_str("\u{25BC} "); // ▼
-                out.push_str(&text);
-                out.push_str(ansi::RESET);
-                out.push('\n');
+                // Emit a summary marker — the pager renders this with a
+                // disclosure triangle and handles expand/collapse.
+                let id = state.next_details_id.saturating_sub(1);
+                out.push_str(&format!("\x00SUMMARY:{id}:{text}\x00\n"));
             }
         }
         _ => {
