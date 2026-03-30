@@ -42,7 +42,7 @@ Gifs can also be used:
 
 ## Videos
 
-![Nature](example_video.mp4)
+![Nature](example_video.webm)
 
 ## Code Blocks
 
