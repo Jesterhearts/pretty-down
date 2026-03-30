@@ -23,6 +23,10 @@ struct Args {
     /// Print output directly without the pager
     #[arg(long)]
     no_pager: bool,
+
+    /// Watch the file for changes and reload automatically
+    #[arg(short, long)]
+    watch: bool,
 }
 
 /// Fairfax font embedded in the binary (OFL licensed).
@@ -60,6 +64,10 @@ fn main() {
             (md, base)
         }
         None => {
+            if args.watch {
+                eprintln!("error: --watch requires a file argument");
+                std::process::exit(1);
+            }
             let mut md = String::new();
             std::io::stdin()
                 .read_to_string(&mut md)
@@ -76,6 +84,23 @@ fn main() {
     if args.no_pager || !std::io::stdout().is_terminal() {
         print!("{output}");
     } else {
-        pager::run(&output);
+        let watch_path = if args.watch {
+            args.file.as_deref()
+        } else {
+            None
+        };
+
+        let render_fn: Box<dyn Fn() -> String> = if let Some(file) = &args.file {
+            let file = file.clone();
+            let base = base_path.clone();
+            Box::new(move || {
+                let md = std::fs::read_to_string(&file).unwrap_or_default();
+                renderer::render(&md, &font, base.as_deref())
+            })
+        } else {
+            Box::new(move || output.clone())
+        };
+
+        pager::run(&render_fn(), watch_path, &render_fn);
     }
 }

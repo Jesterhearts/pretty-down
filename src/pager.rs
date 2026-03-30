@@ -2,6 +2,9 @@ use std::io::Write;
 use std::io::{
     self,
 };
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crossterm::cursor;
 use crossterm::event::Event;
@@ -107,28 +110,53 @@ fn estimate_sixel_rows(data: &str) -> u16 {
                     .collect::<String>()
                     .parse::<u32>()
             {
-                // Convert pixel height to terminal rows.
-                // Typical terminal cell height is ~20px but varies.
-                // We use a conservative estimate; terminals that support
-                // sixel generally report cell size via CSI 16 t, but
-                // for simplicity we assume ~20px per row.
                 let cell_height = 20u32;
                 return pv.div_ceil(cell_height).max(1) as u16;
             }
         }
     }
 
-    // Fallback: count '-' characters (each = 6 pixel rows) outside of
-    // color definitions
+    // Fallback: count '-' characters (each = 6 pixel rows)
     let band_count = data.chars().filter(|&c| c == '-').count() as u32 + 1;
     let pixel_height = band_count * 6;
     let cell_height = 20u32;
     pixel_height.div_ceil(cell_height).max(1) as u16
 }
 
-/// Run the interactive pager on the rendered output.
-pub fn run(output: &str) {
-    let lines = split_lines(output);
+/// Set up a file watcher that sends a message on the returned receiver when
+/// the file at `path` is modified.
+fn setup_watcher(path: &Path) -> Option<(mpsc::Receiver<()>, notify::RecommendedWatcher)> {
+    use notify::Watcher;
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                use notify::EventKind::*;
+                if matches!(event.kind, Modify(_) | Create(_)) {
+                    let _ = tx.send(());
+                }
+            }
+        })
+        .ok()?;
+
+    watcher
+        .watch(path, notify::RecursiveMode::NonRecursive)
+        .ok()?;
+
+    Some((rx, watcher))
+}
+
+/// Run the interactive pager.
+///
+/// If `watch_path` is provided, the file will be watched for changes and
+/// `render_fn` will be called to produce updated output.
+pub fn run(
+    output: &str,
+    watch_path: Option<&Path>,
+    render_fn: &dyn Fn() -> String,
+) {
+    let mut lines = split_lines(output);
     if lines.is_empty() {
         return;
     }
@@ -137,63 +165,73 @@ pub fn run(output: &str) {
 
     // Get terminal size
     let (_, term_rows) = terminal::size().unwrap_or((80, 24));
-    // Reserve 1 row for the status bar
     let viewport_rows = term_rows.saturating_sub(1);
 
-    // Check if the content fits without scrolling
+    // Check if the content fits without scrolling and we're not watching
     let total_rows: u16 = lines.iter().map(|l| l.rows()).sum();
-    if total_rows <= viewport_rows {
-        // Content fits — just print it directly, no pager needed
+    if total_rows <= viewport_rows && watch_path.is_none() {
         print!("{output}");
         return;
     }
 
-    // Enter raw mode for interactive scrolling
+    // Set up file watcher if requested
+    let watcher_state = watch_path.and_then(setup_watcher);
+    let watch_rx = watcher_state.as_ref().map(|(rx, _)| rx);
+    // Keep the watcher alive by holding it
+    let _watcher = watcher_state.as_ref().map(|(_, w)| w);
+
+    let watching = watch_rx.is_some();
+
+    // Enter raw mode
     terminal::enable_raw_mode().unwrap();
     crossterm::execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide,).unwrap();
 
-    let mut scroll_offset: usize = 0; // index into `lines`
+    let mut scroll_offset: usize = 0;
+    let mut needs_redraw = true;
 
     loop {
-        // Clear screen and draw from scroll_offset
-        crossterm::execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0),
-        )
-        .unwrap();
-
-        let mut rows_used: u16 = 0;
-        let mut line_idx = scroll_offset;
-        while line_idx < lines.len() && rows_used + lines[line_idx].rows() <= viewport_rows {
-            match &lines[line_idx] {
-                Line::Text(text) => {
-                    // Move to the correct row and print
-                    crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                    write!(stdout, "{text}\r").unwrap();
-                    rows_used += 1;
-                }
-                Line::Sixel { data, height } => {
-                    crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                    write!(stdout, "{data}").unwrap();
-                    rows_used += height;
-                }
-            }
-            line_idx += 1;
+        if needs_redraw {
+            draw_screen(
+                &mut stdout,
+                &lines,
+                scroll_offset,
+                viewport_rows,
+                term_rows,
+                watching,
+            );
+            needs_redraw = false;
         }
 
-        // Status bar
-        let progress = if lines.is_empty() {
-            100
-        } else {
-            (line_idx * 100) / lines.len()
-        };
-        let status = format!(" [{progress}%] j/k:scroll  d/u:half-page  g/G:top/bottom  q:quit ");
-        crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
-        write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = 80).unwrap();
-        stdout.flush().unwrap();
+        // Check for file changes (non-blocking)
+        if let Some(rx) = watch_rx
+            && rx.try_recv().is_ok()
+        {
+            // Drain any extra events
+            while rx.try_recv().is_ok() {}
+            // Small delay to let the file finish writing
+            std::thread::sleep(Duration::from_millis(50));
+            // Re-render
+            let new_output = render_fn();
+            lines = split_lines(&new_output);
+            // Clamp scroll offset
+            if scroll_offset >= lines.len() {
+                scroll_offset = lines.len().saturating_sub(1);
+            }
+            needs_redraw = true;
+            continue;
+        }
 
-        // Read input
+        // Poll for keyboard input with a timeout so we can check file changes
+        let poll_timeout = if watching {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(60)
+        };
+
+        if !event::poll(poll_timeout).unwrap_or(false) {
+            continue;
+        }
+
         if let Ok(Event::Key(key)) = event::read() {
             match key {
                 KeyEvent {
@@ -215,6 +253,7 @@ pub fn run(output: &str) {
                     ..
                 } => {
                     scroll_offset = advance_lines(&lines, scroll_offset, 1);
+                    needs_redraw = true;
                 }
                 // Scroll up
                 KeyEvent {
@@ -222,6 +261,7 @@ pub fn run(output: &str) {
                     ..
                 } => {
                     scroll_offset = retreat_lines(scroll_offset, 1);
+                    needs_redraw = true;
                 }
                 // Half page down
                 KeyEvent {
@@ -239,6 +279,7 @@ pub fn run(output: &str) {
                 } => {
                     let half = (viewport_rows / 2) as usize;
                     scroll_offset = advance_lines(&lines, scroll_offset, half);
+                    needs_redraw = true;
                 }
                 // Half page up
                 KeyEvent {
@@ -256,6 +297,7 @@ pub fn run(output: &str) {
                 } => {
                     let half = (viewport_rows / 2) as usize;
                     scroll_offset = retreat_lines(scroll_offset, half);
+                    needs_redraw = true;
                 }
                 // Top
                 KeyEvent {
@@ -267,6 +309,7 @@ pub fn run(output: &str) {
                     ..
                 } => {
                     scroll_offset = 0;
+                    needs_redraw = true;
                 }
                 // Bottom
                 KeyEvent {
@@ -277,6 +320,7 @@ pub fn run(output: &str) {
                     code: KeyCode::End, ..
                 } => {
                     scroll_offset = scroll_to_end(&lines, viewport_rows);
+                    needs_redraw = true;
                 }
                 // Space = page down
                 KeyEvent {
@@ -284,6 +328,19 @@ pub fn run(output: &str) {
                     ..
                 } => {
                     scroll_offset = advance_lines(&lines, scroll_offset, viewport_rows as usize);
+                    needs_redraw = true;
+                }
+                // Manual reload
+                KeyEvent {
+                    code: KeyCode::Char('r'),
+                    ..
+                } => {
+                    let new_output = render_fn();
+                    lines = split_lines(&new_output);
+                    if scroll_offset >= lines.len() {
+                        scroll_offset = lines.len().saturating_sub(1);
+                    }
+                    needs_redraw = true;
                 }
 
                 _ => {}
@@ -294,6 +351,56 @@ pub fn run(output: &str) {
     // Restore terminal
     crossterm::execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen,).unwrap();
     terminal::disable_raw_mode().unwrap();
+}
+
+/// Draw the current view to the screen.
+fn draw_screen(
+    stdout: &mut io::Stdout,
+    lines: &[Line],
+    scroll_offset: usize,
+    viewport_rows: u16,
+    term_rows: u16,
+    watching: bool,
+) {
+    crossterm::execute!(
+        stdout,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0),
+    )
+    .unwrap();
+
+    let mut rows_used: u16 = 0;
+    let mut line_idx = scroll_offset;
+    while line_idx < lines.len() && rows_used + lines[line_idx].rows() <= viewport_rows {
+        match &lines[line_idx] {
+            Line::Text(text) => {
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                write!(stdout, "{text}\r").unwrap();
+                rows_used += 1;
+            }
+            Line::Sixel { data, height } => {
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                write!(stdout, "{data}").unwrap();
+                rows_used += height;
+            }
+        }
+        line_idx += 1;
+    }
+
+    // Status bar
+    let progress = if lines.is_empty() {
+        100
+    } else {
+        (line_idx * 100) / lines.len()
+    };
+    let watch_indicator = if watching { " [watching]" } else { "" };
+    let status = format!(
+        " [{progress}%]{watch_indicator} j/k:scroll  d/u:half-page  g/G:top/bottom  r:reload  \
+         q:quit "
+    );
+    crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
+    write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = 80).unwrap();
+    stdout.flush().unwrap();
 }
 
 /// Advance scroll offset by `count` lines, clamped to valid range.

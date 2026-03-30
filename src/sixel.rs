@@ -1,11 +1,12 @@
+use a_sixel::dither::NoDither;
 use a_sixel::dither::Sierra;
 use image::RgbaImage;
 
-type Encoder = a_sixel::BitMergeSixelEncoderBest<Sierra>;
+type ImageEncoder = a_sixel::BitMergeSixelEncoderBest<Sierra>;
+type TextEncoder = a_sixel::BitSixelEncoder<NoDither>;
 
-/// Encode an RGBA pixel buffer as a sixel string using a-sixel.
-///
-/// `pixels` is row-major RGBA u8 data (4 bytes per pixel).
+/// Encode an RGBA pixel buffer as a sixel string, optimized for
+/// single-color rendered text (fast, no dithering).
 pub fn encode_rgba(
     width: u32,
     height: u32,
@@ -13,7 +14,7 @@ pub fn encode_rgba(
 ) -> String {
     let img =
         RgbaImage::from_raw(width, height, pixels.to_vec()).expect("invalid pixel buffer size");
-    Encoder::encode(img)
+    TextEncoder::encode(img)
 }
 
 /// Load an image file and encode it as sixel, scaling to fit within
@@ -35,5 +36,5 @@ pub fn encode_image_file(
     } else {
         img
     };
-    Some(Encoder::encode(img))
+    Some(ImageEncoder::encode(img))
 }
