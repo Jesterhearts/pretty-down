@@ -120,6 +120,6 @@ collapsible sections, and styled HTML.
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) at your option.
+This software is released into the public domain under the [Unlicense](UNLICENSE).
 
 The Fairfax font is included under the [SIL Open Font License](fonts/FairfaxOFL.txt).
