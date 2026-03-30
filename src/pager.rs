@@ -148,16 +148,36 @@ fn estimate_sixel_rows(data: &str) -> u16 {
                     .collect::<String>()
                     .parse::<u32>()
             {
-                let cell_height = 20u32;
-                return pv.div_ceil(cell_height).max(1) as u16;
+                return crate::sixel::pixel_height_to_rows(pv);
             }
         }
     }
 
     let band_count = data.chars().filter(|&c| c == '-').count() as u32 + 1;
     let pixel_height = band_count * 6;
-    let cell_height = 20u32;
-    pixel_height.div_ceil(cell_height).max(1) as u16
+    crate::sixel::pixel_height_to_rows(pixel_height)
+}
+
+/// Resolve any pending images that are ready into Sixel lines, so the
+/// scroll math uses the correct actual height.
+fn resolve_ready_images(
+    lines: &mut [Line],
+    pending: &[crate::sixel::PendingImage],
+) {
+    for line in lines.iter_mut() {
+        if let Line::PendingImage { id, .. } = line
+            && let Some(p) = pending.get(*id)
+            && p.is_ready()
+        {
+            let data = p.wait().to_string();
+            let height = if data.is_empty() {
+                0
+            } else {
+                estimate_sixel_rows(&data)
+            };
+            *line = Line::Sixel { data, height };
+        }
+    }
 }
 
 /// Set up a file watcher.
@@ -229,7 +249,6 @@ pub fn run(
             draw_screen(
                 &mut stdout,
                 &lines,
-                pending,
                 scroll_offset,
                 viewport_rows,
                 term_rows,
@@ -255,17 +274,22 @@ pub fn run(
             continue;
         }
 
-        // Check if any pending images visible on screen just became ready
-        if check_pending_ready(&lines, pending, scroll_offset, viewport_rows) {
-            needs_redraw = true;
+        // Resolve any pending images that finished encoding into Sixel
+        // lines so the scroll math uses their actual height.
+        let had_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
+        if had_pending {
+            resolve_ready_images(&mut lines, pending);
+            let still_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
+            if had_pending != still_pending {
+                needs_redraw = true;
+            }
         }
 
-        let poll_timeout =
-            if watching || has_visible_pending(&lines, pending, scroll_offset, viewport_rows) {
-                Duration::from_millis(50)
-            } else {
-                Duration::from_secs(60)
-            };
+        let poll_timeout = if watching || had_pending {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(60)
+        };
 
         if !event::poll(poll_timeout).unwrap_or(false) {
             continue;
@@ -405,56 +429,10 @@ pub fn print_output(output: &RenderOutput) {
     }
 }
 
-/// Check if any pending images in the visible area just became ready.
-fn check_pending_ready(
-    lines: &[Line],
-    pending: &[crate::sixel::PendingImage],
-    scroll_offset: usize,
-    viewport_rows: u16,
-) -> bool {
-    let mut rows_used: u16 = 0;
-    let mut idx = scroll_offset;
-    while idx < lines.len() && rows_used + lines[idx].rows() <= viewport_rows {
-        if let Line::PendingImage { id, .. } = &lines[idx]
-            && let Some(p) = pending.get(*id)
-            && p.is_ready()
-        {
-            return true;
-        }
-        rows_used += lines[idx].rows();
-        idx += 1;
-    }
-    false
-}
-
-/// Check if there are any unresolved pending images in the visible area.
-fn has_visible_pending(
-    lines: &[Line],
-    pending: &[crate::sixel::PendingImage],
-    scroll_offset: usize,
-    viewport_rows: u16,
-) -> bool {
-    let mut rows_used: u16 = 0;
-    let mut idx = scroll_offset;
-    while idx < lines.len() && rows_used + lines[idx].rows() <= viewport_rows {
-        if let Line::PendingImage { id, .. } = &lines[idx]
-            && let Some(p) = pending.get(*id)
-            && !p.is_ready()
-        {
-            return true;
-        }
-        rows_used += lines[idx].rows();
-        idx += 1;
-    }
-    false
-}
-
-/// Draw the current view, resolving pending images only if they're visible and
-/// ready.
+/// Draw the current view.
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
-    pending: &[crate::sixel::PendingImage],
     scroll_offset: usize,
     viewport_rows: u16,
     term_rows: u16,
@@ -481,26 +459,11 @@ fn draw_screen(
                 write!(stdout, "{data}").unwrap();
                 rows_used += height;
             }
-            Line::PendingImage { id, estimated_rows } => {
+            Line::PendingImage { .. } => {
+                // Still loading — show placeholder
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                if let Some(p) = pending.get(*id) {
-                    if p.is_ready() {
-                        let sixel = p.wait();
-                        if !sixel.is_empty() {
-                            write!(stdout, "{sixel}").unwrap();
-                            // Use actual sixel height if available
-                            rows_used += estimate_sixel_rows(sixel);
-                        } else {
-                            rows_used += estimated_rows;
-                        }
-                    } else {
-                        // Show loading placeholder
-                        write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
-                        rows_used += 1;
-                    }
-                } else {
-                    rows_used += estimated_rows;
-                }
+                write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
+                rows_used += 1;
             }
         }
         line_idx += 1;

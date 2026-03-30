@@ -8,6 +8,27 @@ use image::RgbaImage;
 type ImageEncoder = a_sixel::BitMergeSixelEncoderBest<Sierra>;
 type TextEncoder = a_sixel::BitSixelEncoder<NoDither>;
 
+/// Query the terminal's cell pixel height.
+/// Falls back to 20px if the query fails or returns 0.
+pub fn cell_pixel_height() -> u32 {
+    static CELL_HEIGHT: OnceLock<u32> = OnceLock::new();
+    *CELL_HEIGHT.get_or_init(|| {
+        if let Ok(ws) = crossterm::terminal::window_size()
+            && ws.height > 0
+            && ws.rows > 0
+        {
+            return (ws.height / ws.rows) as u32;
+        }
+        20 // fallback
+    })
+}
+
+/// Convert a pixel height to terminal rows using the actual cell height.
+pub fn pixel_height_to_rows(pixel_height: u32) -> u16 {
+    let cell_h = cell_pixel_height();
+    pixel_height.div_ceil(cell_h).max(1) as u16
+}
+
 /// Encode an RGBA pixel buffer as a sixel string, optimized for
 /// single-color rendered text (fast, no dithering).
 pub fn encode_rgba(
@@ -35,7 +56,6 @@ impl PendingImage {
 
     /// Get the encoded sixel data, blocking until ready.
     pub fn wait(&self) -> &str {
-        // Spin-wait with short sleeps — encoding typically finishes quickly
         while !self.is_ready() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -65,9 +85,7 @@ pub fn encode_image_file_async(
         img
     };
 
-    // Estimate terminal rows from pixel height (assume ~20px per row)
-    let pixel_height = img.height();
-    let estimated_rows = pixel_height.div_ceil(20).max(1) as u16;
+    let estimated_rows = pixel_height_to_rows(img.height());
 
     let result = Arc::new(OnceLock::new());
     let result_clone = result.clone();
