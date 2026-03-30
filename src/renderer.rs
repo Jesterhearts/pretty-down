@@ -308,9 +308,9 @@ impl RenderState {
         blocks: &mut Vec<OutputBlock>,
     ) {
         let max_w = sixel::terminal_pixel_width();
-        // Try video first, then GIF, then static image
+        // Try video first — cap at half terminal width for speed
         if sixel::is_video(path)
-            && let Some(pending) = sixel::encode_video_async(path, max_w)
+            && let Some(pending) = sixel::encode_video_async(path, max_w / 2)
         {
             let id = self.pending_gifs.len();
             flush_text(out, blocks);

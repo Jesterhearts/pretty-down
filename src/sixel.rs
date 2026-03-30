@@ -403,11 +403,14 @@ fn decode_first_frame_preview(
             if s.index() != stream_index {
                 continue;
             }
-            decoder.send_packet(&packet).ok()?;
+            // Some codecs need multiple packets before producing a frame
+            let _ = decoder.send_packet(&packet);
             let mut decoded = ffmpeg::frame::Video::empty();
             if decoder.receive_frame(&mut decoded).is_ok() {
                 let mut rgb_frame = ffmpeg::frame::Video::empty();
-                scaler.run(&decoded, &mut rgb_frame).ok()?;
+                if scaler.run(&decoded, &mut rgb_frame).is_err() {
+                    continue;
+                }
                 let data = rgb_frame.data(0);
                 let expected = dst_width as usize * dst_height as usize * 4;
                 if data.len() >= expected
