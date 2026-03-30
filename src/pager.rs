@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
-use std::io::{self};
+use std::io::{
+    self,
+};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -15,9 +17,13 @@ use crossterm::event::KeyModifiers;
 use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
-use crossterm::event::{self};
+use crossterm::event::{
+    self,
+};
 use crossterm::terminal::ClearType;
-use crossterm::terminal::{self};
+use crossterm::terminal::{
+    self,
+};
 
 use crate::renderer::RenderOutput;
 
@@ -159,9 +165,9 @@ fn flatten_blocks(
             }
             OutputBlock::Image(id) => {
                 let p = output.pending_images.get(*id);
-                let rows = p.map(|p| p.estimated_rows).unwrap_or(1);
+                let rows = p.map(|p| p.estimated_rows()).unwrap_or(1);
                 let group = ImageGroup::PendingImage(*id);
-                let preview = p.map(|p| &p.preview[..]).unwrap_or(&[]);
+                let preview = p.map(|p| p.preview()).unwrap_or_default();
                 for i in 0..rows {
                     let preview_text = preview.get(i as usize).cloned().unwrap_or_default();
                     lines.push(Line::ImageRow {
@@ -249,15 +255,15 @@ fn flatten_side_by_side(
         match item {
             SideBySideItem::Image(id) => {
                 if let Some(p) = output.pending_images.get(*id) {
-                    let cols = p
-                        .preview
+                    let pv = p.preview();
+                    let cols = pv
                         .first()
                         .map(|l| crate::renderer::ansi::visible_len(l) as u16)
                         .unwrap_or(1);
                     infos.push(ItemInfo {
-                        preview: p.preview.clone(),
+                        preview: pv,
                         cols,
-                        rows: p.estimated_rows,
+                        rows: p.estimated_rows(),
                         sixel: PositionedSixel::Pending {
                             col: 0, // filled in below
                             width: cols,
@@ -686,9 +692,25 @@ pub fn run(
     let mut gif_state: HashMap<usize, (usize, std::time::Instant)> = HashMap::new();
     let mut code_h_scroll: HashMap<usize, usize> = HashMap::new();
     let mut video_paused: HashSet<usize> = HashSet::new();
+    // Track how many pending images were ready at the last flatten
+    let mut images_ready_count: usize = pending.iter().filter(|p| p.is_ready()).count();
 
     loop {
         if advance_gif_frames(&mut gif_state, pending_gifs, &video_paused) {
+            needs_redraw = true;
+        }
+
+        // Re-flatten if a pending image just finished loading (row count may have
+        // changed)
+        let ready_now = pending.iter().filter(|p| p.is_ready()).count();
+        if ready_now > images_ready_count {
+            images_ready_count = ready_now;
+            let output_ref = current_output.as_ref().unwrap_or(output);
+            lines = flatten_blocks(output_ref, &mut sixel_store);
+            visible = visible_indices(&lines, &collapsed);
+            if scroll_offset >= visible.len() {
+                scroll_offset = visible.len().saturating_sub(1);
+            }
             needs_redraw = true;
         }
 

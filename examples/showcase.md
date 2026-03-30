@@ -34,6 +34,12 @@ Images are loaded and rendered inline as sixel graphics:
 
 ![Mountain landscape](example_image.png)
 
+### Remote Images
+
+Images can also be loaded from URLs:
+
+![Ferris](https://rustacean.net/assets/rustacean-flat-noshadow.png)
+
 ## Gifs
 
 Gifs can also be used:

@@ -289,7 +289,7 @@ struct RenderState {
     pending_gifs: Vec<sixel::PendingGif>,
     term_width: u16,
     next_details_id: usize,
-    para_images: Vec<std::path::PathBuf>,
+    para_images: Vec<ImageSource>,
 }
 
 impl RenderState {
@@ -328,15 +328,14 @@ impl RenderState {
         self.table.as_mut().expect("not inside a table")
     }
 
-    /// Start background encoding for an image or GIF and emit an output block.
-    fn emit_image(
+    fn emit_image_source(
         &mut self,
-        path: &std::path::Path,
+        source: &ImageSource,
         out: &mut String,
         blocks: &mut Vec<OutputBlock>,
     ) {
         let max_w = sixel::terminal_pixel_width();
-        if let Some(media) = encode_media(path, max_w) {
+        if let Some(media) = encode_from_source(source, max_w) {
             flush_text(out, blocks);
             push_media(
                 media,
@@ -345,7 +344,10 @@ impl RenderState {
                 blocks,
             );
         } else {
-            out.push_str(&format!("\x1b[2m[image: {}]\x1b[0m", path.display()));
+            out.push_str(&format!(
+                "\x1b[2m[image: {}]\x1b[0m",
+                source_display(source)
+            ));
         }
     }
 }
@@ -371,18 +373,23 @@ fn list_indent(depth: usize) -> String {
     "  ".repeat(depth.saturating_sub(1))
 }
 
-fn resolve_image_path(
+enum ImageSource {
+    Local(std::path::PathBuf),
+    Url(String),
+}
+
+fn resolve_image_source(
     src: &str,
     base_path: &Option<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
+) -> Option<ImageSource> {
     if src.starts_with("http://") || src.starts_with("https://") {
-        return None;
+        return Some(ImageSource::Url(src.to_string()));
     }
     let p = Path::new(src);
     if p.is_absolute() {
-        Some(p.to_path_buf())
+        Some(ImageSource::Local(p.to_path_buf()))
     } else {
-        base_path.as_ref().map(|bp| bp.join(p))
+        base_path.as_ref().map(|bp| ImageSource::Local(bp.join(p)))
     }
 }
 
@@ -629,9 +636,9 @@ fn handle_html_open_tag(
         }
         "img" | "video" => {
             if let Some(src) = xml_attr(tag, b"src")
-                && let Some(path) = resolve_image_path(&src, &state.base_path)
+                && let Some(source) = resolve_image_source(&src, &state.base_path)
             {
-                state.emit_image(&path, out, blocks);
+                state.emit_image_source(&source, out, blocks);
             }
         }
         "hr" => {
@@ -815,9 +822,9 @@ fn handle_block_html(
                     }
                     "img" | "video" => {
                         if let Some(src) = xml_attr(e, b"src")
-                            && let Some(path) = resolve_image_path(&src, &state.base_path)
+                            && let Some(source) = resolve_image_source(&src, &state.base_path)
                         {
-                            state.emit_image(&path, out, blocks);
+                            state.emit_image_source(&source, out, blocks);
                         }
                     }
                     "br" => {
@@ -848,9 +855,9 @@ fn handle_block_html(
                     }
                     "img" | "video" => {
                         if let Some(src) = xml_attr(e, b"src")
-                            && let Some(path) = resolve_image_path(&src, &state.base_path)
+                            && let Some(source) = resolve_image_source(&src, &state.base_path)
                         {
-                            state.emit_image(&path, out, blocks);
+                            state.emit_image_source(&source, out, blocks);
                         }
                     }
                     _ => {}
@@ -1168,6 +1175,51 @@ enum EncodedMedia {
     Gif(sixel::PendingGif),
 }
 
+/// Download a URL and encode the image in a background thread.
+/// Returns a PendingImage with an empty preview (shows "[loading...]")
+/// that resolves once the download and encoding complete.
+fn encode_media_url(
+    url: &str,
+    max_width: u32,
+) -> EncodedMedia {
+    let url = url.to_string();
+    let result = std::sync::Arc::new(std::sync::OnceLock::new());
+    let result_clone = result.clone();
+
+    let (pending, rows_handle, preview_handle) = sixel::PendingImage::new_deferred(result);
+
+    std::thread::spawn(move || {
+        let bytes = match reqwest::blocking::get(&url).and_then(|r| r.bytes()) {
+            Ok(b) => b,
+            Err(_) => {
+                let _ = result_clone.set(String::new());
+                return;
+            }
+        };
+
+        let img = match image::load_from_memory(&bytes) {
+            Ok(img) => img.to_rgba8(),
+            Err(_) => {
+                let _ = result_clone.set(String::new());
+                return;
+            }
+        };
+
+        let img = sixel::scale_image(img, max_width);
+        let rows = sixel::pixel_height_to_rows(img.height());
+        let preview = sixel::half_block_preview(&img, sixel::preview_columns(img.width()), rows);
+
+        // Update dimensions and preview before setting result (which signals ready)
+        rows_handle.store(rows, std::sync::atomic::Ordering::Relaxed);
+        *preview_handle.lock().unwrap() = preview;
+
+        let encoded = sixel::encode_rgba(img.width(), img.height(), img.as_raw());
+        let _ = result_clone.set(encoded);
+    });
+
+    EncodedMedia::Image(pending)
+}
+
 /// Try to encode a media file asynchronously: video → GIF → static image.
 /// Returns None if all encoding attempts fail.
 fn encode_media(
@@ -1314,15 +1366,33 @@ fn end_paragraph(
     }
 }
 
+/// Encode from either a local path or URL.
+fn encode_from_source(
+    source: &ImageSource,
+    max_width: u32,
+) -> Option<EncodedMedia> {
+    match source {
+        ImageSource::Local(path) => encode_media(path, max_width),
+        ImageSource::Url(url) => Some(encode_media_url(url, max_width)),
+    }
+}
+
+fn source_display(source: &ImageSource) -> String {
+    match source {
+        ImageSource::Local(path) => format!("{}", path.display()),
+        ImageSource::Url(url) => url.clone(),
+    }
+}
+
 fn flush_para_images(
     state: &mut RenderState,
-    images: &[std::path::PathBuf],
+    images: &[ImageSource],
     blocks: &mut Vec<OutputBlock>,
 ) {
     let max_w = sixel::terminal_pixel_width();
 
     if images.len() == 1 {
-        if let Some(media) = encode_media(&images[0], max_w) {
+        if let Some(media) = encode_from_source(&images[0], max_w) {
             push_media(
                 media,
                 &mut state.pending_images,
@@ -1332,7 +1402,7 @@ fn flush_para_images(
         } else {
             blocks.push(OutputBlock::Text(format!(
                 "\x1b[2m[image: {}]\x1b[0m",
-                images[0].display()
+                source_display(&images[0])
             )));
         }
         return;
@@ -1341,8 +1411,8 @@ fn flush_para_images(
     // Multiple images — encode each at max_w / n for side-by-side
     let per_image_w = max_w / images.len() as u32;
     let mut items = Vec::new();
-    for path in images {
-        if let Some(media) = encode_media(path, per_image_w) {
+    for source in images {
+        if let Some(media) = encode_from_source(source, per_image_w) {
             items.push(push_media_side_by_side(
                 media,
                 &mut state.pending_images,
@@ -1351,8 +1421,7 @@ fn flush_para_images(
         }
     }
     if items.is_empty() {
-        // All encodings failed — show fallback text
-        let names: Vec<_> = images.iter().map(|p| format!("{}", p.display())).collect();
+        let names: Vec<_> = images.iter().map(source_display).collect();
         blocks.push(OutputBlock::Text(format!(
             "\x1b[2m[images: {}]\x1b[0m",
             names.join(", ")
@@ -1613,13 +1682,14 @@ pub fn render(
             // ── Images ───────────────────────────────────────────────
             Event::Start(Tag::Image { dest_url, .. }) => {
                 state.in_image = true;
-                if let Some(path) = resolve_image_path(&dest_url, &state.base_path) {
+                if let Some(source) = resolve_image_source(&dest_url, &state.base_path) {
                     if state.in_table() {
-                        render_image_in_table_cell(&path, &mut state);
+                        if let ImageSource::Local(path) = &source {
+                            render_image_in_table_cell(path, &mut state);
+                        }
                     } else {
-                        // Buffer image path for side-by-side detection
                         flush_text(&mut out, &mut blocks);
-                        state.para_images.push(path);
+                        state.para_images.push(source);
                     }
                 }
             }

@@ -21,8 +21,8 @@ images are displayed inline — all without leaving your terminal.
 - **Bold, italic, strikethrough, underline** — ANSI terminal styling
 - **Links** — Clickable via [OSC 8](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda)
   hyperlinks (in supported terminals)
-- **Images** — Loaded from local paths, displayed inline as Sixel with
-  half-block previews while loading or partially visible
+- **Images** — Loaded from local paths or URLs, displayed inline as Sixel
+  with half-block previews while loading or partially visible
 - **Animated GIFs** — Decoded and animated in the pager with per-frame timing
 - **Video** — MP4, WebM, MKV, AVI, MOV playback via FFmpeg (requires
   FFmpeg libraries installed)
@@ -130,6 +130,7 @@ collapsible sections, and styled HTML.
 - [quick-xml](https://crates.io/crates/quick-xml) — HTML tag parsing
 - [image](https://crates.io/crates/image) — Image loading and GIF decoding
 - [ffmpeg-next](https://crates.io/crates/ffmpeg-next) — Video decoding
+- [reqwest](https://crates.io/crates/reqwest) — HTTP image fetching
 
 ## License
 

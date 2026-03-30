@@ -124,13 +124,56 @@ pub fn scale_image(
 /// A handle to an image being encoded to sixel in a background thread.
 pub struct PendingImage {
     result: Arc<OnceLock<String>>,
-    /// Estimated terminal rows this image will occupy.
-    pub estimated_rows: u16,
-    /// Half-block preview (ANSI-colored text lines).
-    pub preview: Vec<String>,
+    /// Estimated terminal rows (may be updated by background thread for URL
+    /// images).
+    estimated_rows: Arc<std::sync::atomic::AtomicU16>,
+    /// Half-block preview (may be updated by background thread for URL images).
+    preview: Arc<Mutex<Vec<String>>>,
 }
 
 impl PendingImage {
+    /// Create a PendingImage with the given dimensions and preview.
+    pub fn new(
+        result: Arc<OnceLock<String>>,
+        estimated_rows: u16,
+        preview: Vec<String>,
+    ) -> Self {
+        Self {
+            result,
+            estimated_rows: Arc::new(std::sync::atomic::AtomicU16::new(estimated_rows)),
+            preview: Arc::new(Mutex::new(preview)),
+        }
+    }
+
+    /// Create a PendingImage for a URL download where dimensions are unknown.
+    /// Returns the image plus handles the background thread can use to update
+    /// the estimated rows and preview once the download completes.
+    pub fn new_deferred(
+        result: Arc<OnceLock<String>>
+    ) -> (
+        Self,
+        Arc<std::sync::atomic::AtomicU16>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let rows = Arc::new(std::sync::atomic::AtomicU16::new(1));
+        let preview = Arc::new(Mutex::new(vec![]));
+        let img = Self {
+            result,
+            estimated_rows: rows.clone(),
+            preview: preview.clone(),
+        };
+        (img, rows, preview)
+    }
+
+    pub fn estimated_rows(&self) -> u16 {
+        self.estimated_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn preview(&self) -> Vec<String> {
+        self.preview.lock().unwrap().clone()
+    }
+
     /// Check if encoding is complete.
     pub fn is_ready(&self) -> bool {
         self.result.get().is_some()
@@ -225,20 +268,92 @@ pub fn encode_image_file_async(
         let _ = result_clone.set(encoded);
     });
 
-    Some(PendingImage {
-        result,
-        estimated_rows,
-        preview,
-    })
+    Some(PendingImage::new(result, estimated_rows, preview))
 }
 
-/// Synchronous image encoding.
+/// Encode a static image from raw bytes asynchronously.
 #[allow(dead_code)]
-pub fn encode_image_file(
-    path: &std::path::Path,
+pub fn encode_image_bytes_async(
+    data: &[u8],
     max_width: u32,
-) -> Option<String> {
-    encode_image_file_async(path, max_width).map(|p| p.wait().to_string())
+) -> Option<PendingImage> {
+    let img = image::load_from_memory(data).ok()?.to_rgba8();
+    let img = scale_image(img, max_width);
+    let estimated_rows = pixel_height_to_rows(img.height());
+    let preview = half_block_preview(&img, preview_columns(img.width()), estimated_rows);
+
+    let result = Arc::new(OnceLock::new());
+    let result_clone = result.clone();
+
+    std::thread::spawn(move || {
+        let encoded = ImageEncoder::encode(img);
+        let _ = result_clone.set(encoded);
+    });
+
+    Some(PendingImage::new(result, estimated_rows, preview))
+}
+
+/// Encode a GIF from raw bytes asynchronously.
+#[allow(dead_code)]
+pub fn encode_gif_bytes_async(
+    data: Vec<u8>,
+    max_width: u32,
+) -> Option<PendingGif> {
+    use image::AnimationDecoder;
+    use image::codecs::gif::GifDecoder;
+
+    let cursor = std::io::Cursor::new(&data);
+    let decoder = GifDecoder::new(cursor).ok()?;
+    let raw_frames: Vec<_> = decoder.into_frames().collect();
+
+    if raw_frames.is_empty() {
+        return None;
+    }
+
+    let first = raw_frames.first()?.as_ref().ok()?;
+    let scaled = scale_image(first.buffer().clone(), max_width);
+    let estimated_rows = pixel_height_to_rows(scaled.height());
+    let preview = half_block_preview(&scaled, preview_columns(scaled.width()), estimated_rows);
+
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(OnceLock::new());
+    let frames_clone = frames.clone();
+    let done_clone = done.clone();
+
+    std::thread::spawn(move || {
+        // Re-decode from owned data
+        let cursor = std::io::Cursor::new(data);
+        let Ok(decoder) = GifDecoder::new(cursor) else {
+            let _ = done_clone.set(());
+            return;
+        };
+        for frame_result in decoder.into_frames() {
+            let Ok(frame) = frame_result else { continue };
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let delay_ms: u32 = if denom == 0 {
+                100
+            } else {
+                (numer / denom).max(10)
+            };
+            let img = scale_image(frame.into_buffer(), max_width);
+            let sixel = AnimEncoder::encode(img);
+            frames_clone
+                .lock()
+                .unwrap()
+                .push(GifFrame { sixel, delay_ms });
+        }
+        let _ = done_clone.set(());
+    });
+
+    Some(PendingGif {
+        frames,
+        done,
+        cycle_len: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        playback_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        estimated_rows,
+        preview,
+        is_video: false,
+    })
 }
 
 /// A single encoded GIF frame.
