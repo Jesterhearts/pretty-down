@@ -9,7 +9,7 @@ use image::RgbaImage;
 type ImageEncoder = a_sixel::BitMergeSixelEncoderBest<Sierra>;
 type TextEncoder = a_sixel::BitSixelEncoder<NoDither>;
 /// Fast encoder for animated content (GIFs, videos) where speed > quality.
-type AnimEncoder = a_sixel::BitSixelEncoder<Sierra>;
+type AnimEncoder = a_sixel::BitSixelEncoder<NoDither>;
 
 /// Query the terminal's cell pixel height.
 /// Falls back to 20px if the query fails or returns 0.
@@ -368,8 +368,6 @@ pub fn is_video(path: &std::path::Path) -> bool {
 /// Decode the first video frame and generate a half-block preview.
 fn decode_first_frame_preview(
     path: &std::path::Path,
-    src_width: u32,
-    src_height: u32,
     dst_width: u32,
     dst_height: u32,
     estimated_rows: u16,
@@ -388,27 +386,32 @@ fn decode_first_frame_preview(
             .video()
             .ok()?;
 
-        let mut scaler = ffmpeg::software::scaling::context::Context::get(
-            decoder.format(),
-            src_width,
-            src_height,
-            ffmpeg::format::Pixel::RGBA,
-            dst_width,
-            dst_height,
-            ffmpeg::software::scaling::Flags::BILINEAR,
-        )
-        .ok()?;
+        // Scaler is created lazily after first frame, using the frame's
+        // actual pixel format (which may differ from decoder defaults).
+        let mut scaler: Option<ffmpeg::software::scaling::context::Context> = None;
 
         for (s, packet) in input.packets() {
             if s.index() != stream_index {
                 continue;
             }
-            // Some codecs need multiple packets before producing a frame
             let _ = decoder.send_packet(&packet);
             let mut decoded = ffmpeg::frame::Video::empty();
             if decoder.receive_frame(&mut decoded).is_ok() {
+                // Create scaler from the actual frame format
+                let sws = scaler.get_or_insert_with(|| {
+                    ffmpeg::software::scaling::context::Context::get(
+                        decoded.format(),
+                        decoded.width(),
+                        decoded.height(),
+                        ffmpeg::format::Pixel::RGBA,
+                        dst_width,
+                        dst_height,
+                        ffmpeg::software::scaling::Flags::BILINEAR,
+                    )
+                    .expect("scaler")
+                });
                 let mut rgb_frame = ffmpeg::frame::Video::empty();
-                if scaler.run(&decoded, &mut rgb_frame).is_err() {
+                if sws.run(&decoded, &mut rgb_frame).is_err() {
                     continue;
                 }
                 let data = rgb_frame.data(0);
@@ -485,14 +488,7 @@ pub fn encode_video_async(
     let estimated_rows = pixel_height_to_rows(dst_height);
 
     // Decode first frame for half-block preview
-    let _preview = decode_first_frame_preview(
-        path,
-        src_width,
-        src_height,
-        dst_width,
-        dst_height,
-        estimated_rows,
-    );
+    let preview = decode_first_frame_preview(path, dst_width, dst_height, estimated_rows);
 
     let frames = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(OnceLock::new());
@@ -531,27 +527,8 @@ pub fn encode_video_async(
             return;
         };
 
-        let src_width = decoder.width();
-        let src_height = decoder.height();
-        let (dst_width, dst_height) = if src_width > max_width {
-            let h = (src_height as f64 * max_width as f64 / src_width as f64) as u32;
-            (max_width, h)
-        } else {
-            (src_width, src_height)
-        };
-
-        let Ok(mut scaler) = ffmpeg::software::scaling::context::Context::get(
-            decoder.format(),
-            src_width,
-            src_height,
-            ffmpeg::format::Pixel::RGBA,
-            dst_width,
-            dst_height,
-            ffmpeg::software::scaling::Flags::BILINEAR,
-        ) else {
-            let _ = done_clone.set(());
-            return;
-        };
+        // Scaler created lazily from actual frame format
+        let mut scaler: Option<ffmpeg::software::scaling::context::Context> = None;
 
         const MAX_AHEAD: usize = 30;
 
@@ -560,13 +537,23 @@ pub fn encode_video_async(
                 if s.index() != stream_index {
                     continue;
                 }
-                if decoder.send_packet(&packet).is_err() {
-                    continue;
-                }
+                let _ = decoder.send_packet(&packet);
                 let mut decoded = ffmpeg::frame::Video::empty();
                 while decoder.receive_frame(&mut decoded).is_ok() {
+                    let sws = scaler.get_or_insert_with(|| {
+                        ffmpeg::software::scaling::context::Context::get(
+                            decoded.format(),
+                            decoded.width(),
+                            decoded.height(),
+                            ffmpeg::format::Pixel::RGBA,
+                            dst_width,
+                            dst_height,
+                            ffmpeg::software::scaling::Flags::BILINEAR,
+                        )
+                        .expect("scaler")
+                    });
                     let mut rgb_frame = ffmpeg::frame::Video::empty();
-                    if scaler.run(&decoded, &mut rgb_frame).is_err() {
+                    if sws.run(&decoded, &mut rgb_frame).is_err() {
                         continue;
                     }
                     let data = rgb_frame.data(0);
@@ -612,6 +599,6 @@ pub fn encode_video_async(
         done,
         playback_idx,
         estimated_rows,
-        preview: Vec::new(),
+        preview,
     })
 }
