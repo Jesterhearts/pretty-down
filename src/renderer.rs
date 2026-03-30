@@ -224,7 +224,8 @@ pub struct RenderedTableCell {
     pub sixel: Option<String>,
     /// Optional animated GIF ID (index into pending_gifs).
     pub gif_id: Option<usize>,
-    /// Visible width of the cell content (for text: max line width; for images: image cols).
+    /// Visible width of the cell content (for text: max line width; for images:
+    /// image cols).
     pub width: usize,
     /// Number of terminal rows this cell occupies.
     pub height: usize,
@@ -337,7 +338,12 @@ impl RenderState {
         let max_w = sixel::terminal_pixel_width();
         if let Some(media) = encode_media(path, max_w) {
             flush_text(out, blocks);
-            push_media(media, &mut self.pending_images, &mut self.pending_gifs, blocks);
+            push_media(
+                media,
+                &mut self.pending_images,
+                &mut self.pending_gifs,
+                blocks,
+            );
         } else {
             out.push_str(&format!("\x1b[2m[image: {}]\x1b[0m", path.display()));
         }
@@ -996,46 +1002,52 @@ fn flush_table(
     out: &mut String,
     blocks: &mut Vec<OutputBlock>,
 ) {
-    let table = state.table.take().expect("flush_table called outside table");
+    let table = state
+        .table
+        .take()
+        .expect("flush_table called outside table");
     let header_cells = table.header;
     let row_cells = table.rows;
     let alignments = table.alignments;
 
-    let build_rendered_row =
-        |cells: &[TableCell], is_header: bool| -> Vec<RenderedTableCell> {
-            cells
-                .iter()
-                .map(|cell| {
-                    if let Some(ref img) = cell.image {
-                        RenderedTableCell {
-                            text_lines: img.preview.clone(),
-                            sixel: img.sixel.clone(),
-                            gif_id: img.gif_id,
-                            width: img.width_cols as usize,
-                            height: img.height_rows as usize,
-                        }
-                    } else {
-                        let styled = styled_cell_text(cell, is_header);
-                        let lines: Vec<String> =
-                            styled.split('\n').map(|s| s.to_string()).collect();
-                        let width =
-                            lines.iter().map(|l| ansi::visible_len(l)).max().unwrap_or(0);
-                        let height = lines.len().max(1);
-                        RenderedTableCell {
-                            text_lines: lines,
-                            sixel: None,
-                            gif_id: None,
-                            width,
-                            height,
-                        }
+    let build_rendered_row = |cells: &[TableCell], is_header: bool| -> Vec<RenderedTableCell> {
+        cells
+            .iter()
+            .map(|cell| {
+                if let Some(ref img) = cell.image {
+                    RenderedTableCell {
+                        text_lines: img.preview.clone(),
+                        sixel: img.sixel.clone(),
+                        gif_id: img.gif_id,
+                        width: img.width_cols as usize,
+                        height: img.height_rows as usize,
                     }
-                })
-                .collect()
-        };
+                } else {
+                    let styled = styled_cell_text(cell, is_header);
+                    let lines: Vec<String> = styled.split('\n').map(|s| s.to_string()).collect();
+                    let width = lines
+                        .iter()
+                        .map(|l| ansi::visible_len(l))
+                        .max()
+                        .unwrap_or(0);
+                    let height = lines.len().max(1);
+                    RenderedTableCell {
+                        text_lines: lines,
+                        sixel: None,
+                        gif_id: None,
+                        width,
+                        height,
+                    }
+                }
+            })
+            .collect()
+    };
 
     let header = header_cells.as_ref().map(|h| build_rendered_row(h, true));
-    let rows: Vec<Vec<RenderedTableCell>> =
-        row_cells.iter().map(|r| build_rendered_row(r, false)).collect();
+    let rows: Vec<Vec<RenderedTableCell>> = row_cells
+        .iter()
+        .map(|r| build_rendered_row(r, false))
+        .collect();
 
     // Compute column widths
     let col_count = alignments.len().max(
@@ -1062,10 +1074,12 @@ fn flush_table(
         header,
         rows,
     }));
-
 }
 
-fn styled_cell_text(cell: &TableCell, is_header: bool) -> String {
+fn styled_cell_text(
+    cell: &TableCell,
+    is_header: bool,
+) -> String {
     let mut s = String::new();
     if is_header {
         s.push_str(ansi::BOLD);
@@ -1156,11 +1170,14 @@ enum EncodedMedia {
 
 /// Try to encode a media file asynchronously: video → GIF → static image.
 /// Returns None if all encoding attempts fail.
-fn encode_media(path: &std::path::Path, max_width: u32) -> Option<EncodedMedia> {
-    if sixel::is_video(path) {
-        if let Some(pending) = sixel::encode_video_async(path, max_width) {
-            return Some(EncodedMedia::Gif(pending));
-        }
+fn encode_media(
+    path: &std::path::Path,
+    max_width: u32,
+) -> Option<EncodedMedia> {
+    if sixel::is_video(path)
+        && let Some(pending) = sixel::encode_video_async(path, max_width)
+    {
+        return Some(EncodedMedia::Gif(pending));
     }
     if let Some(pending) = sixel::encode_gif_async(path, max_width) {
         return Some(EncodedMedia::Gif(pending));
@@ -1171,7 +1188,8 @@ fn encode_media(path: &std::path::Path, max_width: u32) -> Option<EncodedMedia> 
     None
 }
 
-/// Push encoded media into the appropriate pending vec and emit an output block.
+/// Push encoded media into the appropriate pending vec and emit an output
+/// block.
 fn push_media(
     media: EncodedMedia,
     pending_images: &mut Vec<sixel::PendingImage>,
@@ -1305,7 +1323,12 @@ fn flush_para_images(
 
     if images.len() == 1 {
         if let Some(media) = encode_media(&images[0], max_w) {
-            push_media(media, &mut state.pending_images, &mut state.pending_gifs, blocks);
+            push_media(
+                media,
+                &mut state.pending_images,
+                &mut state.pending_gifs,
+                blocks,
+            );
         } else {
             blocks.push(OutputBlock::Text(format!(
                 "\x1b[2m[image: {}]\x1b[0m",

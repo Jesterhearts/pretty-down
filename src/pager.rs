@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
-use std::io::{
-    self,
-};
+use std::io::{self};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -17,13 +15,9 @@ use crossterm::event::KeyModifiers;
 use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
-use crossterm::event::{
-    self,
-};
+use crossterm::event::{self};
 use crossterm::terminal::ClearType;
-use crossterm::terminal::{
-    self,
-};
+use crossterm::terminal::{self};
 
 use crate::renderer::RenderOutput;
 
@@ -41,7 +35,11 @@ enum PositionedSixel {
     /// Static sixel image at the given column offset.
     Static { col: u16, width: u16, data: String },
     /// Pending image at the given column offset (resolved at draw time).
-    Pending { col: u16, width: u16, image_id: usize },
+    Pending {
+        col: u16,
+        width: u16,
+        image_id: usize,
+    },
     /// Animated GIF at the given column offset (frame looked up at draw time).
     Gif { col: u16, width: u16, gif_id: usize },
 }
@@ -400,7 +398,11 @@ fn flatten_table(
                         if line_idx == 0 {
                             let w = *width as u16;
                             if let Some(gif_id) = cell.gif_id {
-                                sixels.push(PositionedSixel::Gif { col: col_offset, width: w, gif_id });
+                                sixels.push(PositionedSixel::Gif {
+                                    col: col_offset,
+                                    width: w,
+                                    gif_id,
+                                });
                             } else if let Some(ref sixel_data) = cell.sixel {
                                 sixels.push(PositionedSixel::Static {
                                     col: col_offset,
@@ -489,12 +491,11 @@ fn flatten_table(
         let mut col_off: u16 = 1; // after leading │
         for (col, width) in w.iter().enumerate() {
             col_off += 1; // space padding
-            if let Some(cell) = row.get(col) {
-                if let Some(gif_id) = cell.gif_id {
-                    if pending_gifs.get(gif_id).is_some_and(|g| g.is_video) {
-                        vid_controls.push((col_off, *width as u16, gif_id));
-                    }
-                }
+            if let Some(cell) = row.get(col)
+                && let Some(gif_id) = cell.gif_id
+                && pending_gifs.get(gif_id).is_some_and(|g| g.is_video)
+            {
+                vid_controls.push((col_off, *width as u16, gif_id));
             }
             col_off += *width as u16 + 1; // cell width + trailing space
             if col < w.len() - 1 {
@@ -1192,7 +1193,9 @@ pub fn print_output(output: &RenderOutput) {
             Line::TableRow { content } => {
                 println!("{content}");
             }
-            Line::ImageStrip { content, sixels, .. } => {
+            Line::ImageStrip {
+                content, sixels, ..
+            } => {
                 print!("{content}");
                 for s in sixels {
                     match s {
@@ -1493,31 +1496,28 @@ fn draw_screen(
                                 write!(stdout, "{data}").unwrap();
                             }
                             PositionedSixel::Pending { col, image_id, .. } => {
-                                if let Some(p) = pending_images.get(*image_id) {
-                                    if p.is_ready() {
-                                        let sixel = p.wait();
-                                        if !sixel.is_empty() {
-                                            crossterm::execute!(
-                                                stdout,
-                                                cursor::MoveTo(*col, start_row)
-                                            )
-                                            .unwrap();
-                                            write!(stdout, "{sixel}").unwrap();
-                                        }
-                                    }
-                                }
-                            }
-                            PositionedSixel::Gif { col, gif_id, .. } => {
-                                let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
-                                if let Some(gif) = gifs.get(*gif_id) {
-                                    if let Some(frame) = gif.frame(frame_idx) {
+                                if let Some(p) = pending_images.get(*image_id)
+                                    && p.is_ready()
+                                {
+                                    let sixel = p.wait();
+                                    if !sixel.is_empty() {
                                         crossterm::execute!(
                                             stdout,
                                             cursor::MoveTo(*col, start_row)
                                         )
                                         .unwrap();
-                                        write!(stdout, "{}", frame.sixel).unwrap();
+                                        write!(stdout, "{sixel}").unwrap();
                                     }
+                                }
+                            }
+                            PositionedSixel::Gif { col, gif_id, .. } => {
+                                let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
+                                if let Some(gif) = gifs.get(*gif_id)
+                                    && let Some(frame) = gif.frame(frame_idx)
+                                {
+                                    crossterm::execute!(stdout, cursor::MoveTo(*col, start_row))
+                                        .unwrap();
+                                    write!(stdout, "{}", frame.sixel).unwrap();
                                 }
                             }
                         }
@@ -1529,13 +1529,8 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{content}\r").unwrap();
                 for &(col, w, gif_id) in video_controls {
-                    let controls = format_video_controls(
-                        w as usize,
-                        gif_id,
-                        gifs,
-                        gif_frames,
-                        video_paused,
-                    );
+                    let controls =
+                        format_video_controls(w as usize, gif_id, gifs, gif_frames, video_paused);
                     crossterm::execute!(stdout, cursor::MoveTo(col, rows_used)).unwrap();
                     write!(stdout, "{controls}").unwrap();
                     video_control_rows.push((rows_used, gif_id));
@@ -1590,13 +1585,8 @@ fn draw_screen(
                     .and_then(|g| g.preview.first())
                     .map(|p| crate::renderer::ansi::visible_len(p))
                     .unwrap_or(term_cols as usize);
-                let controls = format_video_controls(
-                    video_cols,
-                    *gif_id,
-                    gifs,
-                    gif_frames,
-                    video_paused,
-                );
+                let controls =
+                    format_video_controls(video_cols, *gif_id, gifs, gif_frames, video_paused);
                 write!(stdout, " {controls} \r").unwrap();
                 video_control_rows.push((rows_used, *gif_id));
                 rows_used += 1;
