@@ -1048,7 +1048,13 @@ fn draw_screen(
                 let btn = if paused { "\u{25B6}" } else { "\u{23F8}" }; // ▶ or ⏸
                 let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
                 let cycle = gifs.get(*gif_id).map(|g| g.cycle_length()).unwrap_or(0);
-                let bar_width = term_cols.saturating_sub(10) as usize;
+                // Match the video's column width (from preview line length)
+                let video_cols = gifs
+                    .get(*gif_id)
+                    .and_then(|g| g.preview.first())
+                    .map(|p| crate::renderer::ansi::visible_len(p))
+                    .unwrap_or(term_cols as usize);
+                let bar_width = video_cols.saturating_sub(5); // " ⏸  " + " " = ~5 chars
                 let progress_pos = if cycle > 1 && bar_width > 0 {
                     let pos_in_cycle = frame_idx % cycle;
                     (pos_in_cycle * bar_width / cycle).min(bar_width - 1)
