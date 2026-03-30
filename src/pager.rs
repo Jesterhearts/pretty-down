@@ -1049,8 +1049,10 @@ fn draw_screen(
                 let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
                 let total = gifs.get(*gif_id).map(|g| g.frame_count()).unwrap_or(0);
                 let bar_width = term_cols.saturating_sub(10) as usize;
-                let progress_pos = if total > 0 {
-                    (frame_idx * bar_width) / total
+                let progress_pos = if total > 1 && bar_width > 0 {
+                    // Use modulo so position wraps on video loop
+                    let pos_in_cycle = frame_idx % total;
+                    (pos_in_cycle * bar_width / total).min(bar_width - 1)
                 } else {
                     0
                 };
