@@ -1,4 +1,5 @@
 mod font;
+mod highlight;
 mod pager;
 mod renderer;
 mod sixel;
@@ -24,6 +25,10 @@ struct Args {
     /// Path to a theme JSON file
     #[arg(short, long)]
     theme: Option<PathBuf>,
+
+    /// Syntax highlighting theme name or .tmTheme file path
+    #[arg(long)]
+    syntax_theme: Option<String>,
 
     /// Print output directly without the pager
     #[arg(long)]
@@ -67,6 +72,20 @@ fn main() {
         None => theme::Theme::default(),
     };
 
+    // Set up syntax highlighter
+    let mut highlighter = highlight::Highlighter::new();
+    if let Some(ref st) = args.syntax_theme {
+        let path = std::path::Path::new(st);
+        if path.exists() {
+            highlighter.load_theme_file(path).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+        } else {
+            highlighter.set_theme(st);
+        }
+    }
+
     // Read markdown
     let (markdown, base_path) = match &args.file {
         Some(p) => {
@@ -93,7 +112,7 @@ fn main() {
         }
     };
 
-    let output = renderer::render(&markdown, &font, base_path.as_deref(), &theme);
+    let output = renderer::render(&markdown, &font, base_path.as_deref(), &theme, &highlighter);
 
     if args.no_pager || !std::io::stdout().is_terminal() {
         for p in &output.pending_images {
@@ -113,7 +132,7 @@ fn main() {
             let theme = theme.clone();
             Box::new(move || {
                 let md = std::fs::read_to_string(&file).unwrap_or_default();
-                renderer::render(&md, &font, base.as_deref(), &theme)
+                renderer::render(&md, &font, base.as_deref(), &theme, &highlighter)
             })
         } else {
             Box::new(|| renderer::RenderOutput {

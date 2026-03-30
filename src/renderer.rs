@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use pulldown_cmark::Alignment;
+use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
 use pulldown_cmark::HeadingLevel;
 use pulldown_cmark::Options;
@@ -136,6 +137,10 @@ struct RenderState {
     link_url: Option<String>,
     /// Whether we are inside a code block
     in_code_block: bool,
+    /// Language of the current code block (for syntax highlighting)
+    code_lang: Option<String>,
+    /// Accumulated code block content (for syntax highlighting)
+    code_buf: String,
     /// List nesting with item index (None = unordered, Some(n) = ordered
     /// starting at n)
     list_stack: Vec<Option<u64>>,
@@ -183,6 +188,8 @@ impl RenderState {
             strikethrough: false,
             link_url: None,
             in_code_block: false,
+            code_lang: None,
+            code_buf: String::new(),
             list_stack: Vec::new(),
             item_index: Vec::new(),
             base_path,
@@ -940,6 +947,7 @@ pub fn render(
     font: &Font,
     base_path: Option<&Path>,
     theme: &crate::theme::Theme,
+    highlighter: &crate::highlight::Highlighter,
 ) -> RenderOutput {
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(markdown, options);
@@ -991,15 +999,45 @@ pub fn render(
             }
 
             // ── Code blocks ──────────────────────────────────────────
-            Event::Start(Tag::CodeBlock(_)) => {
+            Event::Start(Tag::CodeBlock(kind)) => {
                 state.in_code_block = true;
-                out.push_str(&theme.code_block.to_ansi());
-                out.push_str("  ");
+                state.code_buf.clear();
+                state.code_lang = match kind {
+                    CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.to_string()),
+                    _ => None,
+                };
             }
             Event::End(TagEnd::CodeBlock) => {
                 state.in_code_block = false;
+                // Try syntax highlighting, fall back to themed plain text
+                let code = std::mem::take(&mut state.code_buf);
+                let highlighted = state
+                    .code_lang
+                    .as_deref()
+                    .and_then(|lang| highlighter.highlight(&code, lang));
+                if let Some(colored) = highlighted {
+                    // Indent each line
+                    for (i, line) in colored.lines().enumerate() {
+                        if i > 0 {
+                            out.push('\n');
+                        }
+                        out.push_str("  ");
+                        out.push_str(line);
+                    }
+                } else {
+                    // No highlighting — use theme style
+                    out.push_str(&theme.code_block.to_ansi());
+                    out.push_str("  ");
+                    for (i, line) in code.lines().enumerate() {
+                        if i > 0 {
+                            out.push_str("\n  ");
+                        }
+                        out.push_str(line);
+                    }
+                }
                 out.push_str(ansi::RESET);
-                out.push('\n');
+                out.push_str("\n\n");
+                state.code_lang = None;
             }
 
             // ── Inline styling ───────────────────────────────────────
@@ -1154,12 +1192,8 @@ pub fn render(
                 } else if state.heading_level > 0 {
                     state.heading_text.push_str(&text);
                 } else if state.in_code_block {
-                    for (i, line) in text.lines().enumerate() {
-                        if i > 0 {
-                            out.push_str("\n  ");
-                        }
-                        out.push_str(line);
-                    }
+                    // Accumulate code for syntax highlighting at End(CodeBlock)
+                    state.code_buf.push_str(&text);
                 } else {
                     out.push_str(&text);
                 }
