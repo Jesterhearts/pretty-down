@@ -462,6 +462,14 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{data}").unwrap();
                 rows_used += height;
+                // If the sixel overflowed the viewport, the terminal
+                // auto-scrolled. Stop rendering further lines since they'd
+                // be positioned wrong, and break so the status bar can
+                // re-anchor at the screen bottom.
+                if rows_used > viewport_rows {
+                    line_idx += 1;
+                    break;
+                }
             }
             Line::PendingImage { .. } => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
