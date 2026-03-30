@@ -2,7 +2,7 @@
 
 > **Fair warning:** This was vibe-coded for my own personal use. It works for me,
 > but your mileage may vary.
-> 
+>
 > I only test on linux as that is my current environment. If anyone is aware of similar
 > projects/prior art, please let me know so I can link them here. The goal of this was to have
 > in-terminal pretty rendering of markdown files which goes beyond syntax highlighting and is closer
@@ -14,16 +14,30 @@ images are displayed inline — all without leaving your terminal.
 
 ## What it does
 
-- **Headings (h1–h6)** — Rendered as Sixel images with scaled font sizes using
-  the embedded [Fairfax](https://www.kreativekorp.com/software/fonts/fairfax/)
-  font (or a custom font via `--font`)
-- **Bold, italic, strikethrough** — ANSI terminal escape codes
+- **Headings (h1-h6)** — Rendered as Sixel images with scaled font sizes,
+  with half-block Unicode previews while scrolling
+- **Bold, italic, strikethrough, underline** — ANSI terminal styling
 - **Links** — Clickable via [OSC 8](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda)
   hyperlinks (in supported terminals)
-- **Images** — Loaded from local paths and displayed inline as Sixel
-- **Code blocks, lists, blockquotes, horizontal rules** — ANSI styling
-
-HTML content is not supported.
+- **Images** — Loaded from local paths, displayed inline as Sixel with
+  half-block previews while loading or partially visible
+- **Animated GIFs** — Decoded and animated in the pager with per-frame timing
+- **Syntax highlighting** — Code blocks with language tags are highlighted
+  via [syntect](https://crates.io/crates/syntect) with true-color output
+- **Horizontally scrollable code blocks** — Code doesn't wrap; scroll
+  sideways with the mouse
+- **Tables** — Rendered with Unicode box-drawing borders via
+  [comfy-table](https://crates.io/crates/comfy-table)
+- **Blockquotes** — Styled with `│` prefix on every line, supports nesting
+- **Lists** — Ordered, unordered, nested
+- **Horizontal rules**
+- **`<details>`/`<summary>`** — Collapsible sections, click or press Enter
+  to toggle
+- **HTML elements** — `<b>`, `<i>`, `<u>`, `<mark>`, `<kbd>`, `<del>`,
+  `<span>`, `<div>` with inline CSS styles (`color`, `background-color`,
+  `font-weight`, `font-style`, `text-decoration`)
+- **Color themes** — Customizable via JSON theme files
+- **File watching** — Auto-reload on file changes with `-w`
 
 ## Requirements
 
@@ -40,14 +54,38 @@ Reads from stdin if no file is given.
 
 ```sh
 # Render a file
-pretty-down README.md
+pretty-down examples/showcase.md
 
-# Pipe from stdin
+# Watch for changes
+pretty-down -w examples/showcase.md
+
+# Use a custom font and theme
+pretty-down --font /path/to/font.ttf --theme examples/themes/dracula.json doc.md
+
+# Use a different syntax highlighting theme
+pretty-down --syntax-theme "Solarized (dark)" doc.md
+
+# Pipe from stdin (no pager)
 cat notes.md | pretty-down
-
-# Use a custom font for headings
-pretty-down --font /path/to/font.ttf document.md
 ```
+
+### Pager keybindings
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Scroll down |
+| `k` / `Up` | Scroll up |
+| `d` / `PageDown` | Half page down |
+| `u` / `PageUp` | Half page up |
+| `Space` | Page down |
+| `g` / `Home` | Top |
+| `G` / `End` | Bottom |
+| `Enter` | Toggle `<details>` block |
+| `r` | Reload |
+| `q` / `Esc` | Quit |
+| Mouse scroll | Vertical scroll (3 lines) |
+| Mouse h-scroll | Horizontal scroll on code blocks |
+| Mouse click | Toggle `<details>` summary |
 
 ## Building
 
@@ -55,12 +93,30 @@ pretty-down --font /path/to/font.ttf document.md
 cargo build --release
 ```
 
+## Example
+
+A comprehensive showcase of all features is included:
+
+```sh
+cargo run --release -- examples/showcase.md
+```
+
+See [`examples/showcase.md`](examples/showcase.md) for the full feature
+demonstration including syntax highlighting, images, GIFs, tables,
+collapsible sections, and styled HTML.
+
 ## Dependencies
 
 - [pulldown-cmark](https://crates.io/crates/pulldown-cmark) — Markdown parsing
 - [a-sixel](https://crates.io/crates/a-sixel) — Sixel encoding
+- [syntect](https://crates.io/crates/syntect) — Syntax highlighting
 - [rustybuzz](https://crates.io/crates/rustybuzz) — Text shaping
 - [raqote](https://crates.io/crates/raqote) — 2D rasterization
+- [comfy-table](https://crates.io/crates/comfy-table) — Table rendering
+- [crossterm](https://crates.io/crates/crossterm) — Terminal interaction
+- [notify](https://crates.io/crates/notify) — File watching
+- [quick-xml](https://crates.io/crates/quick-xml) — HTML tag parsing
+- [image](https://crates.io/crates/image) — Image loading and GIF decoding
 
 ## License
 
