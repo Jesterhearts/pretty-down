@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::font::Font;
 use crate::sixel;
@@ -61,6 +61,21 @@ struct RenderState {
     base_path: Option<std::path::PathBuf>,
     /// Accumulator for block-level HTML (multiple Html events before End(HtmlBlock))
     html_block_buf: String,
+    /// Table column alignments (set on Start(Table))
+    table_alignments: Vec<Alignment>,
+    /// Whether we are in the header row
+    in_table_head: bool,
+    /// Accumulated text for the current table cell
+    table_cell_buf: String,
+    /// Cells collected for the current row: (text, is_bold, is_italic, is_code)
+    table_row_cells: Vec<(String, bool, bool, bool)>,
+    /// All collected rows: header row (if any) + data rows
+    table_header: Option<Vec<(String, bool, bool, bool)>>,
+    table_rows: Vec<Vec<(String, bool, bool, bool)>>,
+    /// Track inline styles within table cells
+    table_cell_bold: bool,
+    table_cell_italic: bool,
+    table_cell_code: bool,
 }
 
 impl RenderState {
@@ -77,7 +92,20 @@ impl RenderState {
             item_index: Vec::new(),
             base_path,
             html_block_buf: String::new(),
+            table_alignments: Vec::new(),
+            in_table_head: false,
+            table_cell_buf: String::new(),
+            table_row_cells: Vec::new(),
+            table_header: None,
+            table_rows: Vec::new(),
+            table_cell_bold: false,
+            table_cell_italic: false,
+            table_cell_code: false,
         }
+    }
+
+    fn in_table(&self) -> bool {
+        !self.table_alignments.is_empty()
     }
 
     fn push_style(&self, out: &mut String) {
@@ -442,6 +470,75 @@ fn emit_block(
     let _ = state; // avoid unused warning
 }
 
+/// Build a comfy-table from accumulated table state and append to output.
+fn flush_table(state: &mut RenderState, out: &mut String) {
+    use comfy_table::{
+        modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL_CONDENSED, Attribute, Cell,
+        CellAlignment, ContentArrangement, Table,
+    };
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.apply_modifier(UTF8_ROUND_CORNERS);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+
+    // Set column alignments
+    for (i, align) in state.table_alignments.iter().enumerate() {
+        let ca = match align {
+            Alignment::Left | Alignment::None => CellAlignment::Left,
+            Alignment::Center => CellAlignment::Center,
+            Alignment::Right => CellAlignment::Right,
+        };
+        if let Some(col) = table.column_mut(i) {
+            col.set_cell_alignment(ca);
+        }
+    }
+
+    // Header row
+    if let Some(header) = state.table_header.take() {
+        let cells: Vec<Cell> = header
+            .into_iter()
+            .map(|(text, _, _, _)| Cell::new(text).add_attribute(Attribute::Bold))
+            .collect();
+        table.set_header(cells);
+    }
+
+    // Data rows
+    for row in std::mem::take(&mut state.table_rows) {
+        let cells: Vec<Cell> = row
+            .into_iter()
+            .enumerate()
+            .map(|(i, (text, bold, italic, code))| {
+                let mut cell = Cell::new(text);
+                if bold {
+                    cell = cell.add_attribute(Attribute::Bold);
+                }
+                if italic {
+                    cell = cell.add_attribute(Attribute::Italic);
+                }
+                if code {
+                    cell = cell.add_attribute(Attribute::Dim);
+                }
+                // Apply column alignment per-cell
+                if let Some(align) = state.table_alignments.get(i) {
+                    cell = cell.set_alignment(match align {
+                        Alignment::Left | Alignment::None => CellAlignment::Left,
+                        Alignment::Center => CellAlignment::Center,
+                        Alignment::Right => CellAlignment::Right,
+                    });
+                }
+                cell
+            })
+            .collect();
+        table.add_row(cells);
+    }
+
+    out.push_str(&table.to_string());
+    out.push_str("\n\n");
+
+    state.table_alignments.clear();
+}
+
 /// Render markdown to a string containing ANSI escape codes and sixel sequences.
 ///
 /// Headings are rendered as sixel images using the provided font.
@@ -504,42 +601,58 @@ pub fn render(markdown: &str, font: &Font, base_path: Option<&Path>) -> String {
 
             // ── Inline styling ───────────────────────────────────────
             Event::Start(Tag::Emphasis) => {
-                state.italic = true;
-                if state.heading_level == 0 {
-                    out.push_str(ansi::ITALIC);
+                if state.in_table() {
+                    state.table_cell_italic = true;
+                } else {
+                    state.italic = true;
+                    if state.heading_level == 0 {
+                        out.push_str(ansi::ITALIC);
+                    }
                 }
             }
             Event::End(TagEnd::Emphasis) => {
-                state.italic = false;
-                if state.heading_level == 0 {
-                    out.push_str(ansi::RESET);
-                    state.push_style(&mut out);
+                if state.in_table() {
+                    state.table_cell_italic = false;
+                } else {
+                    state.italic = false;
+                    if state.heading_level == 0 {
+                        out.push_str(ansi::RESET);
+                        state.push_style(&mut out);
+                    }
                 }
             }
 
             Event::Start(Tag::Strong) => {
-                state.bold = true;
-                if state.heading_level == 0 {
-                    out.push_str(ansi::BOLD);
+                if state.in_table() {
+                    state.table_cell_bold = true;
+                } else {
+                    state.bold = true;
+                    if state.heading_level == 0 {
+                        out.push_str(ansi::BOLD);
+                    }
                 }
             }
             Event::End(TagEnd::Strong) => {
-                state.bold = false;
-                if state.heading_level == 0 {
-                    out.push_str(ansi::RESET);
-                    state.push_style(&mut out);
+                if state.in_table() {
+                    state.table_cell_bold = false;
+                } else {
+                    state.bold = false;
+                    if state.heading_level == 0 {
+                        out.push_str(ansi::RESET);
+                        state.push_style(&mut out);
+                    }
                 }
             }
 
             Event::Start(Tag::Strikethrough) => {
                 state.strikethrough = true;
-                if state.heading_level == 0 {
+                if state.heading_level == 0 && !state.in_table() {
                     out.push_str(ansi::STRIKETHROUGH);
                 }
             }
             Event::End(TagEnd::Strikethrough) => {
                 state.strikethrough = false;
-                if state.heading_level == 0 {
+                if state.heading_level == 0 && !state.in_table() {
                     out.push_str(ansi::RESET);
                     state.push_style(&mut out);
                 }
@@ -621,7 +734,10 @@ pub fn render(markdown: &str, font: &Font, base_path: Option<&Path>) -> String {
 
             // ── Inline code ──────────────────────────────────────────
             Event::Code(code) => {
-                if state.heading_level > 0 {
+                if state.in_table() {
+                    state.table_cell_buf.push_str(&code);
+                    state.table_cell_code = true;
+                } else if state.heading_level > 0 {
                     state.heading_text.push_str(&code);
                 } else {
                     out.push_str(ansi::DIM);
@@ -633,10 +749,11 @@ pub fn render(markdown: &str, font: &Font, base_path: Option<&Path>) -> String {
 
             // ── Text content ─────────────────────────────────────────
             Event::Text(text) => {
-                if state.heading_level > 0 {
+                if state.in_table() {
+                    state.table_cell_buf.push_str(&text);
+                } else if state.heading_level > 0 {
                     state.heading_text.push_str(&text);
                 } else if state.in_code_block {
-                    // Indent each line of code blocks
                     for (i, line) in text.lines().enumerate() {
                         if i > 0 {
                             out.push_str("\n  ");
@@ -649,18 +766,62 @@ pub fn render(markdown: &str, font: &Font, base_path: Option<&Path>) -> String {
             }
 
             Event::SoftBreak => {
-                if state.heading_level > 0 {
+                if state.in_table() {
+                    state.table_cell_buf.push(' ');
+                } else if state.heading_level > 0 {
                     state.heading_text.push(' ');
                 } else {
                     out.push(' ');
                 }
             }
             Event::HardBreak => {
-                if state.heading_level > 0 {
+                if state.in_table() {
+                    state.table_cell_buf.push(' ');
+                } else if state.heading_level > 0 {
                     state.heading_text.push(' ');
                 } else {
                     out.push('\n');
                 }
+            }
+
+            // ── Tables ────────────────────────────────────────────────
+            Event::Start(Tag::Table(alignments)) => {
+                state.table_alignments = alignments;
+                state.table_header = None;
+                state.table_rows.clear();
+            }
+            Event::End(TagEnd::Table) => {
+                flush_table(&mut state, &mut out);
+            }
+            Event::Start(Tag::TableHead) => {
+                state.in_table_head = true;
+                state.table_row_cells.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                state.in_table_head = false;
+                state.table_header = Some(std::mem::take(&mut state.table_row_cells));
+            }
+            Event::Start(Tag::TableRow) => {
+                state.table_row_cells.clear();
+            }
+            Event::End(TagEnd::TableRow) => {
+                let row = std::mem::take(&mut state.table_row_cells);
+                state.table_rows.push(row);
+            }
+            Event::Start(Tag::TableCell) => {
+                state.table_cell_buf.clear();
+                state.table_cell_bold = false;
+                state.table_cell_italic = false;
+                state.table_cell_code = false;
+            }
+            Event::End(TagEnd::TableCell) => {
+                let text = std::mem::take(&mut state.table_cell_buf);
+                state.table_row_cells.push((
+                    text,
+                    state.table_cell_bold,
+                    state.table_cell_italic,
+                    state.table_cell_code,
+                ));
             }
 
             // ── Inline HTML ──────────────────────────────────────────
