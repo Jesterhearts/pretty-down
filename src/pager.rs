@@ -166,6 +166,34 @@ fn parse_marker(
     }
 }
 
+/// Compute indices of lines that are visible given the current collapsed state.
+/// Lines inside collapsed `<details>` blocks are excluded (except the summary).
+fn visible_indices(
+    lines: &[Line],
+    collapsed: &HashSet<usize>,
+) -> Vec<usize> {
+    let mut visible = Vec::new();
+    let mut skip_id: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(sid) = skip_id {
+            if matches!(line, Line::DetailsEnd { id } if *id == sid) {
+                skip_id = None;
+                // Include the DetailsEnd so draw knows the block ended
+                visible.push(i);
+            }
+            continue;
+        }
+        match line {
+            Line::DetailsSummary { id, .. } if collapsed.contains(id) => {
+                visible.push(i);
+                skip_id = Some(*id);
+            }
+            _ => visible.push(i),
+        }
+    }
+    visible
+}
+
 /// Estimate how many terminal rows a sixel image occupies.
 fn estimate_sixel_rows(data: &str) -> u16 {
     if let Some(q_pos) = data.find('q') {
@@ -272,10 +300,11 @@ pub fn run(
     terminal::enable_raw_mode().unwrap();
     crossterm::execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide,).unwrap();
 
-    let mut scroll_offset: usize = 0;
+    let mut scroll_offset: usize = 0; // index into `visible`
     let mut needs_redraw = true;
     let mut collapsed: HashSet<usize> = HashSet::new();
-    /// Which direction the last scroll action went, if any.
+    let mut visible = visible_indices(&lines, &collapsed);
+
     #[derive(Clone, Copy, PartialEq)]
     enum ScrollDir {
         None,
@@ -289,22 +318,19 @@ pub fn run(
             let overflow = draw_screen(
                 &mut stdout,
                 &lines,
+                &visible,
                 &collapsed,
                 scroll_offset,
                 viewport_rows,
                 term_rows,
                 watching,
             );
-            // After a sixel auto-scroll, adjust scroll_offset to account
-            // for the rows that were pushed off screen. The adjustment
-            // direction depends on which way the user was scrolling.
             if let Some(ov) = overflow {
                 match scroll_dir {
                     ScrollDir::Down => {
-                        // Advance past the lines that were scrolled off the top
                         let mut rows_to_skip = ov.rows;
-                        while rows_to_skip > 0 && scroll_offset < lines.len() {
-                            let r = lines[scroll_offset].rows();
+                        while rows_to_skip > 0 && scroll_offset < visible.len() {
+                            let r = lines[visible[scroll_offset]].rows();
                             if r > rows_to_skip {
                                 break;
                             }
@@ -313,14 +339,12 @@ pub fn run(
                         }
                     }
                     ScrollDir::Up => {
-                        // Retreat to a full viewport of content above the image
-                        // so the next scroll-up continues past it.
-                        let image_line = ov.line_idx;
+                        let image_vis_idx = ov.vis_idx;
                         let mut rows = 0u16;
-                        let mut target = image_line;
+                        let mut target = image_vis_idx;
                         while target > 0 {
                             target -= 1;
-                            rows += lines[target].rows();
+                            rows += lines[visible[target]].rows();
                             if rows >= viewport_rows {
                                 break;
                             }
@@ -342,10 +366,11 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(50));
             let new_output = render_fn();
             lines = split_lines(&new_output.text);
+            visible = visible_indices(&lines, &collapsed);
             current_output = Some(new_output);
             pending = &current_output.as_ref().unwrap().pending_images;
-            if scroll_offset >= lines.len() {
-                scroll_offset = lines.len().saturating_sub(1);
+            if scroll_offset >= visible.len() {
+                scroll_offset = visible.len().saturating_sub(1);
             }
             needs_redraw = true;
             continue;
@@ -356,6 +381,7 @@ pub fn run(
         let had_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
         if had_pending {
             resolve_ready_images(&mut lines, pending);
+            visible = visible_indices(&lines, &collapsed);
             let still_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
             if had_pending != still_pending {
                 needs_redraw = true;
@@ -392,7 +418,7 @@ pub fn run(
                     code: KeyCode::Char('j') | KeyCode::Down,
                     ..
                 } => {
-                    scroll_offset = advance_lines(&lines, scroll_offset, 1);
+                    scroll_offset = advance_lines(&visible, scroll_offset, 1);
                     scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
@@ -420,7 +446,7 @@ pub fn run(
                     ..
                 } => {
                     let half = (viewport_rows / 2) as usize;
-                    scroll_offset = advance_lines(&lines, scroll_offset, half);
+                    scroll_offset = advance_lines(&visible, scroll_offset, half);
                     scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
@@ -463,7 +489,7 @@ pub fn run(
                 | KeyEvent {
                     code: KeyCode::End, ..
                 } => {
-                    scroll_offset = scroll_to_end(&lines, viewport_rows);
+                    scroll_offset = scroll_to_end(&lines, &visible, viewport_rows);
                     scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
@@ -472,7 +498,7 @@ pub fn run(
                     code: KeyCode::Char(' '),
                     ..
                 } => {
-                    scroll_offset = advance_lines(&lines, scroll_offset, viewport_rows as usize);
+                    scroll_offset = advance_lines(&visible, scroll_offset, viewport_rows as usize);
                     scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
@@ -482,10 +508,11 @@ pub fn run(
                 } => {
                     let new_output = render_fn();
                     lines = split_lines(&new_output.text);
+                    visible = visible_indices(&lines, &collapsed);
                     current_output = Some(new_output);
                     pending = &current_output.as_ref().unwrap().pending_images;
-                    if scroll_offset >= lines.len() {
-                        scroll_offset = lines.len().saturating_sub(1);
+                    if scroll_offset >= visible.len() {
+                        scroll_offset = visible.len().saturating_sub(1);
                     }
                     needs_redraw = true;
                 }
@@ -495,11 +522,16 @@ pub fn run(
                     code: KeyCode::Enter,
                     ..
                 } => {
-                    if let Some(id) = first_visible_details(&lines, scroll_offset) {
+                    if let Some(id) = first_visible_details(&lines, &visible, scroll_offset) {
                         if collapsed.contains(&id) {
                             collapsed.remove(&id);
                         } else {
                             collapsed.insert(id);
+                        }
+                        visible = visible_indices(&lines, &collapsed);
+                        // Clamp scroll offset to new visible range
+                        if scroll_offset >= visible.len() {
+                            scroll_offset = visible.len().saturating_sub(1);
                         }
                         needs_redraw = true;
                     }
@@ -542,14 +574,17 @@ pub fn print_output(output: &RenderOutput) {
 struct Overflow {
     /// Number of rows the terminal auto-scrolled.
     rows: u16,
-    /// Line index of the sixel that caused the overflow.
-    line_idx: usize,
+    /// Index into `visible` of the sixel that caused the overflow.
+    vis_idx: usize,
 }
 
 /// Draw the current view.
+/// `scroll_offset` indexes into `visible`, which maps to actual line indices.
+#[allow(clippy::too_many_arguments)]
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
+    visible: &[usize],
     collapsed: &HashSet<usize>,
     scroll_offset: usize,
     viewport_rows: u16,
@@ -566,21 +601,11 @@ fn draw_screen(
     .unwrap();
 
     let mut rows_used: u16 = 0;
-    let mut line_idx = scroll_offset;
+    let mut vis_idx = scroll_offset;
     let mut overflow: Option<Overflow> = None;
-    // Track which details blocks we're inside (for skipping collapsed content)
-    let mut skip_details: Option<usize> = None;
 
-    while line_idx < lines.len() && rows_used < viewport_rows {
-        // If we're skipping a collapsed block, look for its end
-        if let Some(skip_id) = skip_details {
-            if matches!(&lines[line_idx], Line::DetailsEnd { id } if *id == skip_id) {
-                skip_details = None;
-            }
-            line_idx += 1;
-            continue;
-        }
-
+    while vis_idx < visible.len() && rows_used < viewport_rows {
+        let line_idx = visible[vis_idx];
         match &lines[line_idx] {
             Line::Text(text) => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
@@ -594,9 +619,9 @@ fn draw_screen(
                 if rows_used > viewport_rows {
                     overflow = Some(Overflow {
                         rows: rows_used - viewport_rows,
-                        line_idx,
+                        vis_idx,
                     });
-                    line_idx += 1;
+                    vis_idx += 1;
                     break;
                 }
             }
@@ -605,8 +630,8 @@ fn draw_screen(
                 write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
                 rows_used += 1;
             }
-            Line::DetailsStart { .. } => {
-                // Invisible marker, zero height
+            Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {
+                // Invisible markers, zero height
             }
             Line::DetailsSummary { id, text } => {
                 let is_collapsed = collapsed.contains(id);
@@ -614,23 +639,16 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "\x1b[1m{triangle} {text}\x1b[0m\r").unwrap();
                 rows_used += 1;
-                if is_collapsed {
-                    // Skip content until the matching DetailsEnd
-                    skip_details = Some(*id);
-                }
-            }
-            Line::DetailsEnd { .. } => {
-                // Invisible marker, zero height
             }
         }
-        line_idx += 1;
+        vis_idx += 1;
     }
 
     // Status bar
-    let progress = if lines.is_empty() {
+    let progress = if visible.is_empty() {
         100
     } else {
-        (line_idx * 100) / lines.len()
+        (vis_idx * 100) / visible.len()
     };
     let watch_indicator = if watching { " [watching]" } else { "" };
     let status = format!(
@@ -650,10 +668,11 @@ fn draw_screen(
 /// Find the first visible `DetailsSummary` from `scroll_offset` onward.
 fn first_visible_details(
     lines: &[Line],
+    visible: &[usize],
     scroll_offset: usize,
 ) -> Option<usize> {
-    for line in &lines[scroll_offset..] {
-        if let Line::DetailsSummary { id, .. } = line {
+    for &idx in &visible[scroll_offset..] {
+        if let Line::DetailsSummary { id, .. } = &lines[idx] {
             return Some(*id);
         }
     }
@@ -661,11 +680,11 @@ fn first_visible_details(
 }
 
 fn advance_lines(
-    lines: &[Line],
+    visible: &[usize],
     offset: usize,
     count: usize,
 ) -> usize {
-    (offset + count).min(lines.len().saturating_sub(1))
+    (offset + count).min(visible.len().saturating_sub(1))
 }
 
 fn retreat_lines(
@@ -677,11 +696,12 @@ fn retreat_lines(
 
 fn scroll_to_end(
     lines: &[Line],
+    visible: &[usize],
     viewport_rows: u16,
 ) -> usize {
     let mut rows: u16 = 0;
-    for (i, line) in lines.iter().enumerate().rev() {
-        rows += line.rows();
+    for (i, &line_idx) in visible.iter().enumerate().rev() {
+        rows += lines[line_idx].rows();
         if rows > viewport_rows {
             return i + 1;
         }
