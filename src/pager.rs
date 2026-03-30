@@ -240,10 +240,6 @@ pub fn run(
 
     terminal::enable_raw_mode().unwrap();
     crossterm::execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide,).unwrap();
-    // Disable sixel scrolling (DECSDM) — sixel renders at cursor position
-    // without advancing it, clipped at screen edges.
-    write!(stdout, "\x1b[?80h").unwrap();
-    stdout.flush().unwrap();
 
     let mut scroll_offset: usize = 0;
     let mut needs_redraw = true;
@@ -409,7 +405,6 @@ pub fn run(
         }
     }
 
-    write!(stdout, "\x1b[?80l").unwrap();
     crossterm::execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen,).unwrap();
     terminal::disable_raw_mode().unwrap();
 }
@@ -456,7 +451,7 @@ fn draw_screen(
 
     let mut rows_used: u16 = 0;
     let mut line_idx = scroll_offset;
-    while line_idx < lines.len() && rows_used < viewport_rows {
+    while line_idx < lines.len() && rows_used + lines[line_idx].rows() <= viewport_rows {
         match &lines[line_idx] {
             Line::Text(text) => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
@@ -464,9 +459,8 @@ fn draw_screen(
                 rows_used += 1;
             }
             Line::Sixel { data, height } => {
-                // Write cursor move + sixel as a single buffer to ensure
-                // the cursor position is set before the sixel renders.
-                write!(stdout, "\x1b[{};1H{data}", rows_used + 1).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                write!(stdout, "{data}").unwrap();
                 rows_used += height;
             }
             Line::PendingImage { .. } => {
