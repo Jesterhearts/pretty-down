@@ -1012,7 +1012,7 @@ pub fn render(
                     if w > 0 && h > 0 {
                         out.push_str(&sixel::encode_rgba(w, h, &pixels));
                     }
-                    out.push('\n');
+                    out.push_str("\n\n");
                     state.heading_level = 0;
                 }
             }

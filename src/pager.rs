@@ -298,8 +298,8 @@ pub fn run(
 
     let mut stdout = io::stdout();
 
-    let (_, term_rows) = terminal::size().unwrap_or((80, 24));
-    let viewport_rows = term_rows.saturating_sub(1);
+    let (_, mut term_rows) = terminal::size().unwrap_or((80, 24));
+    let mut viewport_rows = term_rows.saturating_sub(1);
 
     // If content fits and no watch and no pending images, just print directly
     let total_rows: u16 = lines.iter().map(|l| l.rows()).sum();
@@ -490,6 +490,28 @@ pub fn run(
         let Ok(ev) = event::read() else {
             continue;
         };
+
+        // Handle terminal resize — re-render with new dimensions
+        if let Event::Resize(_cols, rows) = ev {
+            let new_viewport = rows.saturating_sub(1);
+            // Invalidate cached pixel width so re-render picks up new size
+            crate::sixel::invalidate_terminal_size();
+            let new_output = render_fn();
+            lines = split_lines(&new_output.text);
+            visible = visible_indices(&lines, &collapsed);
+            current_output = Some(new_output);
+            pending = &current_output.as_ref().unwrap().pending_images;
+            pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
+            gif_state.clear();
+            // Update viewport dimensions
+            viewport_rows = new_viewport;
+            term_rows = rows;
+            if scroll_offset >= visible.len() {
+                scroll_offset = visible.len().saturating_sub(1);
+            }
+            needs_redraw = true;
+            continue;
+        }
 
         // Handle mouse clicks on details summaries
         if let Event::Mouse(MouseEvent {

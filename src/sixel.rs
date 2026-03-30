@@ -24,18 +24,35 @@ pub fn cell_pixel_height() -> u32 {
     })
 }
 
-/// Query the terminal's pixel width.
-/// Falls back to 800px if unavailable.
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
+
+static CACHED_PIXEL_WIDTH: AtomicU32 = AtomicU32::new(0);
+
+/// Query the terminal's pixel width. Cached; call `invalidate_terminal_size()`
+/// on resize events to refresh.
 pub fn terminal_pixel_width() -> u32 {
-    static WIDTH: OnceLock<u32> = OnceLock::new();
-    *WIDTH.get_or_init(|| {
-        if let Ok(ws) = crossterm::terminal::window_size()
-            && ws.width > 0
-        {
-            return ws.width as u32;
-        }
-        800
-    })
+    let cached = CACHED_PIXEL_WIDTH.load(Ordering::Relaxed);
+    if cached > 0 {
+        return cached;
+    }
+    let width = query_pixel_width();
+    CACHED_PIXEL_WIDTH.store(width, Ordering::Relaxed);
+    width
+}
+
+/// Invalidate the cached terminal pixel width (call on resize).
+pub fn invalidate_terminal_size() {
+    CACHED_PIXEL_WIDTH.store(0, Ordering::Relaxed);
+}
+
+fn query_pixel_width() -> u32 {
+    if let Ok(ws) = crossterm::terminal::window_size()
+        && ws.width > 0
+    {
+        return ws.width as u32;
+    }
+    800
 }
 
 /// Convert a pixel height to terminal rows using the actual cell height.
