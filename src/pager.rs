@@ -1101,12 +1101,15 @@ fn draw_screen(
         (vis_idx * 100) / visible.len()
     };
     let watch_indicator = if watching { " [watching]" } else { "" };
+    let cols = term_cols as usize;
     let status = format!(
-        " [{progress}%]{watch_indicator} j/k:scroll  h/l:code-scroll  d/u:half-page  \
-         g/G:top/bottom  enter:toggle  r:reload  q:quit "
+        " [{progress}%]{watch_indicator} j/k:scroll  h/l:code  d/u:half  g/G:top/end  \
+         enter:toggle  r:reload  q:quit"
     );
+    // Truncate to terminal width to prevent wrapping
+    let status: String = status.chars().take(cols).collect();
     crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
-    write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = 80).unwrap();
+    write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = cols).unwrap();
 
     // End synchronized update — terminal flushes the buffered frame at once.
     write!(stdout, "\x1b[?2026l").unwrap();
