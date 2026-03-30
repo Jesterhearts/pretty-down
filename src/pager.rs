@@ -451,7 +451,7 @@ fn draw_screen(
 
     let mut rows_used: u16 = 0;
     let mut line_idx = scroll_offset;
-    while line_idx < lines.len() && rows_used + lines[line_idx].rows() <= viewport_rows {
+    while line_idx < lines.len() && rows_used < viewport_rows {
         match &lines[line_idx] {
             Line::Text(text) => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
@@ -459,6 +459,8 @@ fn draw_screen(
                 rows_used += 1;
             }
             Line::Sixel { data, height } => {
+                // Render sixel even if it extends past the viewport —
+                // the terminal clips it without scrolling.
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{data}").unwrap();
                 rows_used += height;
