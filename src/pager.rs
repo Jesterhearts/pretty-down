@@ -665,12 +665,43 @@ fn draw_screen(
     overflow
 }
 
-/// Find the first visible `DetailsSummary` from `scroll_offset` onward.
+/// Find the details block to toggle.
+///
+/// First checks if `scroll_offset` is inside an expanded details block
+/// (i.e. past its summary but before its end) by scanning backward.
+/// If so, returns that block's ID. Otherwise returns the first
+/// `DetailsSummary` visible from `scroll_offset` onward.
 fn first_visible_details(
     lines: &[Line],
     visible: &[usize],
     scroll_offset: usize,
 ) -> Option<usize> {
+    // Check if we're inside a details block by scanning backward for an
+    // unmatched DetailsStart/DetailsSummary before the current position.
+    let current_line_idx = visible.get(scroll_offset).copied().unwrap_or(0);
+    let mut depth: Vec<usize> = Vec::new();
+    for &idx in visible.iter().take(scroll_offset + 1) {
+        match &lines[idx] {
+            Line::DetailsSummary { id, .. } => {
+                depth.push(*id);
+            }
+            Line::DetailsEnd { id } => {
+                depth.retain(|d| d != id);
+            }
+            _ => {}
+        }
+    }
+    // If we're inside a block (depth is non-empty), return the innermost one
+    if let Some(&id) = depth.last() {
+        // Only if we're actually past the summary (not ON it)
+        let on_summary =
+            matches!(&lines[current_line_idx], Line::DetailsSummary { id: sid, .. } if *sid == id);
+        if !on_summary {
+            return Some(id);
+        }
+    }
+
+    // Otherwise, find the first summary at or after scroll_offset
     for &idx in &visible[scroll_offset..] {
         if let Line::DetailsSummary { id, .. } = &lines[idx] {
             return Some(*id);
