@@ -219,6 +219,8 @@ struct RenderState {
     link_url: Option<String>,
     /// Whether we are inside a code block
     in_code_block: bool,
+    /// Whether we are inside an image tag (suppress alt text)
+    in_image: bool,
     /// Blockquote nesting depth
     blockquote_depth: usize,
     /// Language of the current code block (for syntax highlighting)
@@ -272,6 +274,7 @@ impl RenderState {
             strikethrough: false,
             link_url: None,
             in_code_block: false,
+            in_image: false,
             blockquote_depth: 0,
             code_lang: None,
             code_buf: String::new(),
@@ -1364,11 +1367,14 @@ pub fn render(
 
             // ── Images ───────────────────────────────────────────────
             Event::Start(Tag::Image { dest_url, .. }) => {
+                state.in_image = true;
                 if let Some(path) = resolve_image_path(&dest_url, &state.base_path) {
                     state.emit_image(&path, &mut out, &mut blocks);
                 }
             }
-            Event::End(TagEnd::Image) => {}
+            Event::End(TagEnd::Image) => {
+                state.in_image = false;
+            }
 
             // ── Lists ────────────────────────────────────────────────
             Event::Start(Tag::List(first_item)) => {
@@ -1436,12 +1442,13 @@ pub fn render(
 
             // ── Text content ─────────────────────────────────────────
             Event::Text(text) => {
-                if state.in_table() {
+                if state.in_image {
+                    // Suppress alt text — image is rendered as sixel
+                } else if state.in_table() {
                     state.table_cell_buf.push_str(&text);
                 } else if state.heading_level > 0 {
                     state.heading_text.push_str(&text);
                 } else if state.in_code_block {
-                    // Accumulate code for syntax highlighting at End(CodeBlock)
                     state.code_buf.push_str(&text);
                 } else {
                     out.push_str(&text);
