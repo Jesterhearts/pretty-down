@@ -1268,17 +1268,21 @@ fn render_image_in_table_cell(
     let sixel_data = sixel::encode_rgba(padded_img.width(), snapped_h, padded_img.as_raw());
 
     // Build cell content:
-    // 1. Full block (█) rows provide the visible dimensions for comfy-table
-    // 2. After all rows, cursor-up back to the top and emit the sixel which renders
-    //    over the blocks
+    // 1. Save cursor at the start of the first block line
+    // 2. Render full blocks (█) for comfy-table sizing
+    // 3. Restore cursor back to the saved position
+    // 4. Emit sixel data (renders over the blocks at the correct cell position)
+    let save_cursor = "\x1b[s"; // DECSC - save cursor position
+    let restore_cursor = "\x1b[u"; // DECRC - restore cursor position
     let bg_block = "\u{2588}".repeat(cols as usize);
-    let mut cell_lines = Vec::with_capacity(rows as usize);
-    for _ in 0..rows {
+
+    let mut cell_lines = Vec::with_capacity(rows as usize + 1);
+    cell_lines.push(format!("{save_cursor}{bg_block}"));
+    for _ in 1..rows {
         cell_lines.push(bg_block.clone());
     }
-    // After the last row, move cursor up and emit sixel to overwrite
-    let cursor_up = format!("\x1b[{}A\r", rows);
-    cell_lines.push(format!("{cursor_up}{sixel_data}"));
+    // Last line: restore cursor to top of cell, then emit sixel
+    cell_lines.push(format!("{restore_cursor}{sixel_data}"));
 
     state.table_cell_buf.push_str(&cell_lines.join("\n"));
 }
