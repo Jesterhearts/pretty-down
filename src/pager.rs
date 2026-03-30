@@ -243,7 +243,14 @@ pub fn run(
 
     let mut scroll_offset: usize = 0;
     let mut needs_redraw = true;
-    let mut scrolled_down = false; // track if last action was downward
+    /// Which direction the last scroll action went, if any.
+    #[derive(Clone, Copy, PartialEq)]
+    enum ScrollDir {
+        None,
+        Down,
+        Up,
+    }
+    let mut scroll_dir = ScrollDir::None;
 
     loop {
         if needs_redraw {
@@ -255,22 +262,42 @@ pub fn run(
                 term_rows,
                 watching,
             );
-            // After a downward scroll, if a sixel caused auto-scroll,
-            // advance scroll_offset to account for the rows that were
-            // pushed off screen. Don't redraw — the screen already
-            // shows the correct post-scroll state.
-            if scrolled_down && overflow > 0 {
-                let mut rows_to_skip = overflow;
-                while rows_to_skip > 0 && scroll_offset < lines.len() {
-                    let r = lines[scroll_offset].rows();
-                    if r > rows_to_skip {
-                        break;
+            // After a sixel auto-scroll, adjust scroll_offset to account
+            // for the rows that were pushed off screen. The adjustment
+            // direction depends on which way the user was scrolling.
+            if let Some(ov) = overflow {
+                match scroll_dir {
+                    ScrollDir::Down => {
+                        // Advance past the lines that were scrolled off the top
+                        let mut rows_to_skip = ov.rows;
+                        while rows_to_skip > 0 && scroll_offset < lines.len() {
+                            let r = lines[scroll_offset].rows();
+                            if r > rows_to_skip {
+                                break;
+                            }
+                            scroll_offset += 1;
+                            rows_to_skip -= r;
+                        }
                     }
-                    scroll_offset += 1;
-                    rows_to_skip -= r;
+                    ScrollDir::Up => {
+                        // Retreat to a full viewport of content above the image
+                        // so the next scroll-up continues past it.
+                        let image_line = ov.line_idx;
+                        let mut rows = 0u16;
+                        let mut target = image_line;
+                        while target > 0 {
+                            target -= 1;
+                            rows += lines[target].rows();
+                            if rows >= viewport_rows {
+                                break;
+                            }
+                        }
+                        scroll_offset = target;
+                    }
+                    ScrollDir::None => {}
                 }
             }
-            scrolled_down = false;
+            scroll_dir = ScrollDir::None;
             needs_redraw = false;
         }
 
@@ -333,7 +360,7 @@ pub fn run(
                     ..
                 } => {
                     scroll_offset = advance_lines(&lines, scroll_offset, 1);
-                    scrolled_down = true;
+                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 // Scroll up
@@ -342,6 +369,7 @@ pub fn run(
                     ..
                 } => {
                     scroll_offset = retreat_lines(scroll_offset, 1);
+                    scroll_dir = ScrollDir::Up;
                     needs_redraw = true;
                 }
                 // Half page down
@@ -360,7 +388,7 @@ pub fn run(
                 } => {
                     let half = (viewport_rows / 2) as usize;
                     scroll_offset = advance_lines(&lines, scroll_offset, half);
-                    scrolled_down = true;
+                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 // Half page up
@@ -379,6 +407,7 @@ pub fn run(
                 } => {
                     let half = (viewport_rows / 2) as usize;
                     scroll_offset = retreat_lines(scroll_offset, half);
+                    scroll_dir = ScrollDir::Up;
                     needs_redraw = true;
                 }
                 // Top
@@ -402,7 +431,7 @@ pub fn run(
                     code: KeyCode::End, ..
                 } => {
                     scroll_offset = scroll_to_end(&lines, viewport_rows);
-                    scrolled_down = true;
+                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 // Space = page down
@@ -411,7 +440,7 @@ pub fn run(
                     ..
                 } => {
                     scroll_offset = advance_lines(&lines, scroll_offset, viewport_rows as usize);
-                    scrolled_down = true;
+                    scroll_dir = ScrollDir::Down;
                     needs_redraw = true;
                 }
                 KeyEvent {
@@ -457,10 +486,15 @@ pub fn print_output(output: &RenderOutput) {
     }
 }
 
+/// Info about a sixel overflow that occurred during drawing.
+struct Overflow {
+    /// Number of rows the terminal auto-scrolled.
+    rows: u16,
+    /// Line index of the sixel that caused the overflow.
+    line_idx: usize,
+}
+
 /// Draw the current view.
-///
-/// Returns the number of rows the terminal auto-scrolled due to a sixel
-/// image overflowing the viewport (0 if no overflow occurred).
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
@@ -468,7 +502,7 @@ fn draw_screen(
     viewport_rows: u16,
     term_rows: u16,
     watching: bool,
-) -> u16 {
+) -> Option<Overflow> {
     // Begin synchronized update — terminal buffers all output until the
     // matching end sequence, eliminating flicker.
     write!(stdout, "\x1b[?2026h").unwrap();
@@ -482,6 +516,7 @@ fn draw_screen(
 
     let mut rows_used: u16 = 0;
     let mut line_idx = scroll_offset;
+    let mut overflow: Option<Overflow> = None;
     while line_idx < lines.len() && rows_used < viewport_rows {
         match &lines[line_idx] {
             Line::Text(text) => {
@@ -493,9 +528,11 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{data}").unwrap();
                 rows_used += height;
-                // If the sixel overflowed, the terminal auto-scrolled.
-                // Stop rendering further lines since positioning is off.
                 if rows_used > viewport_rows {
+                    overflow = Some(Overflow {
+                        rows: rows_used - viewport_rows,
+                        line_idx,
+                    });
                     line_idx += 1;
                     break;
                 }
@@ -527,7 +564,7 @@ fn draw_screen(
     write!(stdout, "\x1b[?2026l").unwrap();
     stdout.flush().unwrap();
 
-    rows_used.saturating_sub(viewport_rows)
+    overflow
 }
 
 fn advance_lines(
