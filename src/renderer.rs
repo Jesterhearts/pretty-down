@@ -20,6 +20,8 @@ mod ansi {
     pub const UNDERLINE: &str = "\x1b[4m";
     pub const STRIKETHROUGH: &str = "\x1b[9m";
 
+    pub const OVERLINE: &str = "\x1b[53m";
+
     /// OSC 8 hyperlink start
     pub fn link_start(url: &str) -> String {
         format!("\x1b]8;;{url}\x1b\\")
@@ -28,6 +30,24 @@ mod ansi {
     /// OSC 8 hyperlink end
     pub fn link_end() -> String {
         "\x1b]8;;\x1b\\".to_string()
+    }
+
+    /// Set foreground color using 24-bit true color.
+    pub fn fg_rgb(
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> String {
+        format!("\x1b[38;2;{r};{g};{b}m")
+    }
+
+    /// Set background color using 24-bit true color.
+    pub fn bg_rgb(
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> String {
+        format!("\x1b[48;2;{r};{g};{b}m")
     }
 
     /// Word-wrap a string that may contain ANSI escape sequences.
@@ -245,6 +265,148 @@ impl RenderState {
 }
 
 // ---------------------------------------------------------------------------
+// CSS style → ANSI escape conversion
+// ---------------------------------------------------------------------------
+
+/// Parse a CSS `style` attribute value and return ANSI escape sequences.
+///
+/// Handles `color`, `background-color`, `font-weight`, `font-style`,
+/// and `text-decoration` properties.
+fn css_style_to_ansi(style: &str) -> String {
+    let mut result = String::new();
+
+    for decl in style.split(';') {
+        let decl = decl.trim();
+        if decl.is_empty() {
+            continue;
+        }
+        let Some((prop, value)) = decl.split_once(':') else {
+            continue;
+        };
+        let prop = prop.trim().to_ascii_lowercase();
+        let value = value.trim();
+
+        match prop.as_str() {
+            "color" => {
+                if let Some((r, g, b)) = parse_css_color_simple(value) {
+                    result.push_str(&ansi::fg_rgb(r, g, b));
+                }
+            }
+            "background-color" | "background" => {
+                if let Some((r, g, b)) = parse_css_color_simple(value) {
+                    result.push_str(&ansi::bg_rgb(r, g, b));
+                }
+            }
+            "font-weight" => {
+                let v = value.to_ascii_lowercase();
+                if v == "bold" || v == "700" || v == "800" || v == "900" {
+                    result.push_str(ansi::BOLD);
+                }
+            }
+            "font-style" => {
+                let v = value.to_ascii_lowercase();
+                if v == "italic" || v == "oblique" {
+                    result.push_str(ansi::ITALIC);
+                }
+            }
+            "text-decoration" | "text-decoration-line" => {
+                let v = value.to_ascii_lowercase();
+                if v.contains("underline") {
+                    result.push_str(ansi::UNDERLINE);
+                }
+                if v.contains("line-through") {
+                    result.push_str(ansi::STRIKETHROUGH);
+                }
+                if v.contains("overline") {
+                    result.push_str(ansi::OVERLINE);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    result
+}
+
+/// Parse a CSS color value from a string (named colors, #hex, rgb()).
+fn parse_css_color_simple(style_value: &str) -> Option<(u8, u8, u8)> {
+    let val = style_value.trim();
+
+    // #rrggbb
+    if let Some(hex) = val.strip_prefix('#') {
+        return parse_hex_color(hex);
+    }
+
+    // rgb(r, g, b)
+    if let Some(inner) = val
+        .strip_prefix("rgb(")
+        .or_else(|| val.strip_prefix("RGB("))
+        && let Some(inner) = inner.strip_suffix(')')
+    {
+        let parts: Vec<&str> = inner.split(',').collect();
+        if parts.len() == 3 {
+            let r = parts[0].trim().parse().ok()?;
+            let g = parts[1].trim().parse().ok()?;
+            let b = parts[2].trim().parse().ok()?;
+            return Some((r, g, b));
+        }
+    }
+
+    // Named colors (common subset)
+    match val.to_ascii_lowercase().as_str() {
+        "black" => Some((0, 0, 0)),
+        "white" => Some((255, 255, 255)),
+        "red" => Some((255, 0, 0)),
+        "green" => Some((0, 128, 0)),
+        "blue" => Some((0, 0, 255)),
+        "yellow" => Some((255, 255, 0)),
+        "cyan" | "aqua" => Some((0, 255, 255)),
+        "magenta" | "fuchsia" => Some((255, 0, 255)),
+        "orange" => Some((255, 165, 0)),
+        "purple" => Some((128, 0, 128)),
+        "pink" => Some((255, 192, 203)),
+        "gray" | "grey" => Some((128, 128, 128)),
+        "lightgray" | "lightgrey" => Some((211, 211, 211)),
+        "darkgray" | "darkgrey" => Some((169, 169, 169)),
+        "brown" => Some((139, 69, 19)),
+        "navy" => Some((0, 0, 128)),
+        "teal" => Some((0, 128, 128)),
+        "olive" => Some((128, 128, 0)),
+        "maroon" => Some((128, 0, 0)),
+        "lime" => Some((0, 255, 0)),
+        "silver" => Some((192, 192, 192)),
+        "coral" => Some((255, 127, 80)),
+        "salmon" => Some((250, 128, 114)),
+        "gold" => Some((255, 215, 0)),
+        "skyblue" => Some((135, 206, 235)),
+        "violet" => Some((238, 130, 238)),
+        "indigo" => Some((75, 0, 130)),
+        "crimson" => Some((220, 20, 60)),
+        _ => None,
+    }
+}
+
+fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
+    match hex.len() {
+        // #rgb
+        3 => {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+            Some((r * 17, g * 17, b * 17))
+        }
+        // #rrggbb
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some((r, g, b))
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTML parsing via quick-xml
 // ---------------------------------------------------------------------------
 
@@ -354,7 +516,57 @@ fn handle_html_open_tag(
             out.push_str(&"\u{2500}".repeat(40));
             out.push('\n');
         }
-        _ => {}
+        "u" | "ins" => {
+            if state.heading_level == 0 {
+                out.push_str(ansi::UNDERLINE);
+            }
+        }
+        "mark" => {
+            if state.heading_level == 0 {
+                // Yellow background highlight
+                out.push_str(&ansi::bg_rgb(255, 255, 0));
+                out.push_str(&ansi::fg_rgb(0, 0, 0));
+            }
+        }
+        "kbd" | "samp" => {
+            if state.heading_level == 0 {
+                // Reverse video for keyboard/sample
+                out.push_str(ansi::DIM);
+                out.push(' ');
+            }
+        }
+        "var" | "cite" => {
+            if state.heading_level == 0 {
+                out.push_str(ansi::ITALIC);
+            }
+        }
+        "sup" => {
+            // Terminal can't do real superscript — just use dim
+            if state.heading_level == 0 {
+                out.push_str(ansi::DIM);
+            }
+        }
+        "sub" => {
+            if state.heading_level == 0 {
+                out.push_str(ansi::DIM);
+            }
+        }
+        // <span> and <div> — apply CSS styles if present
+        "span" | "div" | "p" => {
+            if state.heading_level == 0
+                && let Some(style) = xml_attr(tag, b"style")
+            {
+                out.push_str(&css_style_to_ansi(&style));
+            }
+        }
+        _ => {
+            // For any unknown tag, still try to apply style attribute
+            if state.heading_level == 0
+                && let Some(style) = xml_attr(tag, b"style")
+            {
+                out.push_str(&css_style_to_ansi(&style));
+            }
+        }
     }
 }
 
@@ -372,7 +584,7 @@ fn handle_html_close_tag(
                 state.push_style(out);
             }
         }
-        "i" | "em" => {
+        "i" | "em" | "var" | "cite" => {
             state.italic = false;
             if state.heading_level == 0 {
                 out.push_str(ansi::RESET);
@@ -386,8 +598,21 @@ fn handle_html_close_tag(
                 state.push_style(out);
             }
         }
-        "code" => {
+        "code" | "sup" | "sub" => {
             if state.heading_level == 0 {
+                out.push_str(ansi::RESET);
+                state.push_style(out);
+            }
+        }
+        "u" | "ins" | "mark" => {
+            if state.heading_level == 0 {
+                out.push_str(ansi::RESET);
+                state.push_style(out);
+            }
+        }
+        "kbd" | "samp" => {
+            if state.heading_level == 0 {
+                out.push(' ');
                 out.push_str(ansi::RESET);
                 state.push_style(out);
             }
@@ -399,7 +624,20 @@ fn handle_html_close_tag(
             }
             state.link_url = None;
         }
-        _ => {}
+        // Styled elements — just reset
+        "span" | "div" => {
+            if state.heading_level == 0 {
+                out.push_str(ansi::RESET);
+                state.push_style(out);
+            }
+        }
+        _ => {
+            // Reset after any unknown styled element
+            if state.heading_level == 0 {
+                out.push_str(ansi::RESET);
+                state.push_style(out);
+            }
+        }
     }
 }
 
