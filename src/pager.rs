@@ -240,6 +240,9 @@ pub fn run(
 
     terminal::enable_raw_mode().unwrap();
     crossterm::execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide,).unwrap();
+    // Disable sixel scrolling (DECSDM) — sixel images render at cursor
+    // position without advancing it, clipped at screen edges.
+    write!(stdout, "\x1b[?80h").unwrap();
 
     let mut scroll_offset: usize = 0;
     let mut needs_redraw = true;
@@ -405,6 +408,8 @@ pub fn run(
         }
     }
 
+    // Restore sixel scrolling (DECSDM reset)
+    write!(stdout, "\x1b[?80l").unwrap();
     crossterm::execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen,).unwrap();
     terminal::disable_raw_mode().unwrap();
 }
