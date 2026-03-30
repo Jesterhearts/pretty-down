@@ -146,13 +146,15 @@ fn flatten_blocks(
             OutputBlock::Gif(id) => {
                 let g = output.pending_gifs.get(*id);
                 let rows = g.map(|g| g.estimated_rows).unwrap_or(1);
+                let preview = g.map(|g| &g.preview[..]).unwrap_or(&[]);
                 let group = ImageGroup::Gif(*id);
                 for i in 0..rows {
+                    let preview_text = preview.get(i as usize).cloned().unwrap_or_default();
                     lines.push(Line::ImageRow {
                         group,
                         row_in_group: i,
                         total_rows: rows,
-                        preview_text: String::new(), // GIFs don't have static preview
+                        preview_text,
                     });
                 }
             }

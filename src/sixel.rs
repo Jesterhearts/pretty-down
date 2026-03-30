@@ -249,6 +249,8 @@ pub struct PendingGif {
     done: Arc<OnceLock<()>>,
     /// Estimated terminal rows.
     pub estimated_rows: u16,
+    /// Half-block preview of the first frame.
+    pub preview: Vec<String>,
 }
 
 impl PendingGif {
@@ -299,6 +301,20 @@ pub fn encode_gif_async(
     let scaled = scale_image(first_buf.clone(), max_width);
     let estimated_rows = pixel_height_to_rows(scaled.height());
 
+    // Generate half-block preview from first frame
+    let cell_w = crossterm::terminal::window_size()
+        .ok()
+        .and_then(|ws| {
+            if ws.width > 0 && ws.columns > 0 {
+                Some(ws.width as u32 / ws.columns as u32)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(8);
+    let preview_cols = (scaled.width() / cell_w).max(1);
+    let preview = half_block_preview(&scaled, preview_cols, estimated_rows);
+
     let frames = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(OnceLock::new());
     let frames_clone = frames.clone();
@@ -329,5 +345,6 @@ pub fn encode_gif_async(
         frames,
         done,
         estimated_rows,
+        preview,
     })
 }
