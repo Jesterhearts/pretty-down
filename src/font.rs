@@ -1,8 +1,16 @@
-use std::hash::{BuildHasher, Hasher, RandomState};
+use std::hash::BuildHasher;
+use std::hash::Hasher;
+use std::hash::RandomState;
 
-use raqote::{DrawOptions, DrawTarget, PathBuilder, SolidSource, Source, Transform};
-use rustybuzz::ttf_parser::{GlyphId, RgbaColor};
+use raqote::DrawOptions;
+use raqote::DrawTarget;
+use raqote::PathBuilder;
+use raqote::SolidSource;
+use raqote::Source;
+use raqote::Transform;
 use rustybuzz::Face;
+use rustybuzz::ttf_parser::GlyphId;
+use rustybuzz::ttf_parser::RgbaColor;
 
 /// A parsed font face used for text rasterization.
 #[allow(dead_code)]
@@ -35,7 +43,10 @@ impl<'a> Font<'a> {
 
     /// Compute the pixel width of a single character at the given height.
     #[allow(dead_code)]
-    pub fn char_width(&self, height_px: u32) -> u32 {
+    pub fn char_width(
+        &self,
+        height_px: u32,
+    ) -> u32 {
         let scale = height_px as f32 / self.face.height() as f32;
         (self.advance * scale) as u32
     }
@@ -64,18 +75,44 @@ impl Outline {
 }
 
 impl rustybuzz::ttf_parser::OutlineBuilder for Outline {
-    fn move_to(&mut self, x: f32, y: f32) {
+    fn move_to(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) {
         self.path.move_to(x, y);
     }
-    fn line_to(&mut self, x: f32, y: f32) {
+
+    fn line_to(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) {
         self.path.line_to(x, y);
     }
-    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+
+    fn quad_to(
+        &mut self,
+        x1: f32,
+        y1: f32,
+        x: f32,
+        y: f32,
+    ) {
         self.path.quad_to(x1, y1, x, y);
     }
-    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+
+    fn curve_to(
+        &mut self,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x: f32,
+        y: f32,
+    ) {
         self.path.cubic_to(x1, y1, x2, y2, x, y);
     }
+
     fn close(&mut self) {
         self.path.close();
     }
@@ -131,7 +168,10 @@ impl<'f, 'd, 'p> Painter<'f, 'd, 'p> {
 }
 
 impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
-    fn outline_glyph(&mut self, glyph_id: rustybuzz::ttf_parser::GlyphId) {
+    fn outline_glyph(
+        &mut self,
+        glyph_id: rustybuzz::ttf_parser::GlyphId,
+    ) {
         let mut outline = Outline::default();
         self.outline = self
             .font
@@ -139,7 +179,10 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
             .map(|_| outline.finish());
     }
 
-    fn paint(&mut self, paint: rustybuzz::ttf_parser::colr::Paint<'a>) {
+    fn paint(
+        &mut self,
+        paint: rustybuzz::ttf_parser::colr::Paint<'a>,
+    ) {
         let paint = match paint {
             rustybuzz::ttf_parser::colr::Paint::Solid(color) => {
                 Source::Solid(SolidSource::from_unpremultiplied_argb(
@@ -186,7 +229,10 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
         );
     }
 
-    fn push_clip_box(&mut self, clipbox: rustybuzz::ttf_parser::colr::ClipBox) {
+    fn push_clip_box(
+        &mut self,
+        clipbox: rustybuzz::ttf_parser::colr::ClipBox,
+    ) {
         let transform = self.compute_transform();
         let xy0 = transform.transform_point((clipbox.x_min, clipbox.y_min).into());
         let xy1 = transform.transform_point((clipbox.x_max, clipbox.y_max).into());
@@ -205,7 +251,10 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
         self.target.pop_clip();
     }
 
-    fn push_layer(&mut self, mode: rustybuzz::ttf_parser::colr::CompositeMode) {
+    fn push_layer(
+        &mut self,
+        mode: rustybuzz::ttf_parser::colr::CompositeMode,
+    ) {
         use rustybuzz::ttf_parser::colr::CompositeMode::*;
         self.target.push_layer_with_blend(
             1.0,
@@ -246,7 +295,10 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
         self.target.pop_layer();
     }
 
-    fn push_transform(&mut self, transform: rustybuzz::ttf_parser::Transform) {
+    fn push_transform(
+        &mut self,
+        transform: rustybuzz::ttf_parser::Transform,
+    ) {
         self.transforms.push(transform);
     }
 
@@ -263,7 +315,12 @@ impl<'a> rustybuzz::ttf_parser::colr::Painter<'a> for Painter<'_, '_, '_> {
 ///
 /// Returns `(width, height, pixels)` where pixels is row-major RGBA u8 data.
 /// The `color` is `[r, g, b]`.
-pub fn render_text(font: &Font, text: &str, height_px: u32, color: [u8; 3]) -> (u32, u32, Vec<u8>) {
+pub fn render_text(
+    font: &Font,
+    text: &str,
+    height_px: u32,
+    color: [u8; 3],
+) -> (u32, u32, Vec<u8>) {
     if text.is_empty() {
         return (0, 0, vec![]);
     }
@@ -325,18 +382,20 @@ pub fn render_text(font: &Font, text: &str, height_px: u32, color: [u8; 3]) -> (
 
         if font
             .face()
-            .paint_color_glyph(glyph_id, 0, RgbaColor::new(255, 255, 255, 255), &mut painter)
+            .paint_color_glyph(
+                glyph_id,
+                0,
+                RgbaColor::new(255, 255, 255, 255),
+                &mut painter,
+            )
             .is_none()
         {
             // Render outline glyph
             let mut outline = Outline::default();
             if font.face().outline_glyph(glyph_id, &mut outline).is_some() {
                 let path = outline.finish();
-                let mut target = DrawTarget::from_backing(
-                    render_w as i32,
-                    render_h as i32,
-                    &mut pixels[..],
-                );
+                let mut target =
+                    DrawTarget::from_backing(render_w as i32, render_h as i32, &mut pixels[..]);
                 target.set_transform(
                     &Transform::scale(render_scale, -render_scale)
                         .then_translate((x_off, y_off).into()),

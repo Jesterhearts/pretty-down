@@ -1,6 +1,12 @@
 use std::path::Path;
 
-use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::Alignment;
+use pulldown_cmark::Event;
+use pulldown_cmark::HeadingLevel;
+use pulldown_cmark::Options;
+use pulldown_cmark::Parser;
+use pulldown_cmark::Tag;
+use pulldown_cmark::TagEnd;
 
 use crate::font::Font;
 use crate::sixel;
@@ -53,13 +59,15 @@ struct RenderState {
     link_url: Option<String>,
     /// Whether we are inside a code block
     in_code_block: bool,
-    /// List nesting with item index (None = unordered, Some(n) = ordered starting at n)
+    /// List nesting with item index (None = unordered, Some(n) = ordered
+    /// starting at n)
     list_stack: Vec<Option<u64>>,
     /// Whether we just started a list item (for prefix)
     item_index: Vec<usize>,
     /// Base path for resolving relative image paths
     base_path: Option<std::path::PathBuf>,
-    /// Accumulator for block-level HTML (multiple Html events before End(HtmlBlock))
+    /// Accumulator for block-level HTML (multiple Html events before
+    /// End(HtmlBlock))
     html_block_buf: String,
     /// Table column alignments (set on Start(Table))
     table_alignments: Vec<Alignment>,
@@ -108,7 +116,10 @@ impl RenderState {
         !self.table_alignments.is_empty()
     }
 
-    fn push_style(&self, out: &mut String) {
+    fn push_style(
+        &self,
+        out: &mut String,
+    ) {
         if self.bold {
             out.push_str(ansi::BOLD);
         }
@@ -124,7 +135,10 @@ impl RenderState {
         "  ".repeat(self.list_stack.len().saturating_sub(1))
     }
 
-    fn resolve_image_path(&self, src: &str) -> Option<std::path::PathBuf> {
+    fn resolve_image_path(
+        &self,
+        src: &str,
+    ) -> Option<std::path::PathBuf> {
         if src.starts_with("http://") || src.starts_with("https://") {
             return None;
         }
@@ -145,7 +159,10 @@ use quick_xml::events::Event as XmlEvent;
 use quick_xml::reader::Reader as XmlReader;
 
 /// Get an attribute value from a quick-xml `BytesStart` tag.
-fn xml_attr(tag: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+fn xml_attr(
+    tag: &quick_xml::events::BytesStart<'_>,
+    name: &[u8],
+) -> Option<String> {
     tag.attributes()
         .filter_map(|a| a.ok())
         .find(|a| a.key.as_ref() == name)
@@ -161,7 +178,11 @@ fn xml_tag_name(tag: &quick_xml::events::BytesStart<'_>) -> String {
 ///
 /// pulldown-cmark emits each inline HTML tag as a separate string like
 /// `<b>`, `</b>`, `<a href="...">`, `<br>`, `<img src="...">`.
-fn handle_inline_html(tag_str: &str, state: &mut RenderState, out: &mut String) {
+fn handle_inline_html(
+    tag_str: &str,
+    state: &mut RenderState,
+    out: &mut String,
+) {
     let mut reader = XmlReader::from_str(tag_str);
     reader.config_mut().check_end_names = false;
     reader.config_mut().allow_unmatched_ends = true;
@@ -228,13 +249,12 @@ fn handle_html_open_tag(
             }
         }
         "img" => {
-            if let Some(src) = xml_attr(tag, b"src") {
-                if let Some(path) = state.resolve_image_path(&src) {
-                    if let Some(sixel_data) = sixel::encode_image_file(&path, 800) {
-                        out.push_str(&sixel_data);
-                        out.push('\n');
-                    }
-                }
+            if let Some(src) = xml_attr(tag, b"src")
+                && let Some(path) = state.resolve_image_path(&src)
+                && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
+            {
+                out.push_str(&sixel_data);
+                out.push('\n');
             }
         }
         "hr" => {
@@ -246,7 +266,11 @@ fn handle_html_open_tag(
 }
 
 /// Process a closing HTML tag.
-fn handle_html_close_tag(name: &str, state: &mut RenderState, out: &mut String) {
+fn handle_html_close_tag(
+    name: &str,
+    state: &mut RenderState,
+    out: &mut String,
+) {
     match name {
         "b" | "strong" => {
             state.bold = false;
@@ -291,7 +315,12 @@ fn handle_html_close_tag(name: &str, state: &mut RenderState, out: &mut String) 
 /// Uses quick-xml to walk the tags and text, dispatching to the same rendering
 /// logic used for inline tags, plus block-level elements like `<h1>`-`<h6>`,
 /// `<pre>`, `<hr>`, `<blockquote>`, etc.
-fn handle_block_html(html: &str, state: &mut RenderState, out: &mut String, font: &Font) {
+fn handle_block_html(
+    html: &str,
+    state: &mut RenderState,
+    out: &mut String,
+    font: &Font,
+) {
     let html = html.trim();
     if html.is_empty() {
         return;
@@ -323,13 +352,12 @@ fn handle_block_html(html: &str, state: &mut RenderState, out: &mut String, font
                         out.push('\n');
                     }
                     "img" => {
-                        if let Some(src) = xml_attr(e, b"src") {
-                            if let Some(path) = state.resolve_image_path(&src) {
-                                if let Some(sixel_data) = sixel::encode_image_file(&path, 800) {
-                                    out.push_str(&sixel_data);
-                                    out.push('\n');
-                                }
-                            }
+                        if let Some(src) = xml_attr(e, b"src")
+                            && let Some(path) = state.resolve_image_path(&src)
+                            && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
+                        {
+                            out.push_str(&sixel_data);
+                            out.push('\n');
                         }
                     }
                     "br" => {
@@ -359,13 +387,12 @@ fn handle_block_html(html: &str, state: &mut RenderState, out: &mut String, font
                         }
                     }
                     "img" => {
-                        if let Some(src) = xml_attr(e, b"src") {
-                            if let Some(path) = state.resolve_image_path(&src) {
-                                if let Some(sixel_data) = sixel::encode_image_file(&path, 800) {
-                                    out.push_str(&sixel_data);
-                                    out.push('\n');
-                                }
-                            }
+                        if let Some(src) = xml_attr(e, b"src")
+                            && let Some(path) = state.resolve_image_path(&src)
+                            && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
+                        {
+                            out.push_str(&sixel_data);
+                            out.push('\n');
                         }
                     }
                     _ => {}
@@ -471,11 +498,17 @@ fn emit_block(
 }
 
 /// Build a comfy-table from accumulated table state and append to output.
-fn flush_table(state: &mut RenderState, out: &mut String) {
-    use comfy_table::{
-        modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL_CONDENSED, Attribute, Cell,
-        CellAlignment, ContentArrangement, Table,
-    };
+fn flush_table(
+    state: &mut RenderState,
+    out: &mut String,
+) {
+    use comfy_table::Attribute;
+    use comfy_table::Cell;
+    use comfy_table::CellAlignment;
+    use comfy_table::ContentArrangement;
+    use comfy_table::Table;
+    use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+    use comfy_table::presets::UTF8_FULL_CONDENSED;
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
@@ -539,13 +572,18 @@ fn flush_table(state: &mut RenderState, out: &mut String) {
     state.table_alignments.clear();
 }
 
-/// Render markdown to a string containing ANSI escape codes and sixel sequences.
+/// Render markdown to a string containing ANSI escape codes and sixel
+/// sequences.
 ///
 /// Headings are rendered as sixel images using the provided font.
 /// Body text uses ANSI terminal styling.
 /// Links use OSC 8 hyperlinks.
 /// Images are rendered inline as sixel.
-pub fn render(markdown: &str, font: &Font, base_path: Option<&Path>) -> String {
+pub fn render(
+    markdown: &str,
+    font: &Font,
+    base_path: Option<&Path>,
+) -> String {
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(markdown, options);
 
@@ -677,11 +715,11 @@ pub fn render(markdown: &str, font: &Font, base_path: Option<&Path>) -> String {
 
             // ── Images ───────────────────────────────────────────────
             Event::Start(Tag::Image { dest_url, .. }) => {
-                if let Some(path) = state.resolve_image_path(&dest_url) {
-                    if let Some(sixel_data) = sixel::encode_image_file(&path, 800) {
-                        out.push_str(&sixel_data);
-                        out.push('\n');
-                    }
+                if let Some(path) = state.resolve_image_path(&dest_url)
+                    && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
+                {
+                    out.push_str(&sixel_data);
+                    out.push('\n');
                 }
             }
             Event::End(TagEnd::Image) => {}

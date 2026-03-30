@@ -1,9 +1,19 @@
-use std::io::{self, Write};
+use std::io::Write;
+use std::io::{
+    self,
+};
 
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal::{self, ClearType},
+use crossterm::cursor;
+use crossterm::event::Event;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use crossterm::event::{
+    self,
+};
+use crossterm::terminal::ClearType;
+use crossterm::terminal::{
+    self,
 };
 
 /// A display line is either a plain text line or an atomic sixel block.
@@ -90,21 +100,20 @@ fn estimate_sixel_rows(data: &str) -> u16 {
         let after_q = &data[q_pos + 1..];
         if let Some(raster) = after_q.strip_prefix('"') {
             let parts: Vec<&str> = raster.splitn(5, ';').collect();
-            if parts.len() >= 4 {
-                if let Ok(pv) = parts[3]
+            if parts.len() >= 4
+                && let Ok(pv) = parts[3]
                     .chars()
                     .take_while(|c| c.is_ascii_digit())
                     .collect::<String>()
                     .parse::<u32>()
-                {
-                    // Convert pixel height to terminal rows.
-                    // Typical terminal cell height is ~20px but varies.
-                    // We use a conservative estimate; terminals that support
-                    // sixel generally report cell size via CSI 16 t, but
-                    // for simplicity we assume ~20px per row.
-                    let cell_height = 20u32;
-                    return ((pv + cell_height - 1) / cell_height).max(1) as u16;
-                }
+            {
+                // Convert pixel height to terminal rows.
+                // Typical terminal cell height is ~20px but varies.
+                // We use a conservative estimate; terminals that support
+                // sixel generally report cell size via CSI 16 t, but
+                // for simplicity we assume ~20px per row.
+                let cell_height = 20u32;
+                return pv.div_ceil(cell_height).max(1) as u16;
             }
         }
     }
@@ -114,7 +123,7 @@ fn estimate_sixel_rows(data: &str) -> u16 {
     let band_count = data.chars().filter(|&c| c == '-').count() as u32 + 1;
     let pixel_height = band_count * 6;
     let cell_height = 20u32;
-    ((pixel_height + cell_height - 1) / cell_height).max(1) as u16
+    pixel_height.div_ceil(cell_height).max(1) as u16
 }
 
 /// Run the interactive pager on the rendered output.
@@ -141,12 +150,7 @@ pub fn run(output: &str) {
 
     // Enter raw mode for interactive scrolling
     terminal::enable_raw_mode().unwrap();
-    crossterm::execute!(
-        stdout,
-        terminal::EnterAlternateScreen,
-        cursor::Hide,
-    )
-    .unwrap();
+    crossterm::execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide,).unwrap();
 
     let mut scroll_offset: usize = 0; // index into `lines`
 
@@ -184,9 +188,7 @@ pub fn run(output: &str) {
         } else {
             (line_idx * 100) / lines.len()
         };
-        let status = format!(
-            " [{progress}%] j/k:scroll  d/u:half-page  g/G:top/bottom  q:quit "
-        );
+        let status = format!(" [{progress}%] j/k:scroll  d/u:half-page  g/G:top/bottom  q:quit ");
         crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
         write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = 80).unwrap();
         stdout.flush().unwrap();
@@ -281,8 +283,7 @@ pub fn run(output: &str) {
                     code: KeyCode::Char(' '),
                     ..
                 } => {
-                    scroll_offset =
-                        advance_lines(&lines, scroll_offset, viewport_rows as usize);
+                    scroll_offset = advance_lines(&lines, scroll_offset, viewport_rows as usize);
                 }
 
                 _ => {}
@@ -291,27 +292,32 @@ pub fn run(output: &str) {
     }
 
     // Restore terminal
-    crossterm::execute!(
-        stdout,
-        cursor::Show,
-        terminal::LeaveAlternateScreen,
-    )
-    .unwrap();
+    crossterm::execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen,).unwrap();
     terminal::disable_raw_mode().unwrap();
 }
 
 /// Advance scroll offset by `count` lines, clamped to valid range.
-fn advance_lines(lines: &[Line], offset: usize, count: usize) -> usize {
+fn advance_lines(
+    lines: &[Line],
+    offset: usize,
+    count: usize,
+) -> usize {
     (offset + count).min(lines.len().saturating_sub(1))
 }
 
 /// Retreat scroll offset by `count` lines.
-fn retreat_lines(offset: usize, count: usize) -> usize {
+fn retreat_lines(
+    offset: usize,
+    count: usize,
+) -> usize {
     offset.saturating_sub(count)
 }
 
 /// Compute the scroll offset that shows the last screenful.
-fn scroll_to_end(lines: &[Line], viewport_rows: u16) -> usize {
+fn scroll_to_end(
+    lines: &[Line],
+    viewport_rows: u16,
+) -> usize {
     let mut rows: u16 = 0;
     for (i, line) in lines.iter().enumerate().rev() {
         rows += line.rows();

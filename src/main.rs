@@ -3,7 +3,8 @@ mod pager;
 mod renderer;
 mod sixel;
 
-use std::io::{IsTerminal, Read};
+use std::io::IsTerminal;
+use std::io::Read;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -60,10 +61,12 @@ fn main() {
         }
         None => {
             let mut md = String::new();
-            std::io::stdin().read_to_string(&mut md).unwrap_or_else(|e| {
-                eprintln!("error: cannot read stdin: {e}");
-                std::process::exit(1);
-            });
+            std::io::stdin()
+                .read_to_string(&mut md)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: cannot read stdin: {e}");
+                    std::process::exit(1);
+                });
             (md, None)
         }
     };
