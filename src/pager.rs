@@ -33,6 +33,7 @@ enum ImageGroup {
     Sixel(usize),        // index into a vec of sixel data
     PendingImage(usize), // index into pending_images
     Gif(usize),          // index into pending_gifs
+    Merged,              // side-by-side composite — always show preview
 }
 
 /// A display line.
@@ -285,6 +286,18 @@ fn merge_side_by_side_images(lines: &mut Vec<Line>) {
             all_previews.push(extract_preview_texts(&lines[*g_start..*g_start + g_rows]));
         }
 
+        // Compute max visible width per group for padding
+        let group_widths: Vec<usize> = all_previews
+            .iter()
+            .map(|previews| {
+                previews
+                    .iter()
+                    .map(|p| crate::renderer::ansi::visible_len(p))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+
         // Build merged rows
         let mut merged_rows = Vec::new();
         for row in 0..max_rows {
@@ -293,12 +306,18 @@ fn merge_side_by_side_images(lines: &mut Vec<Line>) {
                 if g_idx > 0 {
                     combined.push_str(gap);
                 }
-                if let Some(text) = previews.get(row) {
-                    combined.push_str(text);
+                let text = previews.get(row).map(|s| s.as_str()).unwrap_or("");
+                combined.push_str(text);
+                // Reset ANSI and pad to group width
+                combined.push_str("\x1b[0m");
+                let vis_len = crate::renderer::ansi::visible_len(text);
+                let pad = group_widths[g_idx].saturating_sub(vis_len);
+                for _ in 0..pad {
+                    combined.push(' ');
                 }
             }
             merged_rows.push(Line::ImageRow {
-                group: first_group, // Use first group for sixel rendering
+                group: ImageGroup::Merged,
                 row_in_group: row as u16,
                 total_rows: max_rows as u16,
                 preview_text: combined,
@@ -936,6 +955,9 @@ pub fn print_output(output: &RenderOutput) {
                                 }
                             }
                         }
+                        ImageGroup::Merged => {
+                            // Merged groups: print preview text row by row
+                        }
                     }
                 }
                 // Skip non-first rows of the group (sixel covers them)
@@ -1047,6 +1069,7 @@ fn try_render_full_image(
 ) -> bool {
     crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
     match group {
+        ImageGroup::Merged => return false,
         ImageGroup::Sixel(id) => {
             if let Some(sd) = sixel_store.get(id) {
                 write!(stdout, "{}", sd.data).unwrap();
