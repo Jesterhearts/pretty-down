@@ -1251,18 +1251,35 @@ fn render_image_in_table_cell(
     let max_px = max_cols * sixel::cell_pixel_width();
     let img = sixel::scale_image(img, max_px);
     let cols = sixel::preview_columns(img.width()).min(max_cols);
-    let (w, h) = img.dimensions();
-    let rows = if h > 0 && w > 0 {
-        let aspect = h as f64 / w as f64;
-        // Half-blocks give 2 pixels per row, so halve the aspect ratio
-        ((cols as f64 * aspect) / 2.0).ceil().max(1.0) as u16
-    } else {
-        1
-    };
-    let preview = sixel::half_block_preview(&img, cols, rows);
 
-    let cell_content = preview.join("\n");
-    state.table_cell_buf.push_str(&cell_content);
+    // Snap height to cell boundary for clean sixel rendering
+    let snapped_h = sixel::snap_height_to_cells(img.height());
+    let rows = sixel::pixel_height_to_rows(snapped_h);
+
+    // Pad image to snapped height
+    let mut padded_img = img;
+    if snapped_h > padded_img.height() {
+        let mut new_img = image::RgbaImage::new(padded_img.width(), snapped_h);
+        image::imageops::overlay(&mut new_img, &padded_img, 0, 0);
+        padded_img = new_img;
+    }
+
+    // Encode the sixel
+    let sixel_data = sixel::encode_rgba(padded_img.width(), snapped_h, padded_img.as_raw());
+
+    // Build cell content:
+    // Line 1: sixel data (renders the image at cursor position)
+    // Lines 2..N: full blocks (█) colored as background for sizing/transparency
+    // The first row of blocks is on the same "line" as the sixel in comfy-table,
+    // but the terminal renders the sixel first.
+    let bg_block = format!("\x1b[0m{}", "\u{2588}".repeat(cols as usize));
+    let mut cell_lines = Vec::with_capacity(rows as usize);
+    cell_lines.push(format!("{sixel_data}{bg_block}"));
+    for _ in 1..rows {
+        cell_lines.push(bg_block.clone());
+    }
+
+    state.table_cell_buf.push_str(&cell_lines.join("\n"));
 }
 
 /// Render markdown into a sequence of output blocks.
