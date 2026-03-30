@@ -8,10 +8,14 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::cursor;
+use crossterm::event::EnableMouseCapture;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use crossterm::event::MouseButton;
+use crossterm::event::MouseEvent;
+use crossterm::event::MouseEventKind;
 use crossterm::event::{
     self,
 };
@@ -298,7 +302,13 @@ pub fn run(
     let watching = watch_rx.is_some();
 
     terminal::enable_raw_mode().unwrap();
-    crossterm::execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide,).unwrap();
+    crossterm::execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        cursor::Hide,
+        EnableMouseCapture,
+    )
+    .unwrap();
 
     let mut scroll_offset: usize = 0; // index into `visible`
     let mut needs_redraw = true;
@@ -319,10 +329,14 @@ pub fn run(
         Up,
     }
     let mut scroll_dir = ScrollDir::None;
+    let mut last_draw = DrawResult {
+        overflow: None,
+        summary_rows: Vec::new(),
+    };
 
     loop {
         if needs_redraw {
-            let overflow = draw_screen(
+            last_draw = draw_screen(
                 &mut stdout,
                 &lines,
                 &visible,
@@ -332,7 +346,7 @@ pub fn run(
                 term_rows,
                 watching,
             );
-            if let Some(ov) = overflow {
+            if let Some(ref ov) = last_draw.overflow {
                 match scroll_dir {
                     ScrollDir::Down => {
                         let mut rows_to_skip = ov.rows;
@@ -405,7 +419,54 @@ pub fn run(
             continue;
         }
 
-        if let Ok(Event::Key(key)) = event::read() {
+        let Ok(ev) = event::read() else {
+            continue;
+        };
+
+        // Handle mouse clicks on details summaries
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row,
+            ..
+        }) = ev
+            && let Some(&(_, id)) = last_draw.summary_rows.iter().find(|(r, _)| *r == row)
+        {
+            if collapsed.contains(&id) {
+                collapsed.remove(&id);
+            } else {
+                collapsed.insert(id);
+            }
+            visible = visible_indices(&lines, &collapsed);
+            if scroll_offset >= visible.len() {
+                scroll_offset = visible.len().saturating_sub(1);
+            }
+            needs_redraw = true;
+            continue;
+        }
+
+        // Handle mouse scroll
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            ..
+        }) = ev
+        {
+            scroll_offset = advance_lines(&visible, scroll_offset, 3);
+            scroll_dir = ScrollDir::Down;
+            needs_redraw = true;
+            continue;
+        }
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..
+        }) = ev
+        {
+            scroll_offset = retreat_lines(scroll_offset, 3);
+            scroll_dir = ScrollDir::Up;
+            needs_redraw = true;
+            continue;
+        }
+
+        if let Event::Key(key) = ev {
             match key {
                 KeyEvent {
                     code: KeyCode::Char('q'),
@@ -549,7 +610,13 @@ pub fn run(
         }
     }
 
-    crossterm::execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen,).unwrap();
+    crossterm::execute!(
+        stdout,
+        crossterm::event::DisableMouseCapture,
+        cursor::Show,
+        terminal::LeaveAlternateScreen,
+    )
+    .unwrap();
     terminal::disable_raw_mode().unwrap();
 }
 
@@ -585,6 +652,12 @@ struct Overflow {
     vis_idx: usize,
 }
 
+struct DrawResult {
+    overflow: Option<Overflow>,
+    /// Maps terminal row → details block ID for click handling.
+    summary_rows: Vec<(u16, usize)>,
+}
+
 /// Draw the current view.
 /// `scroll_offset` indexes into `visible`, which maps to actual line indices.
 #[allow(clippy::too_many_arguments)]
@@ -597,7 +670,7 @@ fn draw_screen(
     viewport_rows: u16,
     term_rows: u16,
     watching: bool,
-) -> Option<Overflow> {
+) -> DrawResult {
     write!(stdout, "\x1b[?2026h").unwrap();
 
     crossterm::execute!(
@@ -610,6 +683,7 @@ fn draw_screen(
     let mut rows_used: u16 = 0;
     let mut vis_idx = scroll_offset;
     let mut overflow: Option<Overflow> = None;
+    let mut summary_rows: Vec<(u16, usize)> = Vec::new();
 
     while vis_idx < visible.len() && rows_used < viewport_rows {
         let line_idx = visible[vis_idx];
@@ -645,6 +719,7 @@ fn draw_screen(
                 let triangle = if is_collapsed { "\u{25B6}" } else { "\u{25BC}" };
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "\x1b[1m{triangle} {text}\x1b[0m\r").unwrap();
+                summary_rows.push((rows_used, *id));
                 rows_used += 1;
             }
         }
@@ -669,7 +744,10 @@ fn draw_screen(
     write!(stdout, "\x1b[?2026l").unwrap();
     stdout.flush().unwrap();
 
-    overflow
+    DrawResult {
+        overflow,
+        summary_rows,
+    }
 }
 
 /// Find the details block to toggle.
