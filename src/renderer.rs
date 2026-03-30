@@ -13,7 +13,7 @@ use crate::font::Font;
 use crate::sixel;
 
 /// ANSI escape helpers
-mod ansi {
+pub(crate) mod ansi {
     pub const RESET: &str = "\x1b[0m";
     pub const BOLD: &str = "\x1b[1m";
     pub const DIM: &str = "\x1b[2m";
@@ -49,6 +49,71 @@ mod ansi {
         b: u8,
     ) -> String {
         format!("\x1b[48;2;{r};{g};{b}m")
+    }
+
+    /// Count the visible (non-escape) characters in a string.
+    pub fn visible_len(s: &str) -> usize {
+        let mut len = 0;
+        let mut in_escape = false;
+        for ch in s.chars() {
+            if ch == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if ch.is_ascii_alphabetic() || ch == '\\' {
+                    in_escape = false;
+                }
+            } else {
+                len += 1;
+            }
+        }
+        len
+    }
+
+    /// Slice a string with ANSI escapes at visible column boundaries.
+    /// Returns the substring from visible column `start` with `width` visible
+    /// chars. ANSI state is preserved at the boundaries.
+    pub fn visible_slice(
+        s: &str,
+        start: usize,
+        width: usize,
+    ) -> String {
+        let mut result = String::new();
+        let mut col = 0;
+        let mut in_escape = false;
+        let mut pending_escape = String::new();
+
+        for ch in s.chars() {
+            if ch == '\x1b' {
+                in_escape = true;
+                pending_escape.clear();
+                pending_escape.push(ch);
+                continue;
+            }
+            if in_escape {
+                pending_escape.push(ch);
+                if ch.is_ascii_alphabetic() || ch == '\\' {
+                    in_escape = false;
+                    // Include escapes in the visible region
+                    if col >= start && col < start + width {
+                        result.push_str(&pending_escape);
+                    } else if col < start {
+                        // Track style for when we enter the visible region
+                        result.push_str(&pending_escape);
+                    }
+                }
+                continue;
+            }
+
+            if col >= start && col < start + width {
+                result.push(ch);
+            }
+            col += 1;
+            if col >= start + width {
+                break;
+            }
+        }
+
+        result
     }
 
     /// Word-wrap a string that may contain ANSI escape sequences.
@@ -185,6 +250,8 @@ struct RenderState {
     table_cell_code: bool,
     /// Pending background image encodes, indexed by placeholder ID.
     pending_images: Vec<sixel::PendingImage>,
+    /// Rendered code blocks for horizontal scrolling.
+    code_blocks: Vec<CodeBlock>,
     /// Pending GIF animations, indexed by placeholder ID.
     pending_gifs: Vec<sixel::PendingGif>,
     /// Byte offset in `out` where the current paragraph started (for wrapping).
@@ -221,6 +288,7 @@ impl RenderState {
             table_cell_italic: false,
             table_cell_code: false,
             pending_images: Vec::new(),
+            code_blocks: Vec::new(),
             pending_gifs: Vec::new(),
             para_start: None,
             term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
@@ -956,10 +1024,19 @@ fn flush_table(
 
 /// Output from rendering markdown, containing the text output and any
 /// images still being encoded in background threads.
+/// A rendered code block with syntax-highlighted lines.
+pub struct CodeBlock {
+    /// Each line with ANSI color escapes.
+    pub lines: Vec<String>,
+    /// Maximum visible column width across all lines.
+    pub max_width: usize,
+}
+
 pub struct RenderOutput {
     pub text: String,
     pub pending_images: Vec<sixel::PendingImage>,
     pub pending_gifs: Vec<sixel::PendingGif>,
+    pub code_blocks: Vec<CodeBlock>,
 }
 
 /// Render markdown to a string containing ANSI escape codes, sixel sequences,
@@ -1042,34 +1119,37 @@ pub fn render(
             }
             Event::End(TagEnd::CodeBlock) => {
                 state.in_code_block = false;
-                // Try syntax highlighting, fall back to themed plain text
                 let code = std::mem::take(&mut state.code_buf);
+
+                // Build highlighted lines
                 let highlighted = state
                     .code_lang
                     .as_deref()
                     .and_then(|lang| highlighter.highlight(&code, lang));
-                if let Some(colored) = highlighted {
-                    // Indent each line
-                    for (i, line) in colored.lines().enumerate() {
-                        if i > 0 {
-                            out.push('\n');
-                        }
-                        out.push_str("  ");
-                        out.push_str(line);
-                    }
+
+                let styled_lines: Vec<String> = if let Some(colored) = highlighted {
+                    colored.lines().map(|l| l.to_string()).collect()
                 } else {
-                    // No highlighting — use theme style
-                    out.push_str(&theme.code_block.to_ansi());
-                    out.push_str("  ");
-                    for (i, line) in code.lines().enumerate() {
-                        if i > 0 {
-                            out.push_str("\n  ");
-                        }
-                        out.push_str(line);
-                    }
-                }
-                out.push_str(ansi::RESET);
-                out.push_str("\n\n");
+                    let style = theme.code_block.to_ansi();
+                    code.lines().map(|l| format!("{style}{l}\x1b[0m")).collect()
+                };
+
+                // Compute max visible width
+                let max_width = styled_lines
+                    .iter()
+                    .map(|l| ansi::visible_len(l))
+                    .max()
+                    .unwrap_or(0);
+
+                let id = state.code_blocks.len();
+                let height = styled_lines.len();
+                state.code_blocks.push(CodeBlock {
+                    lines: styled_lines,
+                    max_width,
+                });
+
+                // +1 for the scrollbar row
+                out.push_str(&format!("\x00CODE:{id}:{}\x00\n", height + 1));
                 state.code_lang = None;
             }
 
@@ -1317,5 +1397,6 @@ pub fn render(
         text: out,
         pending_images: state.pending_images,
         pending_gifs: state.pending_gifs,
+        code_blocks: state.code_blocks,
     }
 }

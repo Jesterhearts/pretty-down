@@ -139,6 +139,7 @@ fn main() {
                 text: String::new(),
                 pending_images: Vec::new(),
                 pending_gifs: Vec::new(),
+                code_blocks: Vec::new(),
             })
         };
 

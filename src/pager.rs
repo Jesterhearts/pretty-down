@@ -44,6 +44,8 @@ enum Line {
     DetailsEnd { id: usize },
     /// An animated GIF placeholder.
     Gif { id: usize, estimated_rows: u16 },
+    /// A horizontally scrollable code block.
+    CodeBlock { id: usize, height: u16 },
 }
 
 impl Line {
@@ -55,6 +57,7 @@ impl Line {
             Line::PendingImage { estimated_rows, .. } | Line::Gif { estimated_rows, .. } => {
                 *estimated_rows
             }
+            Line::CodeBlock { height, .. } => *height,
             Line::DetailsSummary { .. } => 1,
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => 0,
         }
@@ -174,6 +177,11 @@ fn parse_marker(
                 id,
                 estimated_rows: rows,
             });
+        }
+        Some("CODE") if parts.len() == 3 => {
+            let id: usize = parts[1].parse().unwrap_or(0);
+            let height: u16 = parts[2].parse().unwrap_or(1);
+            lines.push(Line::CodeBlock { id, height });
         }
         Some("/DETAILS") if parts.len() >= 2 => {
             let id: usize = parts[1].parse().unwrap_or(0);
@@ -298,7 +306,7 @@ pub fn run(
 
     let mut stdout = io::stdout();
 
-    let (_, mut term_rows) = terminal::size().unwrap_or((80, 24));
+    let (mut term_cols, mut term_rows) = terminal::size().unwrap_or((80, 24));
     let mut viewport_rows = term_rows.saturating_sub(1);
 
     // If content fits and no watch and no pending images, just print directly
@@ -349,6 +357,7 @@ pub fn run(
     };
     // Per-GIF animation state: (current frame index, next frame deadline)
     let mut gif_state: HashMap<usize, (usize, std::time::Instant)> = HashMap::new();
+    let mut code_h_scroll: HashMap<usize, usize> = HashMap::new();
 
     loop {
         // Advance any GIFs whose frame deadline has passed
@@ -384,8 +393,11 @@ pub fn run(
                 &collapsed,
                 pending_gifs,
                 &gif_frames,
+                &output.code_blocks,
+                &code_h_scroll,
                 scroll_offset,
                 viewport_rows,
+                term_cols,
                 term_rows,
                 watching,
             );
@@ -492,7 +504,8 @@ pub fn run(
         };
 
         // Handle terminal resize — re-render with new dimensions
-        if let Event::Resize(_cols, rows) = ev {
+        if let Event::Resize(cols, rows) = ev {
+            term_cols = cols;
             let new_viewport = rows.saturating_sub(1);
             // Invalidate cached pixel width so re-render picks up new size
             crate::sixel::invalidate_terminal_size();
@@ -534,7 +547,43 @@ pub fn run(
             continue;
         }
 
-        // Handle mouse scroll
+        // Handle mouse horizontal scroll on code blocks
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight,
+            row,
+            ..
+        }) = ev
+        {
+            // Find which code block the mouse is over
+            if let Some(block_id) = find_code_block_at_row(
+                &lines,
+                &visible,
+                &output.code_blocks,
+                scroll_offset,
+                viewport_rows,
+                row,
+            ) {
+                let entry = code_h_scroll.entry(block_id).or_insert(0);
+                let max = output.code_blocks[block_id]
+                    .max_width
+                    .saturating_sub(term_cols as usize);
+                if matches!(
+                    ev,
+                    Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::ScrollRight,
+                        ..
+                    })
+                ) {
+                    *entry = (*entry + 4).min(max);
+                } else {
+                    *entry = entry.saturating_sub(4);
+                }
+                needs_redraw = true;
+                continue;
+            }
+        }
+
+        // Handle mouse vertical scroll
         if let Event::Mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
             ..
@@ -742,6 +791,14 @@ pub fn print_output(output: &RenderOutput) {
             Line::DetailsSummary { text, .. } => {
                 println!("\x1b[1m\u{25BC} {text}\x1b[0m");
             }
+            Line::CodeBlock { id, .. } => {
+                if let Some(block) = output.code_blocks.get(*id) {
+                    for line in &block.lines {
+                        println!("  {line}");
+                    }
+                    println!();
+                }
+            }
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {}
         }
     }
@@ -771,8 +828,11 @@ fn draw_screen(
     collapsed: &HashSet<usize>,
     gifs: &[crate::sixel::PendingGif],
     gif_frames: &HashMap<usize, usize>,
+    code_blocks: &[crate::renderer::CodeBlock],
+    code_h_scroll: &HashMap<usize, usize>,
     scroll_offset: usize,
     viewport_rows: u16,
+    term_cols: u16,
     term_rows: u16,
     watching: bool,
 ) -> DrawResult {
@@ -850,6 +910,36 @@ fn draw_screen(
                 summary_rows.push((rows_used, *id));
                 rows_used += 1;
             }
+            Line::CodeBlock { id, height } => {
+                if let Some(block) = code_blocks.get(*id) {
+                    let h_offset = code_h_scroll.get(id).copied().unwrap_or(0);
+                    let avail_cols = term_cols as usize;
+
+                    // Render each code line with horizontal scroll
+                    for line in &block.lines {
+                        if rows_used >= viewport_rows {
+                            break;
+                        }
+                        crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                        let sliced =
+                            crate::renderer::ansi::visible_slice(line, h_offset, avail_cols);
+                        write!(stdout, "  {sliced}\x1b[0m\r").unwrap();
+                        rows_used += 1;
+                    }
+
+                    // Scrollbar row
+                    if rows_used < viewport_rows {
+                        crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                        if block.max_width > avail_cols {
+                            let bar = render_scrollbar(h_offset, block.max_width, avail_cols);
+                            write!(stdout, "\x1b[2m{bar}\x1b[0m\r").unwrap();
+                        }
+                        rows_used += 1;
+                    }
+                } else {
+                    rows_used += height;
+                }
+            }
         }
         vis_idx += 1;
     }
@@ -921,6 +1011,71 @@ fn first_visible_details(
         }
     }
     None
+}
+
+/// Find which code block (if any) occupies the given terminal row.
+fn find_code_block_at_row(
+    lines: &[Line],
+    visible: &[usize],
+    _code_blocks: &[crate::renderer::CodeBlock],
+    scroll_offset: usize,
+    viewport_rows: u16,
+    target_row: u16,
+) -> Option<usize> {
+    let mut rows_used: u16 = 0;
+    for &vi in &visible[scroll_offset..] {
+        if rows_used >= viewport_rows {
+            break;
+        }
+        let line = &lines[vi];
+        let line_rows = line.rows();
+        if let Line::CodeBlock { id, .. } = line
+            && target_row >= rows_used
+            && target_row < rows_used + line_rows
+        {
+            return Some(*id);
+        }
+        rows_used += line_rows;
+    }
+    None
+}
+
+/// Render a horizontal scrollbar for a code block.
+fn render_scrollbar(
+    offset: usize,
+    content_width: usize,
+    view_width: usize,
+) -> String {
+    if content_width <= view_width {
+        return String::new();
+    }
+    let bar_width = view_width.saturating_sub(2); // leave space for arrows
+    if bar_width == 0 {
+        return String::new();
+    }
+
+    // Thumb size proportional to visible portion
+    let thumb_size = ((view_width as f64 / content_width as f64) * bar_width as f64)
+        .ceil()
+        .max(1.0) as usize;
+    let max_offset = content_width.saturating_sub(view_width);
+    let thumb_pos = if max_offset > 0 {
+        ((offset as f64 / max_offset as f64) * (bar_width - thumb_size) as f64) as usize
+    } else {
+        0
+    };
+
+    let mut bar = String::with_capacity(view_width);
+    bar.push('\u{25C0}'); // ◀
+    for i in 0..bar_width {
+        if i >= thumb_pos && i < thumb_pos + thumb_size {
+            bar.push('\u{2588}'); // █
+        } else {
+            bar.push('\u{2500}'); // ─
+        }
+    }
+    bar.push('\u{25B6}'); // ▶
+    bar
 }
 
 fn advance_lines(
