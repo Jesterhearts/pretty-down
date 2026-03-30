@@ -1272,16 +1272,17 @@ fn render_image_in_table_cell(
     // 2. Render full blocks (█) for comfy-table sizing
     // 3. Restore cursor back to the saved position
     // 4. Emit sixel data (renders over the blocks at the correct cell position)
-    let save_cursor = "\x1b[s"; // DECSC - save cursor position
-    let restore_cursor = "\x1b[u"; // DECRC - restore cursor position
-    let bg_block = "\u{2588}".repeat(cols as usize);
+    let save_cursor = "\x1b[s";
+    let restore_cursor = "\x1b[u";
+    // Use spaces for padding — they inherit the terminal background color
+    let padding_row = " ".repeat(cols as usize);
 
-    let mut cell_lines = Vec::with_capacity(rows as usize + 1);
-    cell_lines.push(format!("{save_cursor}{bg_block}"));
-    for _ in 1..rows {
-        cell_lines.push(bg_block.clone());
+    let mut cell_lines = Vec::with_capacity(rows as usize + 2);
+    cell_lines.push(format!("{save_cursor}{padding_row}"));
+    for _ in 1..=rows {
+        // +1 extra row to avoid bottom cutoff from sixel height rounding
+        cell_lines.push(padding_row.clone());
     }
-    // Last line: restore cursor to top of cell, then emit sixel
     cell_lines.push(format!("{restore_cursor}{sixel_data}"));
 
     state.table_cell_buf.push_str(&cell_lines.join("\n"));
