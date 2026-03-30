@@ -250,12 +250,14 @@ pub struct PendingGif {
     /// Set to true when all frames are encoded.
     done: Arc<OnceLock<()>>,
     /// The index of the frame currently being displayed by the pager.
-    /// The encoding thread uses this to avoid getting too far ahead.
     pub playback_idx: Arc<std::sync::atomic::AtomicUsize>,
     /// Estimated terminal rows.
     pub estimated_rows: u16,
     /// Half-block preview of the first frame.
     pub preview: Vec<String>,
+    /// Whether this is a video (has playback controls) vs a GIF (loops
+    /// silently).
+    pub is_video: bool,
 }
 
 impl PendingGif {
@@ -352,6 +354,7 @@ pub fn encode_gif_async(
         playback_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         estimated_rows,
         preview,
+        is_video: false,
     })
 }
 
@@ -600,5 +603,6 @@ pub fn encode_video_async(
         playback_idx,
         estimated_rows,
         preview,
+        is_video: true,
     })
 }

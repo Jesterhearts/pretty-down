@@ -57,6 +57,8 @@ enum Line {
     DetailsEnd { id: usize },
     /// A horizontally scrollable code block.
     CodeBlock { id: usize, height: u16 },
+    /// Video playback control bar (play/pause + progress).
+    VideoControls { gif_id: usize },
 }
 
 impl Line {
@@ -65,6 +67,7 @@ impl Line {
         match self {
             Line::Text(_) | Line::ImageRow { .. } => 1,
             Line::CodeBlock { height, .. } => *height,
+            Line::VideoControls { .. } => 1,
             Line::DetailsSummary { .. } => 1,
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => 0,
         }
@@ -147,6 +150,7 @@ fn flatten_blocks(
                 let g = output.pending_gifs.get(*id);
                 let rows = g.map(|g| g.estimated_rows).unwrap_or(1);
                 let preview = g.map(|g| &g.preview[..]).unwrap_or(&[]);
+                let is_video = g.is_some_and(|g| g.is_video);
                 let group = ImageGroup::Gif(*id);
                 for i in 0..rows {
                     let preview_text = preview.get(i as usize).cloned().unwrap_or_default();
@@ -156,6 +160,9 @@ fn flatten_blocks(
                         total_rows: rows,
                         preview_text,
                     });
+                }
+                if is_video {
+                    lines.push(Line::VideoControls { gif_id: *id });
                 }
             }
             OutputBlock::Code(id) => {
@@ -309,10 +316,12 @@ pub fn run(
 
     let mut last_draw = DrawResult {
         summary_rows: Vec::new(),
+        video_control_rows: Vec::new(),
     };
     // Per-GIF animation state: (current frame index, next frame deadline)
     let mut gif_state: HashMap<usize, (usize, std::time::Instant)> = HashMap::new();
     let mut code_h_scroll: HashMap<usize, usize> = HashMap::new();
+    let mut video_paused: HashSet<usize> = HashSet::new();
 
     loop {
         // Advance any GIFs whose frame deadline has passed
@@ -320,6 +329,7 @@ pub fn run(
         let mut any_advanced = false;
         for (id, (frame_idx, deadline)) in gif_state.iter_mut() {
             if now >= *deadline
+                && !video_paused.contains(id)
                 && let Some(gif) = pending_gifs.get(*id)
             {
                 let count = gif.frame_count();
@@ -357,6 +367,7 @@ pub fn run(
                 pending,
                 pending_gifs,
                 &gif_frames,
+                &video_paused,
                 code_blocks,
                 &code_h_scroll,
                 scroll_offset,
@@ -501,6 +512,23 @@ pub fn run(
             visible = visible_indices(&lines, &collapsed);
             if scroll_offset >= visible.len() {
                 scroll_offset = visible.len().saturating_sub(1);
+            }
+            needs_redraw = true;
+            continue;
+        }
+
+        // Handle click on video control bar
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row,
+            ..
+        }) = ev
+            && let Some(&(_, gif_id)) = last_draw.video_control_rows.iter().find(|(r, _)| *r == row)
+        {
+            if video_paused.contains(&gif_id) {
+                video_paused.remove(&gif_id);
+            } else {
+                video_paused.insert(gif_id);
             }
             needs_redraw = true;
             continue;
@@ -728,19 +756,29 @@ pub fn run(
                     needs_redraw = true;
                 }
 
-                // Toggle the first visible details block
+                // Toggle details or video play/pause
                 KeyEvent {
                     code: KeyCode::Enter,
                     ..
                 } => {
-                    if let Some(id) = first_visible_details(&lines, &visible, scroll_offset) {
+                    // Try toggling a video first
+                    let toggled_video =
+                        first_visible_video_controls(&lines, &visible, scroll_offset);
+                    if let Some(gif_id) = toggled_video {
+                        if video_paused.contains(&gif_id) {
+                            video_paused.remove(&gif_id);
+                        } else {
+                            video_paused.insert(gif_id);
+                        }
+                        needs_redraw = true;
+                    } else if let Some(id) = first_visible_details(&lines, &visible, scroll_offset)
+                    {
                         if collapsed.contains(&id) {
                             collapsed.remove(&id);
                         } else {
                             collapsed.insert(id);
                         }
                         visible = visible_indices(&lines, &collapsed);
-                        // Clamp scroll offset to new visible range
                         if scroll_offset >= visible.len() {
                             scroll_offset = visible.len().saturating_sub(1);
                         }
@@ -818,6 +856,7 @@ pub fn print_output(output: &RenderOutput) {
                 }
             }
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {}
+            Line::VideoControls { .. } => {} // no controls in non-pager mode
         }
     }
 }
@@ -825,6 +864,8 @@ pub fn print_output(output: &RenderOutput) {
 struct DrawResult {
     /// Maps terminal row → details block ID for click handling.
     summary_rows: Vec<(u16, usize)>,
+    /// Maps terminal row → gif_id for video control click handling.
+    video_control_rows: Vec<(u16, usize)>,
 }
 
 /// Draw the current view.
@@ -882,6 +923,7 @@ fn draw_screen(
     pending_images: &[crate::sixel::PendingImage],
     gifs: &[crate::sixel::PendingGif],
     gif_frames: &HashMap<usize, usize>,
+    video_paused: &HashSet<usize>,
     code_blocks: &[crate::renderer::CodeBlock],
     code_h_scroll: &HashMap<usize, usize>,
     scroll_offset: usize,
@@ -902,6 +944,7 @@ fn draw_screen(
     let mut rows_used: u16 = 0;
     let mut vis_idx = scroll_offset;
     let mut summary_rows: Vec<(u16, usize)> = Vec::new();
+    let mut video_control_rows: Vec<(u16, usize)> = Vec::new();
 
     while vis_idx < visible.len() && rows_used < viewport_rows {
         let line_idx = visible[vis_idx];
@@ -999,6 +1042,30 @@ fn draw_screen(
                     rows_used += height;
                 }
             }
+            Line::VideoControls { gif_id } => {
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                let paused = video_paused.contains(gif_id);
+                let btn = if paused { "\u{25B6}" } else { "\u{23F8}" }; // ▶ or ⏸
+                let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
+                let total = gifs.get(*gif_id).map(|g| g.frame_count()).unwrap_or(0);
+                let bar_width = term_cols.saturating_sub(10) as usize;
+                let progress_pos = if total > 0 {
+                    (frame_idx * bar_width) / total
+                } else {
+                    0
+                };
+                let mut bar = String::new();
+                for i in 0..bar_width {
+                    if i == progress_pos {
+                        bar.push('\u{25CF}'); // ●
+                    } else {
+                        bar.push('\u{2500}'); // ─
+                    }
+                }
+                write!(stdout, "\x1b[2m {btn}  {bar} \x1b[0m\r").unwrap();
+                video_control_rows.push((rows_used, *gif_id));
+                rows_used += 1;
+            }
         }
         vis_idx += 1;
     }
@@ -1021,7 +1088,10 @@ fn draw_screen(
     write!(stdout, "\x1b[?2026l").unwrap();
     stdout.flush().unwrap();
 
-    DrawResult { summary_rows }
+    DrawResult {
+        summary_rows,
+        video_control_rows,
+    }
 }
 
 /// Find the details block to toggle.
@@ -1070,6 +1140,20 @@ fn first_visible_details(
 }
 
 /// Find which code block (if any) occupies the given terminal row.
+/// Find the first visible video control bar from scroll_offset.
+fn first_visible_video_controls(
+    lines: &[Line],
+    visible: &[usize],
+    scroll_offset: usize,
+) -> Option<usize> {
+    for &vi in &visible[scroll_offset..] {
+        if let Line::VideoControls { gif_id } = &lines[vi] {
+            return Some(*gif_id);
+        }
+    }
+    None
+}
+
 /// Find the first visible code block from scroll_offset.
 fn first_visible_code_block(
     lines: &[Line],
