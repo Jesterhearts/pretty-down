@@ -324,7 +324,14 @@ pub fn run(
             {
                 let count = gif.frame_count();
                 if count > 1 {
-                    *frame_idx = (*frame_idx + 1) % count;
+                    *frame_idx += 1;
+                    // For GIFs, loop. For videos, the thread loops.
+                    if gif.is_done() {
+                        *frame_idx %= count;
+                    }
+                    // Update playback position for throttling
+                    gif.playback_idx
+                        .store(*frame_idx, std::sync::atomic::Ordering::Relaxed);
                     if let Some(frame) = gif.frame(*frame_idx) {
                         *deadline = now + Duration::from_millis(frame.delay_ms as u64);
                     }

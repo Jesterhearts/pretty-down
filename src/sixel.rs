@@ -241,12 +241,15 @@ pub struct GifFrame {
     pub delay_ms: u32,
 }
 
-/// A handle to a GIF being decoded and encoded in a background thread.
+/// A handle to a GIF/video being decoded and encoded in a background thread.
 pub struct PendingGif {
     /// Frames encoded so far. The thread appends to this as it goes.
     frames: Arc<Mutex<Vec<GifFrame>>>,
     /// Set to true when all frames are encoded.
     done: Arc<OnceLock<()>>,
+    /// The index of the frame currently being displayed by the pager.
+    /// The encoding thread uses this to avoid getting too far ahead.
+    pub playback_idx: Arc<std::sync::atomic::AtomicUsize>,
     /// Estimated terminal rows.
     pub estimated_rows: u16,
     /// Half-block preview of the first frame.
@@ -344,6 +347,7 @@ pub fn encode_gif_async(
     Some(PendingGif {
         frames,
         done,
+        playback_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         estimated_rows,
         preview,
     })
@@ -460,8 +464,10 @@ pub fn encode_video_async(
 
     let frames = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(OnceLock::new());
+    let playback_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let frames_clone = frames.clone();
     let done_clone = done.clone();
+    let playback_clone = playback_idx.clone();
     let path = path.to_owned();
 
     std::thread::spawn(move || {
@@ -500,34 +506,56 @@ pub fn encode_video_async(
             return;
         };
 
-        for (s, packet) in input.packets() {
-            if s.index() != stream_index {
-                continue;
-            }
-            if decoder.send_packet(&packet).is_err() {
-                continue;
-            }
-            let mut decoded = ffmpeg::frame::Video::empty();
-            while decoder.receive_frame(&mut decoded).is_ok() {
-                let mut rgb_frame = ffmpeg::frame::Video::empty();
-                if scaler.run(&decoded, &mut rgb_frame).is_err() {
+        // Buffer limit: stay at most this many frames ahead of playback
+        const MAX_AHEAD: usize = 30;
+
+        loop {
+            for (s, packet) in input.packets() {
+                if s.index() != stream_index {
                     continue;
                 }
-                let data = rgb_frame.data(0);
-                let expected = dst_width as usize * dst_height as usize * 4;
-                if data.len() < expected {
+                if decoder.send_packet(&packet).is_err() {
                     continue;
                 }
-                if let Some(img) =
-                    RgbaImage::from_raw(dst_width, dst_height, data[..expected].to_vec())
-                {
-                    let sixel = ImageEncoder::encode(img);
-                    frames_clone
-                        .lock()
-                        .unwrap()
-                        .push(GifFrame { sixel, delay_ms });
+                let mut decoded = ffmpeg::frame::Video::empty();
+                while decoder.receive_frame(&mut decoded).is_ok() {
+                    let mut rgb_frame = ffmpeg::frame::Video::empty();
+                    if scaler.run(&decoded, &mut rgb_frame).is_err() {
+                        continue;
+                    }
+                    let data = rgb_frame.data(0);
+                    let expected = dst_width as usize * dst_height as usize * 4;
+                    if data.len() < expected {
+                        continue;
+                    }
+                    if let Some(img) =
+                        RgbaImage::from_raw(dst_width, dst_height, data[..expected].to_vec())
+                    {
+                        // Throttle: wait if we're too far ahead of playback
+                        loop {
+                            let count = frames_clone.lock().unwrap().len();
+                            let playback =
+                                playback_clone.load(std::sync::atomic::Ordering::Relaxed);
+                            if count <= playback + MAX_AHEAD {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+
+                        let sixel = ImageEncoder::encode(img);
+                        frames_clone
+                            .lock()
+                            .unwrap()
+                            .push(GifFrame { sixel, delay_ms });
+                    }
                 }
             }
+
+            // Video ended — loop by seeking back to the start
+            if input.seek(0, ..).is_err() {
+                break;
+            }
+            decoder.flush();
         }
 
         let _ = done_clone.set(());
@@ -536,6 +564,7 @@ pub fn encode_video_async(
     Some(PendingGif {
         frames,
         done,
+        playback_idx,
         estimated_rows,
         preview,
     })

@@ -40,6 +40,9 @@ Gifs can also be used:
 
 ![Terran Planet](example_gif.gif) ![Blackhole](example_gif_2.gif)
 
+## Videos
+
+![Nature](example_video.mp4)
 
 ## Code Blocks
 
