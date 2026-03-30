@@ -1268,16 +1268,17 @@ fn render_image_in_table_cell(
     let sixel_data = sixel::encode_rgba(padded_img.width(), snapped_h, padded_img.as_raw());
 
     // Build cell content:
-    // Line 1: sixel data (renders the image at cursor position)
-    // Lines 2..N: full blocks (█) colored as background for sizing/transparency
-    // The first row of blocks is on the same "line" as the sixel in comfy-table,
-    // but the terminal renders the sixel first.
-    let bg_block = format!("\x1b[0m{}", "\u{2588}".repeat(cols as usize));
+    // 1. Full block (█) rows provide the visible dimensions for comfy-table
+    // 2. After all rows, cursor-up back to the top and emit the sixel which renders
+    //    over the blocks
+    let bg_block = "\u{2588}".repeat(cols as usize);
     let mut cell_lines = Vec::with_capacity(rows as usize);
-    cell_lines.push(format!("{sixel_data}{bg_block}"));
-    for _ in 1..rows {
+    for _ in 0..rows {
         cell_lines.push(bg_block.clone());
     }
+    // After the last row, move cursor up and emit sixel to overwrite
+    let cursor_up = format!("\x1b[{}A\r", rows);
+    cell_lines.push(format!("{cursor_up}{sixel_data}"));
 
     state.table_cell_buf.push_str(&cell_lines.join("\n"));
 }
