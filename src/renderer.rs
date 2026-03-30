@@ -254,8 +254,6 @@ struct RenderState {
     code_blocks: Vec<CodeBlock>,
     /// Pending GIF animations, indexed by placeholder ID.
     pending_gifs: Vec<sixel::PendingGif>,
-    /// Byte offset in `out` where the current paragraph started (for wrapping).
-    para_start: Option<usize>,
     /// Terminal width for word wrapping.
     term_width: u16,
     /// Counter for assigning unique IDs to `<details>` blocks.
@@ -290,7 +288,6 @@ impl RenderState {
             pending_images: Vec::new(),
             code_blocks: Vec::new(),
             pending_gifs: Vec::new(),
-            para_start: None,
             term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
             next_details_id: 0,
         }
@@ -1132,17 +1129,12 @@ pub fn render(
                 }
             }
 
-            Event::Start(Tag::Paragraph) => {
-                state.para_start = Some(out.len());
-            }
+            Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
                 out.push_str(ansi::RESET);
-                // Word-wrap the paragraph content
-                if let Some(start) = state.para_start.take() {
-                    let para_text = out[start..].to_string();
-                    out.truncate(start);
-                    out.push_str(&ansi::wrap(&para_text, state.term_width));
-                }
+                // Word-wrap the paragraph text
+                let wrapped = ansi::wrap(&std::mem::take(&mut out), state.term_width);
+                out.push_str(&wrapped);
                 out.push_str("\n\n");
             }
 
