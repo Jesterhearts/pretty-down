@@ -430,13 +430,18 @@ fn handle_block_html(
             Ok(XmlEvent::Start(ref e)) => {
                 let name = xml_tag_name(e);
                 match name.as_str() {
-                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "pre" | "blockquote" => {
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "pre" | "blockquote"
+                    | "summary" => {
                         block_tag = Some(name.clone());
                         text_buf.clear();
                         if name == "pre" {
                             in_pre = true;
                         }
                     }
+                    // <details> — for now, always expanded. Just emit a
+                    // visual separator. </details> is handled as an End tag
+                    // with no matching block_tag, so it falls through.
+                    "details" => {}
                     "hr" => {
                         out.push_str(&"\u{2500}".repeat(40));
                         out.push('\n');
@@ -575,6 +580,16 @@ fn emit_block(
             out.push_str(&text);
             out.push_str(ansi::RESET);
             out.push_str("\n\n");
+        }
+        "summary" => {
+            if !text.is_empty() {
+                // Render summary as a bold line with a disclosure triangle
+                out.push_str(ansi::BOLD);
+                out.push_str("\u{25BC} "); // ▼
+                out.push_str(&text);
+                out.push_str(ansi::RESET);
+                out.push('\n');
+            }
         }
         _ => {
             if !text.is_empty() {
