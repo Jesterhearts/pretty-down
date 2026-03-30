@@ -451,7 +451,7 @@ fn draw_screen(
 
     let mut rows_used: u16 = 0;
     let mut line_idx = scroll_offset;
-    while line_idx < lines.len() && rows_used + lines[line_idx].rows() <= viewport_rows {
+    while line_idx < lines.len() && rows_used < viewport_rows {
         match &lines[line_idx] {
             Line::Text(text) => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
