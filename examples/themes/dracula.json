@@ -1,0 +1,17 @@
+{
+  "h1": { "fg": "#ff79c6", "bold": true },
+  "h2": { "fg": "#bd93f9", "bold": true },
+  "h3": { "fg": "#8be9fd", "bold": true },
+  "h4": { "fg": "#50fa7b", "bold": true },
+  "h5": { "fg": "#f1fa8c", "bold": true },
+  "h6": { "fg": "#ffb86c", "bold": true },
+  "bold": { "bold": true },
+  "italic": { "italic": true },
+  "strikethrough": { "strikethrough": true },
+  "code_inline": { "fg": "#f1fa8c" },
+  "code_block": { "fg": "#f8f8f2", "bg": "#44475a" },
+  "link": { "fg": "#8be9fd", "underline": true },
+  "blockquote": { "fg": "#6272a4", "italic": true },
+  "horizontal_rule": { "fg": "#6272a4" },
+  "details_summary": { "fg": "#bd93f9", "bold": true }
+}

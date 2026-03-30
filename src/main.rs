@@ -2,6 +2,7 @@ mod font;
 mod pager;
 mod renderer;
 mod sixel;
+mod theme;
 
 use std::io::IsTerminal;
 use std::io::Read;
@@ -20,6 +21,10 @@ struct Args {
     #[arg(short, long)]
     font: Option<PathBuf>,
 
+    /// Path to a theme JSON file
+    #[arg(short, long)]
+    theme: Option<PathBuf>,
+
     /// Print output directly without the pager
     #[arg(long)]
     no_pager: bool,
@@ -35,7 +40,7 @@ const EMBEDDED_FONT: &[u8] = include_bytes!("../fonts/Fairfax.ttf");
 fn main() {
     let args = Args::parse();
 
-    // Load font: use --font if specified, otherwise the embedded Fairfax
+    // Load font
     let font_data_owned;
     let font_data: &[u8] = match &args.font {
         Some(p) => {
@@ -52,6 +57,15 @@ fn main() {
         eprintln!("error: failed to parse font file");
         std::process::exit(1);
     });
+
+    // Load theme
+    let theme = match &args.theme {
+        Some(p) => theme::Theme::from_file(p).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }),
+        None => theme::Theme::default(),
+    };
 
     // Read markdown
     let (markdown, base_path) = match &args.file {
@@ -79,11 +93,9 @@ fn main() {
         }
     };
 
-    let output = renderer::render(&markdown, &font, base_path.as_deref());
+    let output = renderer::render(&markdown, &font, base_path.as_deref(), &theme);
 
     if args.no_pager || !std::io::stdout().is_terminal() {
-        // For non-pager mode, wait for all pending images and print with
-        // placeholders resolved
         for p in &output.pending_images {
             p.wait();
         }
@@ -98,12 +110,12 @@ fn main() {
         let render_fn: Box<dyn Fn() -> renderer::RenderOutput> = if let Some(file) = &args.file {
             let file = file.clone();
             let base = base_path.clone();
+            let theme = theme.clone();
             Box::new(move || {
                 let md = std::fs::read_to_string(&file).unwrap_or_default();
-                renderer::render(&md, &font, base.as_deref())
+                renderer::render(&md, &font, base.as_deref(), &theme)
             })
         } else {
-            // No file — render_fn just returns an empty output (stdin can't be re-read)
             Box::new(|| renderer::RenderOutput {
                 text: String::new(),
                 pending_images: Vec::new(),

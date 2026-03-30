@@ -121,16 +121,6 @@ mod ansi {
 /// Heading font sizes in pixels for h1..h6
 const HEADING_SIZES: [u32; 6] = [48, 40, 32, 28, 24, 20];
 
-/// Heading colors [r, g, b] for h1..h6
-const HEADING_COLORS: [[u8; 3]; 6] = [
-    [255, 255, 255],
-    [220, 220, 255],
-    [200, 220, 255],
-    [180, 210, 255],
-    [170, 200, 240],
-    [160, 190, 230],
-];
-
 struct RenderState {
     /// Text accumulated for the current heading (rendered as sixel)
     heading_text: String,
@@ -658,6 +648,7 @@ fn handle_block_html(
     state: &mut RenderState,
     out: &mut String,
     font: &Font,
+    theme: &crate::theme::Theme,
 ) {
     let html = html.trim();
     if html.is_empty() {
@@ -758,7 +749,7 @@ fn handle_block_html(
                     let id = state.next_details_id.saturating_sub(1);
                     out.push_str(&format!("\x00/DETAILS:{id}\x00\n"));
                 } else if block_tag.as_deref() == Some(&name) {
-                    emit_block(&name, &text_buf, state, out, font, in_pre);
+                    emit_block(&name, &text_buf, state, out, font, theme, in_pre);
                     block_tag = None;
                     text_buf.clear();
                     in_pre = false;
@@ -773,7 +764,7 @@ fn handle_block_html(
     // If there's leftover text with no block wrapper, output it
     if !text_buf.is_empty() {
         if let Some(tag) = &block_tag {
-            emit_block(tag, &text_buf, state, out, font, in_pre);
+            emit_block(tag, &text_buf, state, out, font, theme, in_pre);
         } else {
             out.push_str(&text_buf);
             out.push('\n');
@@ -788,6 +779,7 @@ fn emit_block(
     state: &mut RenderState,
     out: &mut String,
     font: &Font,
+    theme: &crate::theme::Theme,
     in_pre: bool,
 ) {
     let text = if in_pre {
@@ -801,8 +793,9 @@ fn emit_block(
             let level: usize = tag[1..].parse().unwrap_or(1);
             let idx = (level - 1).min(5);
             if !text.is_empty() {
+                let color = theme.heading_color(level);
                 let (w, h, pixels) =
-                    crate::font::render_text(font, &text, HEADING_SIZES[idx], HEADING_COLORS[idx]);
+                    crate::font::render_text(font, &text, HEADING_SIZES[idx], color);
                 if w > 0 && h > 0 {
                     out.push_str(&sixel::encode_rgba(w, h, &pixels));
                 }
@@ -946,6 +939,7 @@ pub fn render(
     markdown: &str,
     font: &Font,
     base_path: Option<&Path>,
+    theme: &crate::theme::Theme,
 ) -> RenderOutput {
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(markdown, options);
@@ -971,7 +965,7 @@ pub fn render(
                 if state.heading_level > 0 {
                     let idx = (state.heading_level - 1).min(5);
                     let size = HEADING_SIZES[idx];
-                    let color = HEADING_COLORS[idx];
+                    let color = theme.heading_color(state.heading_level);
                     let text = std::mem::take(&mut state.heading_text);
                     let (w, h, pixels) = crate::font::render_text(font, &text, size, color);
                     if w > 0 && h > 0 {
@@ -999,7 +993,7 @@ pub fn render(
             // ── Code blocks ──────────────────────────────────────────
             Event::Start(Tag::CodeBlock(_)) => {
                 state.in_code_block = true;
-                out.push_str(ansi::DIM);
+                out.push_str(&theme.code_block.to_ansi());
                 out.push_str("  ");
             }
             Event::End(TagEnd::CodeBlock) => {
@@ -1125,7 +1119,7 @@ pub fn render(
 
             // ── Block quote ──────────────────────────────────────────
             Event::Start(Tag::BlockQuote(_)) => {
-                out.push_str(ansi::DIM);
+                out.push_str(&theme.blockquote.to_ansi());
                 out.push_str("  \u{2502} ");
             }
             Event::End(TagEnd::BlockQuote(_)) => {
@@ -1146,7 +1140,7 @@ pub fn render(
                 } else if state.heading_level > 0 {
                     state.heading_text.push_str(&code);
                 } else {
-                    out.push_str(ansi::DIM);
+                    out.push_str(&theme.code_inline.to_ansi());
                     out.push_str(&code);
                     out.push_str(ansi::RESET);
                     state.push_style(&mut out);
@@ -1241,7 +1235,7 @@ pub fn render(
             }
             Event::End(TagEnd::HtmlBlock) => {
                 let html = std::mem::take(&mut state.html_block_buf);
-                handle_block_html(&html, &mut state, &mut out, font);
+                handle_block_html(&html, &mut state, &mut out, font, theme);
             }
             Event::Html(html) => {
                 state.html_block_buf.push_str(&html);

@@ -1,0 +1,17 @@
+{
+  "h1": { "fg": "#cb4b16", "bold": true },
+  "h2": { "fg": "#268bd2", "bold": true },
+  "h3": { "fg": "#859900", "bold": true },
+  "h4": { "fg": "#2aa198", "bold": true },
+  "h5": { "fg": "#d33682", "bold": true },
+  "h6": { "fg": "#6c71c4", "bold": true },
+  "bold": { "bold": true },
+  "italic": { "italic": true },
+  "strikethrough": { "strikethrough": true },
+  "code_inline": { "fg": "#b58900" },
+  "code_block": { "fg": "#839496", "bg": "#073642" },
+  "link": { "fg": "#268bd2", "underline": true },
+  "blockquote": { "fg": "#586e75", "italic": true },
+  "horizontal_rule": { "fg": "#586e75" },
+  "details_summary": { "fg": "#268bd2", "bold": true }
+}
