@@ -107,6 +107,7 @@ fn main() {
             Box::new(|| renderer::RenderOutput {
                 text: String::new(),
                 pending_images: Vec::new(),
+                pending_gifs: Vec::new(),
             })
         };
 

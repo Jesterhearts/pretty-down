@@ -173,6 +173,8 @@ struct RenderState {
     table_cell_code: bool,
     /// Pending background image encodes, indexed by placeholder ID.
     pending_images: Vec<sixel::PendingImage>,
+    /// Pending GIF animations, indexed by placeholder ID.
+    pending_gifs: Vec<sixel::PendingGif>,
     /// Byte offset in `out` where the current paragraph started (for wrapping).
     para_start: Option<usize>,
     /// Terminal width for word wrapping.
@@ -205,6 +207,7 @@ impl RenderState {
             table_cell_italic: false,
             table_cell_code: false,
             pending_images: Vec::new(),
+            pending_gifs: Vec::new(),
             para_start: None,
             term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
             next_details_id: 0,
@@ -215,15 +218,19 @@ impl RenderState {
         !self.table_alignments.is_empty()
     }
 
-    /// Emit a placeholder for a pending image and start background encoding.
+    /// Emit a placeholder for a pending image or GIF.
     fn emit_image(
         &mut self,
         path: &std::path::Path,
         out: &mut String,
     ) {
-        if let Some(pending) = sixel::encode_image_file_async(path, 800) {
+        // Try GIF first (returns None for non-GIF files), fall back to static
+        if let Some(pending) = sixel::encode_gif_async(path, 800) {
+            let id = self.pending_gifs.len();
+            out.push_str(&format!("\x00GIF:{id}:{}\x00\n", pending.estimated_rows));
+            self.pending_gifs.push(pending);
+        } else if let Some(pending) = sixel::encode_image_file_async(path, 800) {
             let id = self.pending_images.len();
-            // Placeholder format recognized by the pager
             out.push_str(&format!("\x00IMG:{id}:{}\x00\n", pending.estimated_rows));
             self.pending_images.push(pending);
         }
@@ -925,6 +932,7 @@ fn flush_table(
 pub struct RenderOutput {
     pub text: String,
     pub pending_images: Vec<sixel::PendingImage>,
+    pub pending_gifs: Vec<sixel::PendingGif>,
 }
 
 /// Render markdown to a string containing ANSI escape codes, sixel sequences,
@@ -1247,5 +1255,6 @@ pub fn render(
     RenderOutput {
         text: out,
         pending_images: state.pending_images,
+        pending_gifs: state.pending_gifs,
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::io::{
@@ -41,6 +42,8 @@ enum Line {
     DetailsSummary { id: usize, text: String },
     /// End of a `<details>` block (invisible marker, zero height).
     DetailsEnd { id: usize },
+    /// An animated GIF placeholder.
+    Gif { id: usize, estimated_rows: u16 },
 }
 
 impl Line {
@@ -49,7 +52,9 @@ impl Line {
         match self {
             Line::Text(_) => 1,
             Line::Sixel { height, .. } => *height,
-            Line::PendingImage { estimated_rows, .. } => *estimated_rows,
+            Line::PendingImage { estimated_rows, .. } | Line::Gif { estimated_rows, .. } => {
+                *estimated_rows
+            }
             Line::DetailsSummary { .. } => 1,
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => 0,
         }
@@ -161,6 +166,14 @@ fn parse_marker(
             let id: usize = parts[1].parse().unwrap_or(0);
             let text = parts[2].to_string();
             lines.push(Line::DetailsSummary { id, text });
+        }
+        Some("GIF") if parts.len() == 3 => {
+            let id: usize = parts[1].parse().unwrap_or(0);
+            let rows: u16 = parts[2].parse().unwrap_or(3);
+            lines.push(Line::Gif {
+                id,
+                estimated_rows: rows,
+            });
         }
         Some("/DETAILS") if parts.len() >= 2 => {
             let id: usize = parts[1].parse().unwrap_or(0);
@@ -274,6 +287,7 @@ pub fn run(
 ) {
     let mut lines = split_lines(&output.text);
     let mut pending = &output.pending_images;
+    let mut pending_gifs = &output.pending_gifs;
     // Owned storage for when we re-render
     #[allow(unused_assignments)]
     let mut current_output: Option<RenderOutput> = None;
@@ -333,19 +347,73 @@ pub fn run(
         overflow: None,
         summary_rows: Vec::new(),
     };
+    let mut gif_frames: HashMap<usize, usize> = HashMap::new();
+    let mut next_frame_time: Option<std::time::Instant> = None;
 
     loop {
+        // Check if it's time to advance GIF frames
+        if let Some(t) = next_frame_time
+            && std::time::Instant::now() >= t
+        {
+            let mut min_delay = u32::MAX;
+            let gifs = &output.pending_gifs;
+            for (id, frame_idx) in gif_frames.iter_mut() {
+                if let Some(gif) = gifs.get(*id) {
+                    let count = gif.frame_count();
+                    if count > 1 {
+                        *frame_idx = (*frame_idx + 1) % count;
+                        if let Some(frame) = gif.frame(*frame_idx) {
+                            min_delay = min_delay.min(frame.delay_ms);
+                        }
+                    }
+                }
+            }
+            if min_delay < u32::MAX {
+                next_frame_time =
+                    Some(std::time::Instant::now() + Duration::from_millis(min_delay as u64));
+            } else {
+                next_frame_time = None;
+            }
+            needs_redraw = true;
+        }
+
         if needs_redraw {
             last_draw = draw_screen(
                 &mut stdout,
                 &lines,
                 &visible,
                 &collapsed,
+                pending_gifs,
+                &gif_frames,
                 scroll_offset,
                 viewport_rows,
                 term_rows,
                 watching,
             );
+
+            // Start GIF animation timer if there are visible animated GIFs
+            if next_frame_time.is_none() {
+                let mut min_delay = u32::MAX;
+                for &vi in &visible[scroll_offset..] {
+                    if let Line::Gif { id, .. } = &lines[vi] {
+                        let gifs = pending_gifs;
+                        if let Some(gif) = gifs.get(*id) {
+                            if gif.frame_count() > 1 {
+                                gif_frames.entry(*id).or_insert(0);
+                                if let Some(frame) = gif.frame(0) {
+                                    min_delay = min_delay.min(frame.delay_ms);
+                                }
+                            } else if gif.frame_count() == 1 {
+                                gif_frames.entry(*id).or_insert(0);
+                            }
+                        }
+                    }
+                }
+                if min_delay < u32::MAX {
+                    next_frame_time =
+                        Some(std::time::Instant::now() + Duration::from_millis(min_delay as u64));
+                }
+            }
             if let Some(ref ov) = last_draw.overflow {
                 match scroll_dir {
                     ScrollDir::Down => {
@@ -390,6 +458,9 @@ pub fn run(
             visible = visible_indices(&lines, &collapsed);
             current_output = Some(new_output);
             pending = &current_output.as_ref().unwrap().pending_images;
+            pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
+            gif_frames.clear();
+            next_frame_time = None;
             if scroll_offset >= visible.len() {
                 scroll_offset = visible.len().saturating_sub(1);
             }
@@ -409,7 +480,11 @@ pub fn run(
             }
         }
 
-        let poll_timeout = if watching || had_pending {
+        let poll_timeout = if let Some(t) = next_frame_time {
+            // GIF animation: poll with short timeout to hit frame deadlines
+            t.saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_millis(1))
+        } else if watching || had_pending {
             Duration::from_millis(50)
         } else {
             Duration::from_secs(60)
@@ -579,6 +654,9 @@ pub fn run(
                     visible = visible_indices(&lines, &collapsed);
                     current_output = Some(new_output);
                     pending = &current_output.as_ref().unwrap().pending_images;
+                    pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
+                    gif_frames.clear();
+                    next_frame_time = None;
                     if scroll_offset >= visible.len() {
                         scroll_offset = visible.len().saturating_sub(1);
                     }
@@ -636,6 +714,17 @@ pub fn print_output(output: &RenderOutput) {
                     }
                 }
             }
+            Line::Gif { id, .. } => {
+                // Non-pager: just show first frame
+                if let Some(gif) = output.pending_gifs.get(*id) {
+                    while !gif.is_done() && gif.frame_count() == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    if let Some(frame) = gif.frame(0) {
+                        println!("{}", frame.sixel);
+                    }
+                }
+            }
             Line::DetailsSummary { text, .. } => {
                 println!("\x1b[1m\u{25BC} {text}\x1b[0m");
             }
@@ -666,6 +755,8 @@ fn draw_screen(
     lines: &[Line],
     visible: &[usize],
     collapsed: &HashSet<usize>,
+    gifs: &[crate::sixel::PendingGif],
+    gif_frames: &HashMap<usize, usize>,
     scroll_offset: usize,
     viewport_rows: u16,
     term_rows: u16,
@@ -710,6 +801,29 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
                 rows_used += 1;
+            }
+            Line::Gif { id, estimated_rows } => {
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                let frame_idx = gif_frames.get(id).copied().unwrap_or(0);
+                if let Some(gif) = gifs.get(*id) {
+                    if let Some(frame) = gif.frame(frame_idx) {
+                        write!(stdout, "{}", frame.sixel).unwrap();
+                        rows_used += estimated_rows;
+                        if rows_used > viewport_rows {
+                            overflow = Some(Overflow {
+                                rows: rows_used - viewport_rows,
+                                vis_idx,
+                            });
+                            vis_idx += 1;
+                            break;
+                        }
+                    } else {
+                        write!(stdout, "\x1b[2m  [loading gif...]\x1b[0m\r").unwrap();
+                        rows_used += 1;
+                    }
+                } else {
+                    rows_used += estimated_rows;
+                }
             }
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {
                 // Invisible markers, zero height
