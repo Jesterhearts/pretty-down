@@ -347,37 +347,36 @@ pub fn run(
         overflow: None,
         summary_rows: Vec::new(),
     };
-    let mut gif_frames: HashMap<usize, usize> = HashMap::new();
-    let mut next_frame_time: Option<std::time::Instant> = None;
+    // Per-GIF animation state: (current frame index, next frame deadline)
+    let mut gif_state: HashMap<usize, (usize, std::time::Instant)> = HashMap::new();
 
     loop {
-        // Check if it's time to advance GIF frames
-        if let Some(t) = next_frame_time
-            && std::time::Instant::now() >= t
-        {
-            let mut min_delay = u32::MAX;
-            let gifs = &output.pending_gifs;
-            for (id, frame_idx) in gif_frames.iter_mut() {
-                if let Some(gif) = gifs.get(*id) {
-                    let count = gif.frame_count();
-                    if count > 1 {
-                        *frame_idx = (*frame_idx + 1) % count;
-                        if let Some(frame) = gif.frame(*frame_idx) {
-                            min_delay = min_delay.min(frame.delay_ms);
-                        }
+        // Advance any GIFs whose frame deadline has passed
+        let now = std::time::Instant::now();
+        let mut any_advanced = false;
+        for (id, (frame_idx, deadline)) in gif_state.iter_mut() {
+            if now >= *deadline
+                && let Some(gif) = pending_gifs.get(*id)
+            {
+                let count = gif.frame_count();
+                if count > 1 {
+                    *frame_idx = (*frame_idx + 1) % count;
+                    if let Some(frame) = gif.frame(*frame_idx) {
+                        *deadline = now + Duration::from_millis(frame.delay_ms as u64);
                     }
+                    any_advanced = true;
                 }
             }
-            if min_delay < u32::MAX {
-                next_frame_time =
-                    Some(std::time::Instant::now() + Duration::from_millis(min_delay as u64));
-            } else {
-                next_frame_time = None;
-            }
+        }
+        if any_advanced {
             needs_redraw = true;
         }
 
         if needs_redraw {
+            // Build the frame index map for draw_screen
+            let gif_frames: HashMap<usize, usize> =
+                gif_state.iter().map(|(id, (idx, _))| (*id, *idx)).collect();
+
             last_draw = draw_screen(
                 &mut stdout,
                 &lines,
@@ -391,27 +390,20 @@ pub fn run(
                 watching,
             );
 
-            // Start GIF animation timer if there are visible animated GIFs
-            if next_frame_time.is_none() {
-                let mut min_delay = u32::MAX;
-                for &vi in &visible[scroll_offset..] {
-                    if let Line::Gif { id, .. } = &lines[vi] {
-                        let gifs = pending_gifs;
-                        if let Some(gif) = gifs.get(*id) {
-                            if gif.frame_count() > 1 {
-                                gif_frames.entry(*id).or_insert(0);
-                                if let Some(frame) = gif.frame(0) {
-                                    min_delay = min_delay.min(frame.delay_ms);
-                                }
-                            } else if gif.frame_count() == 1 {
-                                gif_frames.entry(*id).or_insert(0);
-                            }
-                        }
-                    }
-                }
-                if min_delay < u32::MAX {
-                    next_frame_time =
-                        Some(std::time::Instant::now() + Duration::from_millis(min_delay as u64));
+            // Register any newly visible GIFs that aren't tracked yet
+            for &vi in &visible[scroll_offset..] {
+                if let Line::Gif { id, .. } = &lines[vi] {
+                    gif_state.entry(*id).or_insert_with(|| {
+                        let delay = pending_gifs
+                            .get(*id)
+                            .and_then(|g| g.frame(0))
+                            .map(|f| f.delay_ms)
+                            .unwrap_or(100);
+                        (
+                            0,
+                            std::time::Instant::now() + Duration::from_millis(delay as u64),
+                        )
+                    });
                 }
             }
             if let Some(ref ov) = last_draw.overflow {
@@ -459,8 +451,7 @@ pub fn run(
             current_output = Some(new_output);
             pending = &current_output.as_ref().unwrap().pending_images;
             pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
-            gif_frames.clear();
-            next_frame_time = None;
+            gif_state.clear();
             if scroll_offset >= visible.len() {
                 scroll_offset = visible.len().saturating_sub(1);
             }
@@ -480,8 +471,10 @@ pub fn run(
             }
         }
 
-        let poll_timeout = if let Some(t) = next_frame_time {
-            // GIF animation: poll with short timeout to hit frame deadlines
+        // Find the earliest GIF frame deadline
+        let next_gif_deadline = gif_state.values().map(|(_, deadline)| *deadline).min();
+
+        let poll_timeout = if let Some(t) = next_gif_deadline {
             t.saturating_duration_since(std::time::Instant::now())
                 .max(Duration::from_millis(1))
         } else if watching || had_pending {
@@ -655,8 +648,7 @@ pub fn run(
                     current_output = Some(new_output);
                     pending = &current_output.as_ref().unwrap().pending_images;
                     pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
-                    gif_frames.clear();
-                    next_frame_time = None;
+                    gif_state.clear();
                     if scroll_offset >= visible.len() {
                         scroll_offset = visible.len().saturating_sub(1);
                     }

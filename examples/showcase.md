@@ -34,6 +34,13 @@ Images are loaded and rendered inline as sixel graphics:
 
 ![Mountain landscape](example_image.png)
 
+## Gifs
+
+Gifs can also be used:
+
+![Terran Planet](example_gif.gif) ![Blackhole](example_gif_2.gif)
+
+
 ## Code Blocks
 
 ```rust
