@@ -365,22 +365,131 @@ pub fn is_video(path: &std::path::Path) -> bool {
     })
 }
 
+/// Decode the first video frame and generate a half-block preview.
+fn decode_first_frame_preview(
+    path: &std::path::Path,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    estimated_rows: u16,
+) -> Vec<String> {
+    use ffmpeg_next as ffmpeg;
+
+    let try_decode = || -> Option<Vec<String>> {
+        let mut input = ffmpeg::format::input(path).ok()?;
+        let stream = input.streams().best(ffmpeg::media::Type::Video)?;
+        let stream_index = stream.index();
+        let codec_params = stream.parameters();
+
+        let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)
+            .ok()?
+            .decoder()
+            .video()
+            .ok()?;
+
+        let mut scaler = ffmpeg::software::scaling::context::Context::get(
+            decoder.format(),
+            src_width,
+            src_height,
+            ffmpeg::format::Pixel::RGBA,
+            dst_width,
+            dst_height,
+            ffmpeg::software::scaling::Flags::BILINEAR,
+        )
+        .ok()?;
+
+        for (s, packet) in input.packets() {
+            if s.index() != stream_index {
+                continue;
+            }
+            decoder.send_packet(&packet).ok()?;
+            let mut decoded = ffmpeg::frame::Video::empty();
+            if decoder.receive_frame(&mut decoded).is_ok() {
+                let mut rgb_frame = ffmpeg::frame::Video::empty();
+                scaler.run(&decoded, &mut rgb_frame).ok()?;
+                let data = rgb_frame.data(0);
+                let expected = dst_width as usize * dst_height as usize * 4;
+                if data.len() >= expected
+                    && let Some(img) =
+                        RgbaImage::from_raw(dst_width, dst_height, data[..expected].to_vec())
+                {
+                    let cell_w = crossterm::terminal::window_size()
+                        .ok()
+                        .and_then(|ws| {
+                            if ws.width > 0 && ws.columns > 0 {
+                                Some(ws.width as u32 / ws.columns as u32)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(8);
+                    let preview_cols = (dst_width / cell_w).max(1);
+                    return Some(half_block_preview(&img, preview_cols, estimated_rows));
+                }
+            }
+        }
+        None
+    };
+
+    try_decode().unwrap_or_default()
+}
+
 /// Load a video file and start decoding/encoding frames in a background thread.
-/// Returns `None` if the file doesn't look like a video.
-/// All ffmpeg work (init, probe, decode) happens on the background thread
-/// so the main thread returns immediately.
+/// Returns `None` if the file doesn't look like a video or can't be opened.
+/// Probes dimensions and decodes the first frame for a half-block preview
+/// on the main thread (fast), then spawns a background thread for full
+/// frame-by-frame encoding.
 pub fn encode_video_async(
     path: &std::path::Path,
     max_width: u32,
 ) -> Option<PendingGif> {
+    use ffmpeg_next as ffmpeg;
+
     if !is_video(path) {
         return None;
     }
 
-    // We can't probe dimensions without opening the file, so use a
-    // reasonable estimate. The background thread will decode at the
-    // correct size.
-    let estimated_rows = 15; // will be approximate until first frame
+    ffmpeg::init().ok()?;
+
+    // Probe dimensions and frame rate
+    let input = ffmpeg::format::input(path).ok()?;
+    let stream = input.streams().best(ffmpeg::media::Type::Video)?;
+
+    let rate = stream.avg_frame_rate();
+    let _delay_ms = if rate.numerator() > 0 && rate.denominator() > 0 {
+        (1000 * rate.denominator() as u64 / rate.numerator() as u64) as u32
+    } else {
+        33
+    };
+
+    let codec_params = stream.parameters();
+    let decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)
+        .ok()?
+        .decoder()
+        .video()
+        .ok()?;
+
+    let src_width = decoder.width();
+    let src_height = decoder.height();
+    let (dst_width, dst_height) = if src_width > max_width {
+        let h = (src_height as f64 * max_width as f64 / src_width as f64) as u32;
+        (max_width, h)
+    } else {
+        (src_width, src_height)
+    };
+
+    let estimated_rows = pixel_height_to_rows(dst_height);
+
+    // Decode first frame for half-block preview
+    let _preview = decode_first_frame_preview(
+        path,
+        src_width,
+        src_height,
+        dst_width,
+        dst_height,
+        estimated_rows,
+    );
 
     let frames = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(OnceLock::new());
@@ -391,13 +500,6 @@ pub fn encode_video_async(
     let path = path.to_owned();
 
     std::thread::spawn(move || {
-        use ffmpeg_next as ffmpeg;
-
-        if ffmpeg::init().is_err() {
-            let _ = done_clone.set(());
-            return;
-        }
-
         let Ok(mut input) = ffmpeg::format::input(&path) else {
             let _ = done_clone.set(());
             return;
