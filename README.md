@@ -8,7 +8,7 @@
 > in-terminal pretty rendering of markdown files which goes beyond syntax highlighting and is closer
 > to what you would get rendering with a browser or with e.g. vscode's markdown preview.
 
-![demo](demo.webm)
+![demo](demo.mp4)
 
 A CLI tool that renders markdown in the terminal using [Sixel](https://en.wikipedia.org/wiki/Sixel)
 graphics. Headings are rendered as actual rasterized text with larger fonts, and
