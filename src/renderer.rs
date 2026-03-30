@@ -251,67 +251,43 @@ struct TableCell {
     image: Option<TableCellImage>,
 }
 
+/// State for table parsing — created on Start(Table), consumed on flush.
+struct TableState {
+    alignments: Vec<Alignment>,
+    in_head: bool,
+    cell_buf: String,
+    cell_image: Option<TableCellImage>,
+    row_cells: Vec<TableCell>,
+    header: Option<Vec<TableCell>>,
+    rows: Vec<Vec<TableCell>>,
+    cell_bold: bool,
+    cell_italic: bool,
+    cell_code: bool,
+}
+
 struct RenderState {
-    /// Text accumulated for the current heading (rendered as sixel)
     heading_text: String,
-    /// Current heading level (0 = not in heading)
     heading_level: usize,
-    /// Whether we are inside bold
     bold: bool,
-    /// Whether we are inside italic
     italic: bool,
-    /// Whether we are inside strikethrough
     strikethrough: bool,
-    /// Current link URL (if inside a link)
     link_url: Option<String>,
-    /// Whether we are inside a code block
     in_code_block: bool,
-    /// Whether we are inside an image tag (suppress alt text)
     in_image: bool,
-    /// Blockquote nesting depth
     blockquote_depth: usize,
-    /// Language of the current code block (for syntax highlighting)
     code_lang: Option<String>,
-    /// Accumulated code block content (for syntax highlighting)
     code_buf: String,
-    /// List nesting with item index (None = unordered, Some(n) = ordered
-    /// starting at n)
     list_stack: Vec<Option<u64>>,
-    /// Whether we just started a list item (for prefix)
     item_index: Vec<usize>,
-    /// Base path for resolving relative image paths
     base_path: Option<std::path::PathBuf>,
-    /// Accumulator for block-level HTML (multiple Html events before
-    /// End(HtmlBlock))
     html_block_buf: String,
-    /// Table column alignments (set on Start(Table))
-    table_alignments: Vec<Alignment>,
-    /// Whether we are in the header row
-    in_table_head: bool,
-    /// Accumulated text for the current table cell
-    table_cell_buf: String,
-    /// Image data for the current table cell (if any)
-    table_cell_image: Option<TableCellImage>,
-    /// Cells collected for the current row
-    table_row_cells: Vec<TableCell>,
-    /// All collected rows: header row (if any) + data rows
-    table_header: Option<Vec<TableCell>>,
-    table_rows: Vec<Vec<TableCell>>,
-    /// Track inline styles within table cells
-    table_cell_bold: bool,
-    table_cell_italic: bool,
-    table_cell_code: bool,
-    /// Pending background image encodes, indexed by placeholder ID.
+    /// Active table parsing state (None when not inside a table).
+    table: Option<TableState>,
     pending_images: Vec<sixel::PendingImage>,
-    /// Rendered code blocks for horizontal scrolling.
     code_blocks: Vec<CodeBlock>,
-    /// Pending GIF animations, indexed by placeholder ID.
     pending_gifs: Vec<sixel::PendingGif>,
-    /// Terminal width for word wrapping.
     term_width: u16,
-    /// Counter for assigning unique IDs to `<details>` blocks.
     next_details_id: usize,
-    /// Image paths buffered during a paragraph for side-by-side detection.
     para_images: Vec<std::path::PathBuf>,
 }
 
@@ -333,16 +309,7 @@ impl RenderState {
             item_index: Vec::new(),
             base_path,
             html_block_buf: String::new(),
-            table_alignments: Vec::new(),
-            in_table_head: false,
-            table_cell_buf: String::new(),
-            table_cell_image: None,
-            table_row_cells: Vec::new(),
-            table_header: None,
-            table_rows: Vec::new(),
-            table_cell_bold: false,
-            table_cell_italic: false,
-            table_cell_code: false,
+            table: None,
             pending_images: Vec::new(),
             code_blocks: Vec::new(),
             pending_gifs: Vec::new(),
@@ -353,7 +320,11 @@ impl RenderState {
     }
 
     fn in_table(&self) -> bool {
-        !self.table_alignments.is_empty()
+        self.table.is_some()
+    }
+
+    fn table(&mut self) -> &mut TableState {
+        self.table.as_mut().expect("not inside a table")
     }
 
     /// Start background encoding for an image or GIF and emit an output block.
@@ -364,26 +335,11 @@ impl RenderState {
         blocks: &mut Vec<OutputBlock>,
     ) {
         let max_w = sixel::terminal_pixel_width();
-        // Try video first — cap at half terminal width for speed
-        if sixel::is_video(path)
-            && let Some(pending) = sixel::encode_video_async(path, max_w / 2)
-        {
-            let id = self.pending_gifs.len();
+        if let Some(media) = encode_media(path, max_w) {
             flush_text(out, blocks);
-            blocks.push(OutputBlock::Gif(id));
-            self.pending_gifs.push(pending);
-            return;
-        }
-        if let Some(pending) = sixel::encode_gif_async(path, max_w) {
-            let id = self.pending_gifs.len();
-            flush_text(out, blocks);
-            blocks.push(OutputBlock::Gif(id));
-            self.pending_gifs.push(pending);
-        } else if let Some(pending) = sixel::encode_image_file_async(path, max_w) {
-            let id = self.pending_images.len();
-            flush_text(out, blocks);
-            blocks.push(OutputBlock::Image(id));
-            self.pending_images.push(pending);
+            push_media(media, &mut self.pending_images, &mut self.pending_gifs, blocks);
+        } else {
+            out.push_str(&format!("\x1b[2m[image: {}]\x1b[0m", path.display()));
         }
     }
 }
@@ -1040,9 +996,10 @@ fn flush_table(
     out: &mut String,
     blocks: &mut Vec<OutputBlock>,
 ) {
-    let header_cells = state.table_header.take();
-    let row_cells = std::mem::take(&mut state.table_rows);
-    let alignments = state.table_alignments.clone();
+    let table = state.table.take().expect("flush_table called outside table");
+    let header_cells = table.header;
+    let row_cells = table.rows;
+    let alignments = table.alignments;
 
     let build_rendered_row =
         |cells: &[TableCell], is_header: bool| -> Vec<RenderedTableCell> {
@@ -1106,7 +1063,6 @@ fn flush_table(
         rows,
     }));
 
-    state.table_alignments.clear();
 }
 
 fn styled_cell_text(cell: &TableCell, is_header: bool) -> String {
@@ -1189,6 +1145,70 @@ fn flush_text(
 ) {
     if !out.is_empty() {
         blocks.push(OutputBlock::Text(std::mem::take(out)));
+    }
+}
+
+/// Result of encoding an image/GIF/video asynchronously.
+enum EncodedMedia {
+    Image(sixel::PendingImage),
+    Gif(sixel::PendingGif),
+}
+
+/// Try to encode a media file asynchronously: video → GIF → static image.
+/// Returns None if all encoding attempts fail.
+fn encode_media(path: &std::path::Path, max_width: u32) -> Option<EncodedMedia> {
+    if sixel::is_video(path) {
+        if let Some(pending) = sixel::encode_video_async(path, max_width) {
+            return Some(EncodedMedia::Gif(pending));
+        }
+    }
+    if let Some(pending) = sixel::encode_gif_async(path, max_width) {
+        return Some(EncodedMedia::Gif(pending));
+    }
+    if let Some(pending) = sixel::encode_image_file_async(path, max_width) {
+        return Some(EncodedMedia::Image(pending));
+    }
+    None
+}
+
+/// Push encoded media into the appropriate pending vec and emit an output block.
+fn push_media(
+    media: EncodedMedia,
+    pending_images: &mut Vec<sixel::PendingImage>,
+    pending_gifs: &mut Vec<sixel::PendingGif>,
+    blocks: &mut Vec<OutputBlock>,
+) {
+    match media {
+        EncodedMedia::Gif(pending) => {
+            let id = pending_gifs.len();
+            blocks.push(OutputBlock::Gif(id));
+            pending_gifs.push(pending);
+        }
+        EncodedMedia::Image(pending) => {
+            let id = pending_images.len();
+            blocks.push(OutputBlock::Image(id));
+            pending_images.push(pending);
+        }
+    }
+}
+
+/// Push encoded media and return a SideBySideItem.
+fn push_media_side_by_side(
+    media: EncodedMedia,
+    pending_images: &mut Vec<sixel::PendingImage>,
+    pending_gifs: &mut Vec<sixel::PendingGif>,
+) -> SideBySideItem {
+    match media {
+        EncodedMedia::Gif(pending) => {
+            let id = pending_gifs.len();
+            pending_gifs.push(pending);
+            SideBySideItem::Gif(id)
+        }
+        EncodedMedia::Image(pending) => {
+            let id = pending_images.len();
+            pending_images.push(pending);
+            SideBySideItem::Image(id)
+        }
     }
 }
 
@@ -1284,24 +1304,13 @@ fn flush_para_images(
     let max_w = sixel::terminal_pixel_width();
 
     if images.len() == 1 {
-        // Single image — encode at full width
-        let path = &images[0];
-        if sixel::is_video(path) {
-            if let Some(pending) = sixel::encode_video_async(path, max_w / 2) {
-                let id = state.pending_gifs.len();
-                blocks.push(OutputBlock::Gif(id));
-                state.pending_gifs.push(pending);
-                return;
-            }
-        }
-        if let Some(pending) = sixel::encode_gif_async(path, max_w) {
-            let id = state.pending_gifs.len();
-            blocks.push(OutputBlock::Gif(id));
-            state.pending_gifs.push(pending);
-        } else if let Some(pending) = sixel::encode_image_file_async(path, max_w) {
-            let id = state.pending_images.len();
-            blocks.push(OutputBlock::Image(id));
-            state.pending_images.push(pending);
+        if let Some(media) = encode_media(&images[0], max_w) {
+            push_media(media, &mut state.pending_images, &mut state.pending_gifs, blocks);
+        } else {
+            blocks.push(OutputBlock::Text(format!(
+                "\x1b[2m[image: {}]\x1b[0m",
+                images[0].display()
+            )));
         }
         return;
     }
@@ -1309,28 +1318,23 @@ fn flush_para_images(
     // Multiple images — encode each at max_w / n for side-by-side
     let per_image_w = max_w / images.len() as u32;
     let mut items = Vec::new();
-
     for path in images {
-        if sixel::is_video(path) {
-            if let Some(pending) = sixel::encode_video_async(path, per_image_w) {
-                let id = state.pending_gifs.len();
-                items.push(SideBySideItem::Gif(id));
-                state.pending_gifs.push(pending);
-                continue;
-            }
-        }
-        if let Some(pending) = sixel::encode_gif_async(path, per_image_w) {
-            let id = state.pending_gifs.len();
-            items.push(SideBySideItem::Gif(id));
-            state.pending_gifs.push(pending);
-        } else if let Some(pending) = sixel::encode_image_file_async(path, per_image_w) {
-            let id = state.pending_images.len();
-            items.push(SideBySideItem::Image(id));
-            state.pending_images.push(pending);
+        if let Some(media) = encode_media(path, per_image_w) {
+            items.push(push_media_side_by_side(
+                media,
+                &mut state.pending_images,
+                &mut state.pending_gifs,
+            ));
         }
     }
-
-    if !items.is_empty() {
+    if items.is_empty() {
+        // All encodings failed — show fallback text
+        let names: Vec<_> = images.iter().map(|p| format!("{}", p.display())).collect();
+        blocks.push(OutputBlock::Text(format!(
+            "\x1b[2m[images: {}]\x1b[0m",
+            names.join(", ")
+        )));
+    } else {
         blocks.push(OutputBlock::SideBySide(items));
     }
 }
@@ -1396,13 +1400,14 @@ fn render_image_in_table_cell(
     let max_cols: u32 = 30;
     let max_px = max_cols * sixel::cell_pixel_width();
 
-    // Try video or animated GIF
-    let pending_anim = if sixel::is_video(path) {
+    // Try animated encoding (video/GIF) — skip static async since
+    // table cells use synchronous encoding with height snapping
+    let animated = if sixel::is_video(path) {
         sixel::encode_video_async(path, max_px)
     } else {
         sixel::encode_gif_async(path, max_px)
     };
-    if let Some(pending) = pending_anim {
+    if let Some(pending) = animated {
         let gif_id = state.pending_gifs.len();
         let cols = pending
             .preview
@@ -1413,7 +1418,7 @@ fn render_image_in_table_cell(
         let rows = pending.estimated_rows;
         let preview = pending.preview.clone();
         state.pending_gifs.push(pending);
-        state.table_cell_image = Some(TableCellImage {
+        state.table().cell_image = Some(TableCellImage {
             sixel: None,
             gif_id: Some(gif_id),
             preview,
@@ -1423,7 +1428,7 @@ fn render_image_in_table_cell(
         return;
     }
 
-    // Static image fallback
+    // Static image fallback — synchronous encoding with height snapping
     let img = match image::open(path) {
         Ok(img) => img.to_rgba8(),
         Err(_) => return,
@@ -1445,7 +1450,7 @@ fn render_image_in_table_cell(
     let sixel = sixel::encode_rgba(padded.width(), snapped_h, padded.as_raw());
     let preview = sixel::half_block_preview(&img, cols, rows);
 
-    state.table_cell_image = Some(TableCellImage {
+    state.table().cell_image = Some(TableCellImage {
         sixel: Some(sixel),
         gif_id: None,
         preview,
@@ -1509,7 +1514,7 @@ pub fn render(
             // ── Inline styling ───────────────────────────────────────
             Event::Start(Tag::Emphasis) => {
                 if state.in_table() {
-                    state.table_cell_italic = true;
+                    state.table().cell_italic = true;
                 } else {
                     state.italic = true;
                     if state.heading_level == 0 {
@@ -1519,7 +1524,7 @@ pub fn render(
             }
             Event::End(TagEnd::Emphasis) => {
                 if state.in_table() {
-                    state.table_cell_italic = false;
+                    state.table().cell_italic = false;
                 } else {
                     state.italic = false;
                     if state.heading_level == 0 {
@@ -1531,7 +1536,7 @@ pub fn render(
 
             Event::Start(Tag::Strong) => {
                 if state.in_table() {
-                    state.table_cell_bold = true;
+                    state.table().cell_bold = true;
                 } else {
                     state.bold = true;
                     if state.heading_level == 0 {
@@ -1541,7 +1546,7 @@ pub fn render(
             }
             Event::End(TagEnd::Strong) => {
                 if state.in_table() {
-                    state.table_cell_bold = false;
+                    state.table().cell_bold = false;
                 } else {
                     state.bold = false;
                     if state.heading_level == 0 {
@@ -1651,8 +1656,8 @@ pub fn render(
             // ── Inline code ──────────────────────────────────────────
             Event::Code(code) => {
                 if state.in_table() {
-                    state.table_cell_buf.push_str(&code);
-                    state.table_cell_code = true;
+                    state.table().cell_buf.push_str(&code);
+                    state.table().cell_code = true;
                 } else if state.heading_level > 0 {
                     state.heading_text.push_str(&code);
                 } else {
@@ -1668,7 +1673,7 @@ pub fn render(
                 if state.in_image {
                     // Suppress alt text — image is rendered as sixel
                 } else if state.in_table() {
-                    state.table_cell_buf.push_str(&text);
+                    state.table().cell_buf.push_str(&text);
                 } else if state.heading_level > 0 {
                     state.heading_text.push_str(&text);
                 } else if state.in_code_block {
@@ -1680,7 +1685,7 @@ pub fn render(
 
             Event::SoftBreak => {
                 if state.in_table() {
-                    state.table_cell_buf.push(' ');
+                    state.table().cell_buf.push(' ');
                 } else if state.heading_level > 0 {
                     state.heading_text.push(' ');
                 } else {
@@ -1689,7 +1694,7 @@ pub fn render(
             }
             Event::HardBreak => {
                 if state.in_table() {
-                    state.table_cell_buf.push(' ');
+                    state.table().cell_buf.push(' ');
                 } else if state.heading_level > 0 {
                     state.heading_text.push(' ');
                 } else {
@@ -1699,45 +1704,54 @@ pub fn render(
 
             // ── Tables ────────────────────────────────────────────────
             Event::Start(Tag::Table(alignments)) => {
-                state.table_alignments = alignments;
-                state.table_header = None;
-                state.table_rows.clear();
+                state.table = Some(TableState {
+                    alignments,
+                    in_head: false,
+                    cell_buf: String::new(),
+                    cell_image: None,
+                    row_cells: Vec::new(),
+                    header: None,
+                    rows: Vec::new(),
+                    cell_bold: false,
+                    cell_italic: false,
+                    cell_code: false,
+                });
             }
             Event::End(TagEnd::Table) => {
                 flush_table(&mut state, &mut out, &mut blocks);
             }
             Event::Start(Tag::TableHead) => {
-                state.in_table_head = true;
-                state.table_row_cells.clear();
+                state.table().in_head = true;
+                state.table().row_cells.clear();
             }
             Event::End(TagEnd::TableHead) => {
-                state.in_table_head = false;
-                state.table_header = Some(std::mem::take(&mut state.table_row_cells));
+                state.table().in_head = false;
+                state.table().header = Some(std::mem::take(&mut state.table().row_cells));
             }
             Event::Start(Tag::TableRow) => {
-                state.table_row_cells.clear();
+                state.table().row_cells.clear();
             }
             Event::End(TagEnd::TableRow) => {
-                let row = std::mem::take(&mut state.table_row_cells);
-                state.table_rows.push(row);
+                let row = std::mem::take(&mut state.table().row_cells);
+                state.table().rows.push(row);
             }
             Event::Start(Tag::TableCell) => {
-                state.table_cell_buf.clear();
-                state.table_cell_image = None;
-                state.table_cell_bold = false;
-                state.table_cell_italic = false;
-                state.table_cell_code = false;
+                state.table().cell_buf.clear();
+                state.table().cell_image = None;
+                state.table().cell_bold = false;
+                state.table().cell_italic = false;
+                state.table().cell_code = false;
             }
             Event::End(TagEnd::TableCell) => {
-                let text = std::mem::take(&mut state.table_cell_buf);
-                let image = state.table_cell_image.take();
-                state.table_row_cells.push(TableCell {
-                    text,
-                    bold: state.table_cell_bold,
-                    italic: state.table_cell_italic,
-                    code: state.table_cell_code,
-                    image,
-                });
+                let t = state.table();
+                let cell = TableCell {
+                    text: std::mem::take(&mut t.cell_buf),
+                    image: t.cell_image.take(),
+                    bold: t.cell_bold,
+                    italic: t.cell_italic,
+                    code: t.cell_code,
+                };
+                state.table().row_cells.push(cell);
             }
 
             // ── Inline HTML ──────────────────────────────────────────
