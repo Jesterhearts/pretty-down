@@ -187,28 +187,6 @@ fn estimate_sixel_rows(data: &str) -> u16 {
     crate::sixel::pixel_height_to_rows(pixel_height)
 }
 
-/// Resolve any pending images that are ready into Sixel lines, so the
-/// scroll math uses the correct actual height.
-fn resolve_ready_images(
-    lines: &mut [Line],
-    pending: &[crate::sixel::PendingImage],
-) {
-    for line in lines.iter_mut() {
-        if let Line::PendingImage { id, .. } = line
-            && let Some(p) = pending.get(*id)
-            && p.is_ready()
-        {
-            let data = p.wait().to_string();
-            let height = if data.is_empty() {
-                0
-            } else {
-                estimate_sixel_rows(&data)
-            };
-            *line = Line::Sixel { data, height };
-        }
-    }
-}
-
 /// Set up a file watcher.
 fn setup_watcher(path: &Path) -> Option<(mpsc::Receiver<()>, notify::RecommendedWatcher)> {
     use notify::Watcher;
@@ -337,6 +315,7 @@ pub fn run(
                 &lines,
                 &visible,
                 &collapsed,
+                pending,
                 pending_gifs,
                 &gif_frames,
                 code_blocks,
@@ -418,15 +397,21 @@ pub fn run(
             continue;
         }
 
-        // Resolve any pending images that finished encoding into Sixel
-        // lines so the scroll math uses their actual height.
-        let had_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
-        if had_pending {
-            resolve_ready_images(&mut lines, pending);
-            visible = visible_indices(&lines, &collapsed);
-            let still_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
-            if had_pending != still_pending {
-                needs_redraw = true;
+        // Check if any pending images that are visible just became ready
+        let has_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
+        if has_pending {
+            let mut rows = 0u16;
+            for &vi in &visible[scroll_offset..] {
+                if rows >= viewport_rows {
+                    break;
+                }
+                if let Line::PendingImage { id, .. } = &lines[vi]
+                    && pending.get(*id).is_some_and(|p| p.is_ready())
+                {
+                    needs_redraw = true;
+                    break;
+                }
+                rows += lines[vi].rows();
             }
         }
 
@@ -436,7 +421,7 @@ pub fn run(
         let poll_timeout = if let Some(t) = next_gif_deadline {
             t.saturating_duration_since(std::time::Instant::now())
                 .max(Duration::from_millis(1))
-        } else if watching || had_pending {
+        } else if watching || has_pending {
             Duration::from_millis(50)
         } else {
             Duration::from_secs(60)
@@ -775,6 +760,7 @@ fn draw_screen(
     lines: &[Line],
     visible: &[usize],
     collapsed: &HashSet<usize>,
+    pending_images: &[crate::sixel::PendingImage],
     gifs: &[crate::sixel::PendingGif],
     gif_frames: &HashMap<usize, usize>,
     code_blocks: &[crate::renderer::CodeBlock],
@@ -820,10 +806,33 @@ fn draw_screen(
                     break;
                 }
             }
-            Line::PendingImage { .. } => {
+            Line::PendingImage { id, estimated_rows } => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
-                write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
-                rows_used += 1;
+                if let Some(p) = pending_images.get(*id) {
+                    if p.is_ready() {
+                        let sixel = p.wait();
+                        if !sixel.is_empty() {
+                            write!(stdout, "{sixel}").unwrap();
+                            let height = estimate_sixel_rows(sixel);
+                            rows_used += height;
+                            if rows_used > viewport_rows {
+                                overflow = Some(Overflow {
+                                    rows: rows_used - viewport_rows,
+                                    vis_idx,
+                                });
+                                vis_idx += 1;
+                                break;
+                            }
+                        } else {
+                            rows_used += estimated_rows;
+                        }
+                    } else {
+                        write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
+                        rows_used += 1;
+                    }
+                } else {
+                    rows_used += estimated_rows;
+                }
             }
             Line::Gif { id, estimated_rows } => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
