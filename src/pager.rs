@@ -35,6 +35,17 @@ enum ImageGroup {
     Gif(usize),          // index into pending_gifs
 }
 
+/// Sixel data for an image inside a table cell or side-by-side group.
+#[derive(Clone)]
+enum TableCellSixel {
+    /// Static sixel image at the given column offset.
+    Static { col: u16, data: String },
+    /// Pending image at the given column offset (resolved at draw time).
+    Pending { col: u16, image_id: usize },
+    /// Animated GIF at the given column offset (frame looked up at draw time).
+    Gif { col: u16, gif_id: usize },
+}
+
 /// A display line.
 #[derive(Clone)]
 enum Line {
@@ -58,6 +69,13 @@ enum Line {
     DetailsEnd { id: usize },
     /// A horizontally scrollable code block.
     CodeBlock { id: usize, height: u16 },
+    /// A single table row. Drawn directly to stdout for sixel support.
+    /// `content` is the text (borders + text cells + cursor-forward skips for images).
+    /// `sixels` holds image data for cells on this line (first line_idx of each image cell).
+    TableRow {
+        content: String,
+        sixels: Vec<TableCellSixel>,
+    },
     /// Video playback control bar (play/pause + progress).
     VideoControls { gif_id: usize },
 }
@@ -66,7 +84,7 @@ impl Line {
     /// Number of terminal rows this line occupies.
     fn rows(&self) -> u16 {
         match self {
-            Line::Text(_) | Line::ImageRow { .. } => 1,
+            Line::Text(_) | Line::ImageRow { .. } | Line::TableRow { .. } => 1,
             Line::CodeBlock { height, .. } => *height,
             Line::VideoControls { .. } => 1,
             Line::DetailsSummary { .. } => 1,
@@ -174,6 +192,12 @@ fn flatten_blocks(
                     .unwrap_or(1);
                 lines.push(Line::CodeBlock { id: *id, height });
             }
+            OutputBlock::SideBySide(items) => {
+                flatten_side_by_side(items, output, &mut lines);
+            }
+            OutputBlock::Table(table) => {
+                flatten_table(table, &mut lines);
+            }
             OutputBlock::DetailsStart { id } => {
                 lines.push(Line::DetailsStart { id: *id });
             }
@@ -195,6 +219,254 @@ fn flatten_blocks(
     }
 
     lines
+}
+
+fn flatten_side_by_side(
+    items: &[crate::renderer::SideBySideItem],
+    output: &crate::renderer::RenderOutput,
+    lines: &mut Vec<Line>,
+) {
+    use crate::renderer::SideBySideItem;
+
+    struct ItemInfo {
+        cols: u16,
+        rows: u16,
+        sixel: TableCellSixel,
+    }
+
+    let mut infos = Vec::new();
+    let gap = 1u16; // columns between images
+
+    for item in items {
+        match item {
+            SideBySideItem::Image(id) => {
+                if let Some(p) = output.pending_images.get(*id) {
+                    let cols = p
+                        .preview
+                        .first()
+                        .map(|l| crate::renderer::ansi::visible_len(l) as u16)
+                        .unwrap_or(1);
+                    infos.push(ItemInfo {
+                        cols,
+                        rows: p.estimated_rows,
+                        sixel: TableCellSixel::Pending {
+                            col: 0, // filled in below
+                            image_id: *id,
+                        },
+                    });
+                }
+            }
+            SideBySideItem::Gif(id) => {
+                if let Some(g) = output.pending_gifs.get(*id) {
+                    let cols = g
+                        .preview
+                        .first()
+                        .map(|l| crate::renderer::ansi::visible_len(l) as u16)
+                        .unwrap_or(1);
+                    infos.push(ItemInfo {
+                        cols,
+                        rows: g.estimated_rows,
+                        sixel: TableCellSixel::Gif {
+                            col: 0, // filled in below
+                            gif_id: *id,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    if infos.is_empty() {
+        return;
+    }
+
+    // Assign column offsets
+    let mut col_offset: u16 = 0;
+    for info in &mut infos {
+        match &mut info.sixel {
+            TableCellSixel::Static { col, .. }
+            | TableCellSixel::Pending { col, .. }
+            | TableCellSixel::Gif { col, .. } => {
+                *col = col_offset;
+            }
+        }
+        col_offset += info.cols + gap;
+    }
+
+    let max_rows = infos.iter().map(|i| i.rows).max().unwrap_or(0);
+
+    for row_idx in 0..max_rows {
+        let mut content = String::new();
+        let mut sixels = Vec::new();
+
+        // On first row, record sixels
+        if row_idx == 0 {
+            for info in &infos {
+                sixels.push(info.sixel.clone());
+            }
+        }
+
+        // Build content with cursor-forward skips over image areas
+        for (i, info) in infos.iter().enumerate() {
+            if i > 0 {
+                for _ in 0..gap {
+                    content.push(' ');
+                }
+            }
+            content.push_str(&format!("\x1b[{}C", info.cols));
+        }
+
+        lines.push(Line::TableRow { content, sixels });
+    }
+}
+
+fn flatten_table(
+    table: &crate::renderer::RenderedTable,
+    lines: &mut Vec<Line>,
+) {
+    use pulldown_cmark::Alignment;
+
+    let w = &table.col_widths;
+
+    // Top border
+    lines.push(Line::TableRow {
+        content: render_border_str(w, '╭', '┬', '╮', '─'),
+        sixels: vec![],
+    });
+
+    let all_rows: Vec<(&Vec<crate::renderer::RenderedTableCell>, bool)> = table
+        .header
+        .iter()
+        .map(|h| (h, true))
+        .chain(table.rows.iter().map(|r| (r, false)))
+        .collect();
+
+    for (row, is_header) in &all_rows {
+        let row_height = row.iter().map(|c| c.height).max().unwrap_or(1);
+
+        for line_idx in 0..row_height {
+            let mut content = String::new();
+            let mut sixels: Vec<TableCellSixel> = vec![];
+            let mut col_offset: u16 = 0;
+
+            content.push('│');
+            col_offset += 1;
+
+            for (col, width) in w.iter().enumerate() {
+                content.push(' ');
+                col_offset += 1;
+
+                let cell = row.get(col);
+                let align = table
+                    .alignments
+                    .get(col)
+                    .copied()
+                    .unwrap_or(Alignment::None);
+
+                if let Some(cell) = cell {
+                    if cell.sixel.is_some() || cell.gif_id.is_some() {
+                        // Image cell: record sixel/gif position on first line
+                        if line_idx == 0 {
+                            if let Some(gif_id) = cell.gif_id {
+                                sixels.push(TableCellSixel::Gif { col: col_offset, gif_id });
+                            } else if let Some(ref sixel_data) = cell.sixel {
+                                sixels.push(TableCellSixel::Static {
+                                    col: col_offset,
+                                    data: sixel_data.clone(),
+                                });
+                            }
+                        }
+                        // Skip over image area with cursor-forward (don't overwrite sixel)
+                        content.push_str(&format!("\x1b[{}C", width));
+                    } else {
+                        let line = cell
+                            .text_lines
+                            .get(line_idx)
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        let vis_len = crate::renderer::ansi::visible_len(line);
+                        let padding = width.saturating_sub(vis_len);
+
+                        match align {
+                            Alignment::Right => {
+                                for _ in 0..padding {
+                                    content.push(' ');
+                                }
+                                content.push_str(line);
+                            }
+                            Alignment::Center => {
+                                let left = padding / 2;
+                                for _ in 0..left {
+                                    content.push(' ');
+                                }
+                                content.push_str(line);
+                                for _ in 0..padding - left {
+                                    content.push(' ');
+                                }
+                            }
+                            _ => {
+                                content.push_str(line);
+                                for _ in 0..padding {
+                                    content.push(' ');
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for _ in 0..*width {
+                        content.push(' ');
+                    }
+                }
+
+                col_offset += *width as u16;
+                content.push(' ');
+                col_offset += 1;
+
+                if col < w.len() - 1 {
+                    content.push('┆');
+                    col_offset += 1;
+                }
+            }
+            content.push('│');
+
+            lines.push(Line::TableRow { content, sixels });
+        }
+
+        // Header separator
+        if *is_header {
+            lines.push(Line::TableRow {
+                content: render_border_str(w, '╞', '╪', '╡', '═'),
+                sixels: vec![],
+            });
+        }
+    }
+
+    // Bottom border
+    lines.push(Line::TableRow {
+        content: render_border_str(w, '╰', '┴', '╯', '─'),
+        sixels: vec![],
+    });
+}
+
+fn render_border_str(
+    widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+    fill: char,
+) -> String {
+    let mut s = String::new();
+    s.push(left);
+    for (i, w) in widths.iter().enumerate() {
+        for _ in 0..w + 2 {
+            s.push(fill);
+        }
+        if i < widths.len() - 1 {
+            s.push(mid);
+        }
+    }
+    s.push(right);
+    s
 }
 
 /// Compute indices of lines that are visible given the current collapsed state.
@@ -355,23 +627,43 @@ pub fn run(
 
             // Register any newly visible GIFs that aren't tracked yet
             for &vi in &visible[scroll_offset..] {
-                if let Line::ImageRow {
-                    group: ImageGroup::Gif(id),
-                    row_in_group: 0,
-                    ..
-                } = &lines[vi]
-                {
-                    gif_state.entry(*id).or_insert_with(|| {
-                        let delay = pending_gifs
-                            .get(*id)
-                            .and_then(|g| g.frame(0))
-                            .map(|f| f.delay_ms)
-                            .unwrap_or(100);
-                        (
-                            0,
-                            std::time::Instant::now() + Duration::from_millis(delay as u64),
-                        )
-                    });
+                match &lines[vi] {
+                    Line::ImageRow {
+                        group: ImageGroup::Gif(id),
+                        row_in_group: 0,
+                        ..
+                    } => {
+                        gif_state.entry(*id).or_insert_with(|| {
+                            let delay = pending_gifs
+                                .get(*id)
+                                .and_then(|g| g.frame(0))
+                                .map(|f| f.delay_ms)
+                                .unwrap_or(100);
+                            (
+                                0,
+                                std::time::Instant::now() + Duration::from_millis(delay as u64),
+                            )
+                        });
+                    }
+                    Line::TableRow { sixels, .. } => {
+                        for s in sixels {
+                            if let TableCellSixel::Gif { gif_id, .. } = s {
+                                gif_state.entry(*gif_id).or_insert_with(|| {
+                                    let delay = pending_gifs
+                                        .get(*gif_id)
+                                        .and_then(|g| g.frame(0))
+                                        .map(|f| f.delay_ms)
+                                        .unwrap_or(100);
+                                    (
+                                        0,
+                                        std::time::Instant::now()
+                                            + Duration::from_millis(delay as u64),
+                                    )
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             needs_redraw = false;
@@ -807,6 +1099,35 @@ pub fn print_output(output: &RenderOutput) {
             }
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {}
             Line::VideoControls { .. } => {} // no controls in non-pager mode
+            Line::TableRow { content, sixels } => {
+                print!("{content}");
+                for s in sixels {
+                    match s {
+                        TableCellSixel::Static { col, data } => {
+                            print!("\x1b[{col}G{data}");
+                        }
+                        TableCellSixel::Pending { col, image_id } => {
+                            if let Some(p) = output.pending_images.get(*image_id) {
+                                let sixel = p.wait();
+                                if !sixel.is_empty() {
+                                    print!("\x1b[{col}G{sixel}");
+                                }
+                            }
+                        }
+                        TableCellSixel::Gif { col, gif_id } => {
+                            if let Some(gif) = output.pending_gifs.get(*gif_id) {
+                                while !gif.is_done() && gif.frame_count() == 0 {
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                if let Some(frame) = gif.frame(0) {
+                                    print!("\x1b[{col}G{}", frame.sixel);
+                                }
+                            }
+                        }
+                    }
+                }
+                println!();
+            }
         }
     }
 }
@@ -1018,6 +1339,44 @@ fn draw_screen(
                     }
                     rows_used += 1;
                 }
+            }
+            Line::TableRow { content, sixels } => {
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                write!(stdout, "{content}\r").unwrap();
+                for s in sixels {
+                    match s {
+                        TableCellSixel::Static { col, data } => {
+                            crossterm::execute!(stdout, cursor::MoveTo(*col, rows_used)).unwrap();
+                            write!(stdout, "{data}").unwrap();
+                        }
+                        TableCellSixel::Pending { col, image_id } => {
+                            if let Some(p) = pending_images.get(*image_id) {
+                                if p.is_ready() {
+                                    let sixel = p.wait();
+                                    if !sixel.is_empty() {
+                                        crossterm::execute!(
+                                            stdout,
+                                            cursor::MoveTo(*col, rows_used)
+                                        )
+                                        .unwrap();
+                                        write!(stdout, "{sixel}").unwrap();
+                                    }
+                                }
+                            }
+                        }
+                        TableCellSixel::Gif { col, gif_id } => {
+                            let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
+                            if let Some(gif) = gifs.get(*gif_id) {
+                                if let Some(frame) = gif.frame(frame_idx) {
+                                    crossterm::execute!(stdout, cursor::MoveTo(*col, rows_used))
+                                        .unwrap();
+                                    write!(stdout, "{}", frame.sixel).unwrap();
+                                }
+                            }
+                        }
+                    }
+                }
+                rows_used += 1;
             }
             Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {
                 // Invisible markers, zero height

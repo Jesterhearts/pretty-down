@@ -131,8 +131,13 @@ It uses the theme's code_block style without syntax highlighting.
 | **Bold**      | Done      | ANSI escape            |
 | *Italic*      | Done      | ANSI escape            |
 | `Code`        | Done      | Dimmed                 |
-| Tables        | Done      | comfy-table            |
+| Tables        | Done      | custom tables          |
 | Images        | Done      | Background encoding    |
+
+### Images In Tables
+| Text   | Image                      | Video                         |
+| ---    | ---                        | ---                           |
+| Planet | ![planet](example_gif.gif) | ![nature](example_video.webm) |
 
 ## HTML Elements
 
@@ -162,7 +167,8 @@ It uses the theme's code_block style without syntax highlighting.
 
 <span style="font-weight: bold; font-style: italic">Bold italic via CSS</span>.
 
-<span style="text-decoration: underline">CSS underline</span> and <span style="text-decoration: line-through">CSS strikethrough</span>.
+<span style="text-decoration: underline">CSS underline</span> and <span style="text-decoration:
+line-through">CSS strikethrough</span>.
 
 <span style="color: coral; font-weight: bold">Coral bold</span>,
 <span style="color: gold">gold</span>,

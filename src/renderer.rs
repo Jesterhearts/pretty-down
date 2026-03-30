@@ -204,10 +204,39 @@ fn crop_pixels_width(
 /// Heading font sizes in pixels for h1..h6
 const HEADING_SIZES: [u32; 6] = [48, 40, 32, 28, 24, 20];
 
+/// A fully laid-out table ready for direct rendering to stdout.
+pub struct RenderedTable {
+    /// Pre-computed column widths in visible characters.
+    pub col_widths: Vec<usize>,
+    /// Column alignments.
+    pub alignments: Vec<Alignment>,
+    /// Header row (if any).
+    pub header: Option<Vec<RenderedTableCell>>,
+    /// Data rows.
+    pub rows: Vec<Vec<RenderedTableCell>>,
+}
+
+/// A cell in a rendered table.
+pub struct RenderedTableCell {
+    /// Styled text lines for this cell.
+    pub text_lines: Vec<String>,
+    /// Optional sixel image to render in the cell.
+    pub sixel: Option<String>,
+    /// Optional animated GIF ID (index into pending_gifs).
+    pub gif_id: Option<usize>,
+    /// Visible width of the cell content (for text: max line width; for images: image cols).
+    pub width: usize,
+    /// Number of terminal rows this cell occupies.
+    pub height: usize,
+}
+
 /// Image data embedded in a table cell.
 struct TableCellImage {
-    sixel: String,
-    /// Half-block preview lines (fallback for non-pager output)
+    /// Static sixel data (None if animated GIF).
+    sixel: Option<String>,
+    /// Animated GIF ID (index into pending_gifs), if this is a GIF.
+    gif_id: Option<usize>,
+    /// Half-block preview lines (fallback while scrolling / non-pager).
     preview: Vec<String>,
     width_cols: u32,
     height_rows: u16,
@@ -282,6 +311,8 @@ struct RenderState {
     term_width: u16,
     /// Counter for assigning unique IDs to `<details>` blocks.
     next_details_id: usize,
+    /// Image paths buffered during a paragraph for side-by-side detection.
+    para_images: Vec<std::path::PathBuf>,
 }
 
 impl RenderState {
@@ -317,6 +348,7 @@ impl RenderState {
             pending_gifs: Vec::new(),
             term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
             next_details_id: 0,
+            para_images: Vec::new(),
         }
     }
 
@@ -1006,120 +1038,82 @@ fn emit_block(
 fn flush_table(
     state: &mut RenderState,
     out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
 ) {
-    let header = state.table_header.take();
-    let rows = std::mem::take(&mut state.table_rows);
-    let alignments = &state.table_alignments;
+    let header_cells = state.table_header.take();
+    let row_cells = std::mem::take(&mut state.table_rows);
+    let alignments = state.table_alignments.clone();
 
-    let all_rows: Vec<&Vec<TableCell>> = header.as_ref().into_iter().chain(rows.iter()).collect();
-
-    let col_count = alignments
-        .len()
-        .max(all_rows.iter().map(|r| r.len()).max().unwrap_or(0));
-    let col_widths = compute_column_widths_cells(&all_rows, col_count);
-
-    render_border(out, &col_widths, '╭', '┬', '╮', '─');
-    out.push('\n');
-
-    for (row_idx, row) in all_rows.iter().enumerate() {
-        let is_header = header.is_some() && row_idx == 0;
-        let height = cell_row_height(row);
-
-        for line_idx in 0..height {
-            out.push('│');
-            for (col, width) in col_widths.iter().enumerate() {
-                out.push(' ');
-                let cell = row.get(col);
-                let align = alignments.get(col).copied().unwrap_or(Alignment::None);
-
-                if let Some(cell) = cell {
+    let build_rendered_row =
+        |cells: &[TableCell], is_header: bool| -> Vec<RenderedTableCell> {
+            cells
+                .iter()
+                .map(|cell| {
                     if let Some(ref img) = cell.image {
-                        render_image_cell_line(out, img, line_idx, *width);
+                        RenderedTableCell {
+                            text_lines: img.preview.clone(),
+                            sixel: img.sixel.clone(),
+                            gif_id: img.gif_id,
+                            width: img.width_cols as usize,
+                            height: img.height_rows as usize,
+                        }
                     } else {
-                        render_text_cell_line(out, cell, is_header, line_idx, *width, align);
+                        let styled = styled_cell_text(cell, is_header);
+                        let lines: Vec<String> =
+                            styled.split('\n').map(|s| s.to_string()).collect();
+                        let width =
+                            lines.iter().map(|l| ansi::visible_len(l)).max().unwrap_or(0);
+                        let height = lines.len().max(1);
+                        RenderedTableCell {
+                            text_lines: lines,
+                            sixel: None,
+                            gif_id: None,
+                            width,
+                            height,
+                        }
                     }
-                } else {
-                    pad_spaces(out, *width);
-                }
+                })
+                .collect()
+        };
 
-                out.push(' ');
-                if col < col_widths.len() - 1 {
-                    out.push('┆');
-                }
+    let header = header_cells.as_ref().map(|h| build_rendered_row(h, true));
+    let rows: Vec<Vec<RenderedTableCell>> =
+        row_cells.iter().map(|r| build_rendered_row(r, false)).collect();
+
+    // Compute column widths
+    let col_count = alignments.len().max(
+        header
+            .iter()
+            .chain(rows.iter())
+            .map(|r| r.len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut col_widths = vec![0usize; col_count];
+    for row in header.iter().chain(rows.iter()) {
+        for (col, cell) in row.iter().enumerate() {
+            if col < col_count {
+                col_widths[col] = col_widths[col].max(cell.width);
             }
-            out.push_str("│\n");
-        }
-
-        if is_header {
-            render_border(out, &col_widths, '╞', '╪', '╡', '═');
-            out.push('\n');
         }
     }
 
-    render_border(out, &col_widths, '╰', '┴', '╯', '─');
-    out.push_str("\n\n");
+    flush_text(out, blocks);
+    blocks.push(OutputBlock::Table(RenderedTable {
+        col_widths,
+        alignments,
+        header,
+        rows,
+    }));
+
     state.table_alignments.clear();
 }
 
-fn render_text_cell_line(
-    out: &mut String,
-    cell: &TableCell,
-    is_header: bool,
-    line_idx: usize,
-    width: usize,
-    align: Alignment,
-) {
-    let styled = styled_cell_text(cell);
-    let cell_lines: Vec<&str> = styled.split('\n').collect();
-    let line = cell_lines.get(line_idx).copied().unwrap_or("");
-    let vis_len = ansi::visible_len(line);
-    let padding = width.saturating_sub(vis_len);
-
-    if is_header && line_idx == 0 {
-        out.push_str(ansi::BOLD);
-    }
-
-    match align {
-        Alignment::Right => {
-            pad_spaces(out, padding);
-            out.push_str(line);
-        }
-        Alignment::Center => {
-            let left = padding / 2;
-            pad_spaces(out, left);
-            out.push_str(line);
-            pad_spaces(out, padding - left);
-        }
-        _ => {
-            out.push_str(line);
-            pad_spaces(out, padding);
-        }
-    }
-
-    if is_header && line_idx == 0 {
-        out.push_str(ansi::RESET);
-    }
-}
-
-fn render_image_cell_line(
-    out: &mut String,
-    img: &TableCellImage,
-    line_idx: usize,
-    width: usize,
-) {
-    if line_idx == 0 {
-        // First line: save cursor, emit sixel, restore cursor, pad with spaces
-        out.push_str("\x1b[s"); // save cursor
-        out.push_str(&img.sixel);
-        out.push_str("\x1b[u"); // restore cursor
-    }
-    // All lines: pad with spaces to fill the cell width
-    // (the sixel renders over these visually)
-    pad_spaces(out, width);
-}
-
-fn styled_cell_text(cell: &TableCell) -> String {
+fn styled_cell_text(cell: &TableCell, is_header: bool) -> String {
     let mut s = String::new();
+    if is_header {
+        s.push_str(ansi::BOLD);
+    }
     if cell.bold {
         s.push_str(ansi::BOLD);
     }
@@ -1130,76 +1124,11 @@ fn styled_cell_text(cell: &TableCell) -> String {
         s.push_str(ansi::DIM);
     }
     s.push_str(&cell.text);
-    if cell.bold || cell.italic || cell.code {
+    if cell.bold || cell.italic || cell.code || is_header {
         s.push_str(ansi::RESET);
     }
     s
 }
-
-fn compute_column_widths_cells(
-    rows: &[&Vec<TableCell>],
-    col_count: usize,
-) -> Vec<usize> {
-    let mut widths = vec![0usize; col_count];
-    for row in rows {
-        for (col, cell) in row.iter().enumerate() {
-            if col < col_count {
-                if let Some(ref img) = cell.image {
-                    widths[col] = widths[col].max(img.width_cols as usize);
-                } else {
-                    let styled = styled_cell_text(cell);
-                    for line in styled.split('\n') {
-                        widths[col] = widths[col].max(ansi::visible_len(line));
-                    }
-                }
-            }
-        }
-    }
-    widths
-}
-
-fn cell_row_height(row: &[TableCell]) -> usize {
-    row.iter()
-        .map(|cell| {
-            if let Some(ref img) = cell.image {
-                img.height_rows as usize
-            } else {
-                styled_cell_text(cell).split('\n').count().max(1)
-            }
-        })
-        .max()
-        .unwrap_or(1)
-}
-
-fn pad_spaces(
-    out: &mut String,
-    count: usize,
-) {
-    for _ in 0..count {
-        out.push(' ');
-    }
-}
-
-fn render_border(
-    out: &mut String,
-    widths: &[usize],
-    left: char,
-    mid: char,
-    right: char,
-    fill: char,
-) {
-    out.push(left);
-    for (i, w) in widths.iter().enumerate() {
-        for _ in 0..w + 2 {
-            out.push(fill);
-        }
-        if i < widths.len() - 1 {
-            out.push(mid);
-        }
-    }
-    out.push(right);
-}
-
 /// Output from rendering markdown, containing the text output and any
 /// images still being encoded in background threads.
 /// A rendered code block with syntax-highlighted lines.
@@ -1211,6 +1140,14 @@ pub struct CodeBlock {
 }
 
 /// A block of rendered output.
+/// One image in a side-by-side group.
+pub enum SideBySideItem {
+    /// Index into `pending_images`.
+    Image(usize),
+    /// Index into `pending_gifs`.
+    Gif(usize),
+}
+
 pub enum OutputBlock {
     /// ANSI-styled text (may contain newlines).
     Text(String),
@@ -1224,8 +1161,12 @@ pub enum OutputBlock {
     Image(usize),
     /// Index into `pending_gifs`.
     Gif(usize),
+    /// Multiple images laid out side-by-side.
+    SideBySide(Vec<SideBySideItem>),
     /// Index into `code_blocks`.
     Code(usize),
+    /// A pre-laid-out table rendered directly to stdout by the pager.
+    Table(RenderedTable),
     /// Start of a collapsible details section.
     DetailsStart { id: usize },
     /// Summary line for a details section.
@@ -1299,6 +1240,7 @@ fn render_heading_sixel(
 fn end_paragraph(
     state: &mut RenderState,
     out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
     theme: &crate::theme::Theme,
 ) {
     out.push_str(ansi::RESET);
@@ -1325,6 +1267,72 @@ fn end_paragraph(
         out.push_str(&wrapped);
     }
     out.push_str("\n\n");
+
+    // Flush buffered paragraph images
+    let images = std::mem::take(&mut state.para_images);
+    if !images.is_empty() {
+        flush_text(out, blocks);
+        flush_para_images(state, &images, blocks);
+    }
+}
+
+fn flush_para_images(
+    state: &mut RenderState,
+    images: &[std::path::PathBuf],
+    blocks: &mut Vec<OutputBlock>,
+) {
+    let max_w = sixel::terminal_pixel_width();
+
+    if images.len() == 1 {
+        // Single image — encode at full width
+        let path = &images[0];
+        if sixel::is_video(path) {
+            if let Some(pending) = sixel::encode_video_async(path, max_w / 2) {
+                let id = state.pending_gifs.len();
+                blocks.push(OutputBlock::Gif(id));
+                state.pending_gifs.push(pending);
+                return;
+            }
+        }
+        if let Some(pending) = sixel::encode_gif_async(path, max_w) {
+            let id = state.pending_gifs.len();
+            blocks.push(OutputBlock::Gif(id));
+            state.pending_gifs.push(pending);
+        } else if let Some(pending) = sixel::encode_image_file_async(path, max_w) {
+            let id = state.pending_images.len();
+            blocks.push(OutputBlock::Image(id));
+            state.pending_images.push(pending);
+        }
+        return;
+    }
+
+    // Multiple images — encode each at max_w / n for side-by-side
+    let per_image_w = max_w / images.len() as u32;
+    let mut items = Vec::new();
+
+    for path in images {
+        if sixel::is_video(path) {
+            if let Some(pending) = sixel::encode_video_async(path, per_image_w) {
+                let id = state.pending_gifs.len();
+                items.push(SideBySideItem::Gif(id));
+                state.pending_gifs.push(pending);
+                continue;
+            }
+        }
+        if let Some(pending) = sixel::encode_gif_async(path, per_image_w) {
+            let id = state.pending_gifs.len();
+            items.push(SideBySideItem::Gif(id));
+            state.pending_gifs.push(pending);
+        } else if let Some(pending) = sixel::encode_image_file_async(path, per_image_w) {
+            let id = state.pending_images.len();
+            items.push(SideBySideItem::Image(id));
+            state.pending_images.push(pending);
+        }
+    }
+
+    if !items.is_empty() {
+        blocks.push(OutputBlock::SideBySide(items));
+    }
 }
 
 fn end_code_block(
@@ -1385,17 +1393,45 @@ fn render_image_in_table_cell(
     path: &std::path::Path,
     state: &mut RenderState,
 ) {
+    let max_cols: u32 = 30;
+    let max_px = max_cols * sixel::cell_pixel_width();
+
+    // Try video or animated GIF
+    let pending_anim = if sixel::is_video(path) {
+        sixel::encode_video_async(path, max_px)
+    } else {
+        sixel::encode_gif_async(path, max_px)
+    };
+    if let Some(pending) = pending_anim {
+        let gif_id = state.pending_gifs.len();
+        let cols = pending
+            .preview
+            .first()
+            .map(|l| ansi::visible_len(l) as u32)
+            .unwrap_or(1)
+            .min(max_cols);
+        let rows = pending.estimated_rows;
+        let preview = pending.preview.clone();
+        state.pending_gifs.push(pending);
+        state.table_cell_image = Some(TableCellImage {
+            sixel: None,
+            gif_id: Some(gif_id),
+            preview,
+            width_cols: cols,
+            height_rows: rows,
+        });
+        return;
+    }
+
+    // Static image fallback
     let img = match image::open(path) {
         Ok(img) => img.to_rgba8(),
         Err(_) => return,
     };
 
-    let max_cols: u32 = 30;
-    let max_px = max_cols * sixel::cell_pixel_width();
     let img = sixel::scale_image(img, max_px);
     let cols = sixel::preview_columns(img.width()).min(max_cols);
 
-    // Snap height for clean sixel
     let snapped_h = sixel::snap_height_to_cells(img.height());
     let rows = sixel::pixel_height_to_rows(snapped_h);
 
@@ -1410,7 +1446,8 @@ fn render_image_in_table_cell(
     let preview = sixel::half_block_preview(&img, cols, rows);
 
     state.table_cell_image = Some(TableCellImage {
-        sixel,
+        sixel: Some(sixel),
+        gif_id: None,
         preview,
         width_cols: cols,
         height_rows: rows,
@@ -1453,7 +1490,7 @@ pub fn render(
 
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
-                end_paragraph(&mut state, &mut out, theme);
+                end_paragraph(&mut state, &mut out, &mut blocks, theme);
             }
 
             // ── Code blocks ──────────────────────────────────────────
@@ -1552,7 +1589,9 @@ pub fn render(
                     if state.in_table() {
                         render_image_in_table_cell(&path, &mut state);
                     } else {
-                        state.emit_image(&path, &mut out, &mut blocks);
+                        // Buffer image path for side-by-side detection
+                        flush_text(&mut out, &mut blocks);
+                        state.para_images.push(path);
                     }
                 }
             }
@@ -1665,7 +1704,7 @@ pub fn render(
                 state.table_rows.clear();
             }
             Event::End(TagEnd::Table) => {
-                flush_table(&mut state, &mut out);
+                flush_table(&mut state, &mut out, &mut blocks);
             }
             Event::Start(Tag::TableHead) => {
                 state.in_table_head = true;
