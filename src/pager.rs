@@ -19,12 +19,17 @@ use crossterm::terminal::{
     self,
 };
 
-/// A display line is either a plain text line or an atomic sixel block.
+use crate::renderer::RenderOutput;
+
+/// A display line is either a plain text line, a sixel block, or a pending
+/// image.
 enum Line {
     /// A regular text line (may contain ANSI escapes).
     Text(String),
     /// A sixel image block — occupies `height` terminal rows.
     Sixel { data: String, height: u16 },
+    /// A placeholder for an image being encoded in the background.
+    PendingImage { id: usize, estimated_rows: u16 },
 }
 
 impl Line {
@@ -33,6 +38,7 @@ impl Line {
         match self {
             Line::Text(_) => 1,
             Line::Sixel { height, .. } => *height,
+            Line::PendingImage { estimated_rows, .. } => *estimated_rows,
         }
     }
 }
@@ -40,48 +46,84 @@ impl Line {
 /// Split rendered output into display lines.
 ///
 /// Sixel sequences (delimited by `\x1bP` .. `\x1b\`) are kept as atomic
-/// blocks. Everything else is split on newlines.
+/// blocks. Image placeholders (`\x00IMG:id:rows\x00`) become PendingImage
+/// lines. Everything else is split on newlines.
 fn split_lines(output: &str) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut rest = output;
 
     while !rest.is_empty() {
-        // Look for the start of a sixel sequence
-        if let Some(sixel_start) = rest.find("\x1bP") {
-            // Text before the sixel
-            let before = &rest[..sixel_start];
-            for text_line in before.split('\n') {
-                lines.push(Line::Text(text_line.to_string()));
+        // Look for image placeholder or sixel sequence
+        let placeholder_pos = rest.find("\x00IMG:");
+        let sixel_pos = rest.find("\x1bP");
+
+        // Find whichever comes first
+        let next = match (placeholder_pos, sixel_pos) {
+            (Some(p), Some(s)) if p < s => Some(("placeholder", p)),
+            (_, Some(s)) => Some(("sixel", s)),
+            (Some(p), None) => Some(("placeholder", p)),
+            (None, None) => None,
+        };
+
+        match next {
+            Some(("placeholder", pos)) => {
+                // Text before the placeholder
+                let before = &rest[..pos];
+                for text_line in before.split('\n') {
+                    lines.push(Line::Text(text_line.to_string()));
+                }
+
+                let after = &rest[pos..];
+                // Parse \x00IMG:id:rows\x00
+                if let Some(end) = after[1..].find('\x00') {
+                    let marker = &after[1..end + 1]; // "IMG:id:rows"
+                    let parts: Vec<&str> = marker.splitn(3, ':').collect();
+                    if parts.len() == 3 {
+                        let id: usize = parts[1].parse().unwrap_or(0);
+                        let rows: u16 = parts[2].parse().unwrap_or(3);
+                        lines.push(Line::PendingImage {
+                            id,
+                            estimated_rows: rows,
+                        });
+                    }
+                    rest = &after[end + 2..]; // skip past closing \x00
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                } else {
+                    rest = &after[1..];
+                }
             }
+            Some(("sixel", pos)) => {
+                let before = &rest[..pos];
+                for text_line in before.split('\n') {
+                    lines.push(Line::Text(text_line.to_string()));
+                }
 
-            // Find the sixel terminator (ST = ESC \)
-            let after_start = &rest[sixel_start..];
-            let end = after_start
-                .find("\x1b\\")
-                .map(|i| i + 2)
-                .unwrap_or(after_start.len());
+                let after_start = &rest[pos..];
+                let end = after_start
+                    .find("\x1b\\")
+                    .map(|i| i + 2)
+                    .unwrap_or(after_start.len());
 
-            let sixel_data = &after_start[..end];
+                let sixel_data = &after_start[..end];
+                let height = estimate_sixel_rows(sixel_data);
+                lines.push(Line::Sixel {
+                    data: sixel_data.to_string(),
+                    height,
+                });
 
-            // Estimate sixel height: parse raster attributes "Pan;Pad;Ph;Pv"
-            // or count '-' (newline in sixel = 6 pixel rows)
-            let height = estimate_sixel_rows(sixel_data);
-            lines.push(Line::Sixel {
-                data: sixel_data.to_string(),
-                height,
-            });
-
-            rest = &after_start[end..];
-            // Consume a trailing newline after the sixel if present
-            if rest.starts_with('\n') {
-                rest = &rest[1..];
+                rest = &after_start[end..];
+                if rest.starts_with('\n') {
+                    rest = &rest[1..];
+                }
             }
-        } else {
-            // No more sixel — split remaining text on newlines
-            for text_line in rest.split('\n') {
-                lines.push(Line::Text(text_line.to_string()));
+            _ => {
+                for text_line in rest.split('\n') {
+                    lines.push(Line::Text(text_line.to_string()));
+                }
+                break;
             }
-            break;
         }
     }
 
@@ -94,11 +136,7 @@ fn split_lines(output: &str) -> Vec<Line> {
 }
 
 /// Estimate how many terminal rows a sixel image occupies.
-///
-/// First tries to parse the raster attributes (`"Pan;Pad;Ph;Pv`), falling
-/// back to counting sixel newlines (`-`) which each represent 6 pixel rows.
 fn estimate_sixel_rows(data: &str) -> u16 {
-    // Try raster attributes: look for "Pan;Pad;Ph;Pv after the q
     if let Some(q_pos) = data.find('q') {
         let after_q = &data[q_pos + 1..];
         if let Some(raster) = after_q.strip_prefix('"') {
@@ -116,15 +154,13 @@ fn estimate_sixel_rows(data: &str) -> u16 {
         }
     }
 
-    // Fallback: count '-' characters (each = 6 pixel rows)
     let band_count = data.chars().filter(|&c| c == '-').count() as u32 + 1;
     let pixel_height = band_count * 6;
     let cell_height = 20u32;
     pixel_height.div_ceil(cell_height).max(1) as u16
 }
 
-/// Set up a file watcher that sends a message on the returned receiver when
-/// the file at `path` is modified.
+/// Set up a file watcher.
 fn setup_watcher(path: &Path) -> Option<(mpsc::Receiver<()>, notify::RecommendedWatcher)> {
     use notify::Watcher;
 
@@ -148,41 +184,40 @@ fn setup_watcher(path: &Path) -> Option<(mpsc::Receiver<()>, notify::Recommended
 }
 
 /// Run the interactive pager.
-///
-/// If `watch_path` is provided, the file will be watched for changes and
-/// `render_fn` will be called to produce updated output.
 pub fn run(
-    output: &str,
+    output: &RenderOutput,
     watch_path: Option<&Path>,
-    render_fn: &dyn Fn() -> String,
+    render_fn: &dyn Fn() -> RenderOutput,
 ) {
-    let mut lines = split_lines(output);
+    let mut lines = split_lines(&output.text);
+    let mut pending = &output.pending_images;
+    // Owned storage for when we re-render
+    #[allow(unused_assignments)]
+    let mut current_output: Option<RenderOutput> = None;
+
     if lines.is_empty() {
         return;
     }
 
     let mut stdout = io::stdout();
 
-    // Get terminal size
     let (_, term_rows) = terminal::size().unwrap_or((80, 24));
     let viewport_rows = term_rows.saturating_sub(1);
 
-    // Check if the content fits without scrolling and we're not watching
+    // If content fits and no watch and no pending images, just print directly
     let total_rows: u16 = lines.iter().map(|l| l.rows()).sum();
-    if total_rows <= viewport_rows && watch_path.is_none() {
-        print!("{output}");
+    let has_pending = lines.iter().any(|l| matches!(l, Line::PendingImage { .. }));
+    if total_rows <= viewport_rows && watch_path.is_none() && !has_pending {
+        // Print text, resolving any pending images inline
+        print_output(output);
         return;
     }
 
-    // Set up file watcher if requested
     let watcher_state = watch_path.and_then(setup_watcher);
     let watch_rx = watcher_state.as_ref().map(|(rx, _)| rx);
-    // Keep the watcher alive by holding it
     let _watcher = watcher_state.as_ref().map(|(_, w)| w);
-
     let watching = watch_rx.is_some();
 
-    // Enter raw mode
     terminal::enable_raw_mode().unwrap();
     crossterm::execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide,).unwrap();
 
@@ -194,6 +229,7 @@ pub fn run(
             draw_screen(
                 &mut stdout,
                 &lines,
+                pending,
                 scroll_offset,
                 viewport_rows,
                 term_rows,
@@ -202,18 +238,16 @@ pub fn run(
             needs_redraw = false;
         }
 
-        // Check for file changes (non-blocking)
+        // Check for file changes
         if let Some(rx) = watch_rx
             && rx.try_recv().is_ok()
         {
-            // Drain any extra events
             while rx.try_recv().is_ok() {}
-            // Small delay to let the file finish writing
             std::thread::sleep(Duration::from_millis(50));
-            // Re-render
             let new_output = render_fn();
-            lines = split_lines(&new_output);
-            // Clamp scroll offset
+            lines = split_lines(&new_output.text);
+            current_output = Some(new_output);
+            pending = &current_output.as_ref().unwrap().pending_images;
             if scroll_offset >= lines.len() {
                 scroll_offset = lines.len().saturating_sub(1);
             }
@@ -221,12 +255,17 @@ pub fn run(
             continue;
         }
 
-        // Poll for keyboard input with a timeout so we can check file changes
-        let poll_timeout = if watching {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_secs(60)
-        };
+        // Check if any pending images visible on screen just became ready
+        if check_pending_ready(&lines, pending, scroll_offset, viewport_rows) {
+            needs_redraw = true;
+        }
+
+        let poll_timeout =
+            if watching || has_visible_pending(&lines, pending, scroll_offset, viewport_rows) {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(60)
+            };
 
         if !event::poll(poll_timeout).unwrap_or(false) {
             continue;
@@ -247,7 +286,6 @@ pub fn run(
                     code: KeyCode::Esc, ..
                 } => break,
 
-                // Scroll down
                 KeyEvent {
                     code: KeyCode::Char('j') | KeyCode::Down,
                     ..
@@ -255,7 +293,6 @@ pub fn run(
                     scroll_offset = advance_lines(&lines, scroll_offset, 1);
                     needs_redraw = true;
                 }
-                // Scroll up
                 KeyEvent {
                     code: KeyCode::Char('k') | KeyCode::Up,
                     ..
@@ -263,7 +300,6 @@ pub fn run(
                     scroll_offset = retreat_lines(scroll_offset, 1);
                     needs_redraw = true;
                 }
-                // Half page down
                 KeyEvent {
                     code: KeyCode::Char('d'),
                     modifiers: KeyModifiers::CONTROL,
@@ -281,7 +317,6 @@ pub fn run(
                     scroll_offset = advance_lines(&lines, scroll_offset, half);
                     needs_redraw = true;
                 }
-                // Half page up
                 KeyEvent {
                     code: KeyCode::Char('u'),
                     modifiers: KeyModifiers::CONTROL,
@@ -299,7 +334,6 @@ pub fn run(
                     scroll_offset = retreat_lines(scroll_offset, half);
                     needs_redraw = true;
                 }
-                // Top
                 KeyEvent {
                     code: KeyCode::Char('g'),
                     ..
@@ -311,7 +345,6 @@ pub fn run(
                     scroll_offset = 0;
                     needs_redraw = true;
                 }
-                // Bottom
                 KeyEvent {
                     code: KeyCode::Char('G'),
                     ..
@@ -322,7 +355,6 @@ pub fn run(
                     scroll_offset = scroll_to_end(&lines, viewport_rows);
                     needs_redraw = true;
                 }
-                // Space = page down
                 KeyEvent {
                     code: KeyCode::Char(' '),
                     ..
@@ -330,13 +362,14 @@ pub fn run(
                     scroll_offset = advance_lines(&lines, scroll_offset, viewport_rows as usize);
                     needs_redraw = true;
                 }
-                // Manual reload
                 KeyEvent {
                     code: KeyCode::Char('r'),
                     ..
                 } => {
                     let new_output = render_fn();
-                    lines = split_lines(&new_output);
+                    lines = split_lines(&new_output.text);
+                    current_output = Some(new_output);
+                    pending = &current_output.as_ref().unwrap().pending_images;
                     if scroll_offset >= lines.len() {
                         scroll_offset = lines.len().saturating_sub(1);
                     }
@@ -348,15 +381,80 @@ pub fn run(
         }
     }
 
-    // Restore terminal
     crossterm::execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen,).unwrap();
     terminal::disable_raw_mode().unwrap();
 }
 
-/// Draw the current view to the screen.
+/// Print output directly, resolving pending images synchronously.
+pub fn print_output(output: &RenderOutput) {
+    let lines = split_lines(&output.text);
+    let pending = &output.pending_images;
+    for line in &lines {
+        match line {
+            Line::Text(t) => println!("{t}"),
+            Line::Sixel { data, .. } => println!("{data}"),
+            Line::PendingImage { id, .. } => {
+                if let Some(p) = pending.get(*id) {
+                    let sixel = p.wait();
+                    if !sixel.is_empty() {
+                        println!("{sixel}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Check if any pending images in the visible area just became ready.
+fn check_pending_ready(
+    lines: &[Line],
+    pending: &[crate::sixel::PendingImage],
+    scroll_offset: usize,
+    viewport_rows: u16,
+) -> bool {
+    let mut rows_used: u16 = 0;
+    let mut idx = scroll_offset;
+    while idx < lines.len() && rows_used + lines[idx].rows() <= viewport_rows {
+        if let Line::PendingImage { id, .. } = &lines[idx]
+            && let Some(p) = pending.get(*id)
+            && p.is_ready()
+        {
+            return true;
+        }
+        rows_used += lines[idx].rows();
+        idx += 1;
+    }
+    false
+}
+
+/// Check if there are any unresolved pending images in the visible area.
+fn has_visible_pending(
+    lines: &[Line],
+    pending: &[crate::sixel::PendingImage],
+    scroll_offset: usize,
+    viewport_rows: u16,
+) -> bool {
+    let mut rows_used: u16 = 0;
+    let mut idx = scroll_offset;
+    while idx < lines.len() && rows_used + lines[idx].rows() <= viewport_rows {
+        if let Line::PendingImage { id, .. } = &lines[idx]
+            && let Some(p) = pending.get(*id)
+            && !p.is_ready()
+        {
+            return true;
+        }
+        rows_used += lines[idx].rows();
+        idx += 1;
+    }
+    false
+}
+
+/// Draw the current view, resolving pending images only if they're visible and
+/// ready.
 fn draw_screen(
     stdout: &mut io::Stdout,
     lines: &[Line],
+    pending: &[crate::sixel::PendingImage],
     scroll_offset: usize,
     viewport_rows: u16,
     term_rows: u16,
@@ -383,6 +481,27 @@ fn draw_screen(
                 write!(stdout, "{data}").unwrap();
                 rows_used += height;
             }
+            Line::PendingImage { id, estimated_rows } => {
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                if let Some(p) = pending.get(*id) {
+                    if p.is_ready() {
+                        let sixel = p.wait();
+                        if !sixel.is_empty() {
+                            write!(stdout, "{sixel}").unwrap();
+                            // Use actual sixel height if available
+                            rows_used += estimate_sixel_rows(sixel);
+                        } else {
+                            rows_used += estimated_rows;
+                        }
+                    } else {
+                        // Show loading placeholder
+                        write!(stdout, "\x1b[2m  [loading image...]\x1b[0m\r").unwrap();
+                        rows_used += 1;
+                    }
+                } else {
+                    rows_used += estimated_rows;
+                }
+            }
         }
         line_idx += 1;
     }
@@ -403,7 +522,6 @@ fn draw_screen(
     stdout.flush().unwrap();
 }
 
-/// Advance scroll offset by `count` lines, clamped to valid range.
 fn advance_lines(
     lines: &[Line],
     offset: usize,
@@ -412,7 +530,6 @@ fn advance_lines(
     (offset + count).min(lines.len().saturating_sub(1))
 }
 
-/// Retreat scroll offset by `count` lines.
 fn retreat_lines(
     offset: usize,
     count: usize,
@@ -420,7 +537,6 @@ fn retreat_lines(
     offset.saturating_sub(count)
 }
 
-/// Compute the scroll offset that shows the last screenful.
 fn scroll_to_end(
     lines: &[Line],
     viewport_rows: u16,

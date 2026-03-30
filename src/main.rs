@@ -82,7 +82,12 @@ fn main() {
     let output = renderer::render(&markdown, &font, base_path.as_deref());
 
     if args.no_pager || !std::io::stdout().is_terminal() {
-        print!("{output}");
+        // For non-pager mode, wait for all pending images and print with
+        // placeholders resolved
+        for p in &output.pending_images {
+            p.wait();
+        }
+        pager::print_output(&output);
     } else {
         let watch_path = if args.watch {
             args.file.as_deref()
@@ -90,7 +95,7 @@ fn main() {
             None
         };
 
-        let render_fn: Box<dyn Fn() -> String> = if let Some(file) = &args.file {
+        let render_fn: Box<dyn Fn() -> renderer::RenderOutput> = if let Some(file) = &args.file {
             let file = file.clone();
             let base = base_path.clone();
             Box::new(move || {
@@ -98,9 +103,13 @@ fn main() {
                 renderer::render(&md, &font, base.as_deref())
             })
         } else {
-            Box::new(move || output.clone())
+            // No file — render_fn just returns an empty output (stdin can't be re-read)
+            Box::new(|| renderer::RenderOutput {
+                text: String::new(),
+                pending_images: Vec::new(),
+            })
         };
 
-        pager::run(&render_fn(), watch_path, &render_fn);
+        pager::run(&output, watch_path, &render_fn);
     }
 }

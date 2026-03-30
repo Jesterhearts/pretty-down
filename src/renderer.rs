@@ -84,6 +84,8 @@ struct RenderState {
     table_cell_bold: bool,
     table_cell_italic: bool,
     table_cell_code: bool,
+    /// Pending background image encodes, indexed by placeholder ID.
+    pending_images: Vec<sixel::PendingImage>,
 }
 
 impl RenderState {
@@ -109,11 +111,26 @@ impl RenderState {
             table_cell_bold: false,
             table_cell_italic: false,
             table_cell_code: false,
+            pending_images: Vec::new(),
         }
     }
 
     fn in_table(&self) -> bool {
         !self.table_alignments.is_empty()
+    }
+
+    /// Emit a placeholder for a pending image and start background encoding.
+    fn emit_image(
+        &mut self,
+        path: &std::path::Path,
+        out: &mut String,
+    ) {
+        if let Some(pending) = sixel::encode_image_file_async(path, 800) {
+            let id = self.pending_images.len();
+            // Placeholder format recognized by the pager
+            out.push_str(&format!("\x00IMG:{id}:{}\x00\n", pending.estimated_rows));
+            self.pending_images.push(pending);
+        }
     }
 
     fn push_style(
@@ -572,18 +589,25 @@ fn flush_table(
     state.table_alignments.clear();
 }
 
-/// Render markdown to a string containing ANSI escape codes and sixel
-/// sequences.
+/// Output from rendering markdown, containing the text output and any
+/// images still being encoded in background threads.
+pub struct RenderOutput {
+    pub text: String,
+    pub pending_images: Vec<sixel::PendingImage>,
+}
+
+/// Render markdown to a string containing ANSI escape codes, sixel sequences,
+/// and image placeholders.
 ///
 /// Headings are rendered as sixel images using the provided font.
-/// Body text uses ANSI terminal styling.
-/// Links use OSC 8 hyperlinks.
-/// Images are rendered inline as sixel.
+/// Body text uses ANSI terminal styling. Links use OSC 8 hyperlinks.
+/// Images are encoded in background threads — their placeholders
+/// (`\x00IMG:id:rows\x00`) are resolved by the pager when scrolled into view.
 pub fn render(
     markdown: &str,
     font: &Font,
     base_path: Option<&Path>,
-) -> String {
+) -> RenderOutput {
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(markdown, options);
 
@@ -715,11 +739,8 @@ pub fn render(
 
             // ── Images ───────────────────────────────────────────────
             Event::Start(Tag::Image { dest_url, .. }) => {
-                if let Some(path) = state.resolve_image_path(&dest_url)
-                    && let Some(sixel_data) = sixel::encode_image_file(&path, 800)
-                {
-                    out.push_str(&sixel_data);
-                    out.push('\n');
+                if let Some(path) = state.resolve_image_path(&dest_url) {
+                    state.emit_image(&path, &mut out);
                 }
             }
             Event::End(TagEnd::Image) => {}
@@ -884,5 +905,8 @@ pub fn render(
         }
     }
 
-    out
+    RenderOutput {
+        text: out,
+        pending_images: state.pending_images,
+    }
 }
