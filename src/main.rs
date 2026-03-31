@@ -42,23 +42,46 @@ struct Args {
 /// Fairfax font embedded in the binary (OFL licensed).
 const EMBEDDED_FONT: &[u8] = include_bytes!("../fonts/Fairfax.ttf");
 
+/// Find a heading font: user-specified → system serif → embedded Fairfax.
+fn load_font(user_font: Option<&PathBuf>) -> Vec<u8> {
+    // 1. User-specified font takes priority
+    if let Some(p) = user_font {
+        match std::fs::read(p) {
+            Ok(data) => return data,
+            Err(e) => {
+                eprintln!("warning: cannot read font {}: {e}", p.display());
+            }
+        }
+    }
+
+    // 2. Try to find a system serif font via fontdb
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    let serif_query = fontdb::Query {
+        families: &[fontdb::Family::Serif],
+        ..fontdb::Query::default()
+    };
+
+    if let Some(id) = db.query(&serif_query) {
+        let mut data = Vec::new();
+        db.with_face_data(id, |bytes, _| {
+            data = bytes.to_vec();
+        });
+        if !data.is_empty() {
+            return data;
+        }
+    }
+
+    // 3. Embedded Fairfax as last resort
+    EMBEDDED_FONT.to_vec()
+}
+
 fn main() {
     let args = Args::parse();
 
-    // Load font
-    let font_data_owned;
-    let font_data: &[u8] = match &args.font {
-        Some(p) => {
-            font_data_owned = std::fs::read(p).unwrap_or_else(|e| {
-                eprintln!("error: cannot read font {}: {e}", p.display());
-                std::process::exit(1);
-            });
-            &font_data_owned
-        }
-        None => EMBEDDED_FONT,
-    };
-
-    let font = font::Font::new(font_data).unwrap_or_else(|| {
+    let font_data = load_font(args.font.as_ref());
+    let font = font::Font::new(&font_data).unwrap_or_else(|| {
         eprintln!("error: failed to parse font file");
         std::process::exit(1);
     });

@@ -1551,6 +1551,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ffmpeg-next",
+ "fontdb",
  "image",
  "notify",
  "pulldown-cmark",
