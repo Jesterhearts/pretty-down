@@ -50,6 +50,14 @@ Gifs can also be used:
 
 ![Nature](example_video.webm)
 
+## Math
+
+Inline math: $E = mc^2$ and $\int_0^\infty e^{-x} dx = 1$.
+
+Display math:
+
+$$\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}$$
+
 ## Mermaid Diagrams
 
 ```mermaid

@@ -49,11 +49,24 @@ enum PositionedSixel {
     Gif { col: u16, width: u16, gif_id: usize },
 }
 
+/// A segment of a rich text line (text mixed with inline images).
+#[derive(Clone)]
+enum RichSegment {
+    Text(String),
+    Image { image_id: usize, width_cols: u16 },
+}
+
 /// A display line.
 #[derive(Clone)]
 enum Line {
     /// A regular text line (may contain ANSI escapes).
     Text(String),
+    /// A text line containing inline images (e.g. math equations).
+    /// Height may be >1 if an inline image is taller than one row.
+    RichText {
+        segments: Vec<RichSegment>,
+        height: u16,
+    },
     /// One row of a half-block image preview, belonging to an image group.
     /// When all rows of the group are visible, the pager replaces them
     /// with the full sixel image.
@@ -103,6 +116,7 @@ impl Line {
             | Line::ImageRow { .. }
             | Line::TableRow { .. }
             | Line::ImageStrip { .. } => 1,
+            Line::RichText { height, .. } => *height,
             Line::CodeBlock { height, .. } => *height,
             Line::VideoControls { .. } => 1,
             Line::DetailsSummary { .. } => 1,
@@ -138,9 +152,64 @@ fn flatten_blocks(
     for block in &output.blocks {
         match block {
             OutputBlock::Text(text) => {
-                for line in text.split('\n') {
+                let mut line_iter = text.split('\n');
+                // First line: if the previous line is a RichText (from InlineImage),
+                // append this text to it instead of creating a new line
+                if let Some(first) = line_iter.next() {
+                    if let Some(Line::RichText { segments, .. }) = lines.last_mut() {
+                        segments.push(RichSegment::Text(first.to_string()));
+                    } else {
+                        lines.push(Line::Text(first.to_string()));
+                    }
+                }
+                for line in line_iter {
                     lines.push(Line::Text(line.to_string()));
                 }
+            }
+            OutputBlock::InlineImage(id) => {
+                let p = output.pending_images.get(*id);
+                let _rows = p.map(|p| p.estimated_rows()).unwrap_or(1);
+                let cols = p
+                    .map(|p| {
+                        p.preview()
+                            .first()
+                            .map(|l| crate::renderer::ansi::visible_len(l) as u16)
+                            .unwrap_or(4)
+                    })
+                    .unwrap_or(4);
+
+                // Convert the last Text line to a RichText, or start a new one
+                let prev = lines.pop();
+                let mut segments = match prev {
+                    Some(Line::Text(t)) => vec![RichSegment::Text(t)],
+                    Some(Line::RichText { segments, .. }) => segments,
+                    other => {
+                        if let Some(line) = other {
+                            lines.push(line);
+                        }
+                        vec![]
+                    }
+                };
+                segments.push(RichSegment::Image {
+                    image_id: *id,
+                    width_cols: cols,
+                });
+
+                // Height is max of all inline images in this line
+                let height = segments
+                    .iter()
+                    .filter_map(|s| match s {
+                        RichSegment::Image { image_id, .. } => output
+                            .pending_images
+                            .get(*image_id)
+                            .map(|p| p.estimated_rows()),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+
+                lines.push(Line::RichText { segments, height });
             }
             OutputBlock::Sixel {
                 data,
@@ -1215,6 +1284,22 @@ pub fn print_output(output: &RenderOutput) {
     for line in &lines {
         match line {
             Line::Text(t) => println!("{t}"),
+            Line::RichText { segments, .. } => {
+                for seg in segments {
+                    match seg {
+                        RichSegment::Text(t) => print!("{t}"),
+                        RichSegment::Image { image_id, .. } => {
+                            if let Some(p) = output.pending_images.get(*image_id) {
+                                let sixel = p.wait();
+                                if !sixel.is_empty() {
+                                    print!("{sixel}");
+                                }
+                            }
+                        }
+                    }
+                }
+                println!();
+            }
             Line::ImageRow {
                 group,
                 row_in_group,
@@ -1490,6 +1575,45 @@ fn draw_screen(
                     footnote_rows.push((rows_used, 0, 10, label, true));
                 }
                 rows_used += 1;
+            }
+            Line::RichText { segments, height } => {
+                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                // First pass: write text segments, leave gaps for images
+                let mut image_positions: Vec<(u16, usize)> = Vec::new();
+                let mut col: u16 = 0;
+                for seg in segments {
+                    match seg {
+                        RichSegment::Text(text) => {
+                            write!(stdout, "{text}").unwrap();
+                            col += crate::renderer::ansi::visible_len(text) as u16;
+                        }
+                        RichSegment::Image {
+                            image_id,
+                            width_cols,
+                        } => {
+                            image_positions.push((col, *image_id));
+                            // Write spaces as placeholder
+                            let gap = " ".repeat(*width_cols as usize);
+                            write!(stdout, "{gap}").unwrap();
+                            col += width_cols;
+                        }
+                    }
+                }
+                write!(stdout, "\r").unwrap();
+                // Second pass: overlay sixel images at their positions
+                for (img_col, image_id) in &image_positions {
+                    if let Some(p) = pending_images.get(*image_id)
+                        && p.is_ready()
+                    {
+                        let sixel = p.wait();
+                        if !sixel.is_empty() {
+                            crossterm::execute!(stdout, cursor::MoveTo(*img_col, rows_used))
+                                .unwrap();
+                            write!(stdout, "{sixel}").unwrap();
+                        }
+                    }
+                }
+                rows_used += height;
             }
             Line::ImageRow {
                 group,

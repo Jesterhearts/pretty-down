@@ -1,5 +1,6 @@
 mod font;
 mod highlight;
+mod math;
 mod pager;
 mod renderer;
 mod sixel;

@@ -22,3 +22,7 @@ resvg = "0.47.0"
 ureq = "3.3.0"
 fontdb = { version = "0.23.0", features = ["memmap"] }
 mermaid-rs-renderer = "0.2.1"
+mitex = "0.2.4"
+typst = "0.14.2"
+typst-svg = "0.14.2"
+typst-assets = { version = "0.14.2", features = ["fonts"] }

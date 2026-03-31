@@ -27,6 +27,8 @@ images are displayed inline — all without leaving your terminal.
 - **Animated GIFs** — Decoded and animated in the pager with per-frame timing
 - **Video** — MP4, WebM, MKV, AVI, MOV playback via FFmpeg (requires
   FFmpeg libraries installed)
+- **LaTeX math** — `$inline$` and `$$display$$` math rendered as sixel
+  images via [mitex](https://crates.io/crates/mitex) + [typst](https://crates.io/crates/typst)
 - **Mermaid diagrams** — ` ```mermaid ` code blocks rendered as inline
   sixel images via [mermaid-rs-renderer](https://crates.io/crates/mermaid-rs-renderer)
 - **Syntax highlighting** — Code blocks with language tags are highlighted
@@ -138,6 +140,8 @@ collapsible sections, and styled HTML.
 - [ureq](https://crates.io/crates/ureq) — HTTP image fetching
 - [resvg](https://crates.io/crates/resvg) — SVG rendering
 - [mermaid-rs-renderer](https://crates.io/crates/mermaid-rs-renderer) — Mermaid diagram rendering
+- [mitex](https://crates.io/crates/mitex) — LaTeX to Typst conversion
+- [typst](https://crates.io/crates/typst) + [typst-svg](https://crates.io/crates/typst-svg) — Math typesetting and SVG rendering
 
 ## License
 

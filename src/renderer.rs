@@ -893,7 +893,7 @@ fn handle_block_html(
                     let id = state.next_details_id.saturating_sub(1);
                     flush_text(out, blocks);
                     blocks.push(OutputBlock::DetailsEnd { id });
-                } else if block_tag.as_deref() == Some(&name) {
+                } else if block_tag.as_deref() == Some(name.as_str()) {
                     emit_block(&name, &text_buf, state, out, blocks, font, theme, in_pre);
                     block_tag = None;
                     text_buf.clear();
@@ -1154,6 +1154,9 @@ pub enum OutputBlock {
     Gif(usize),
     /// Multiple images laid out side-by-side.
     SideBySide(Vec<SideBySideItem>),
+    /// An image that flows inline with surrounding text (e.g. math).
+    /// Index into `pending_images`.
+    InlineImage(usize),
     /// Index into `code_blocks`.
     Code(usize),
     /// A pre-laid-out table rendered directly to stdout by the pager.
@@ -1495,6 +1498,32 @@ fn flush_para_images(
     }
 }
 
+/// Render a LaTeX math expression to a PendingImage, returning its id.
+fn render_math_image(
+    latex: &str,
+    display: bool,
+    max_width: u32,
+    state: &mut RenderState,
+) -> Option<usize> {
+    let svg = crate::math::render_latex_to_svg(latex, display)?;
+    let img = sixel::render_svg_bytes(svg.as_bytes(), max_width)?;
+    let rows = sixel::pixel_height_to_rows(img.height());
+    let preview = sixel::half_block_preview(&img, sixel::preview_columns(img.width()), rows);
+
+    let result = std::sync::Arc::new(std::sync::OnceLock::new());
+    let result_clone = result.clone();
+    std::thread::spawn(move || {
+        let encoded = sixel::encode_rgba(img.width(), img.height(), img.as_raw());
+        let _ = result_clone.set(encoded);
+    });
+
+    let id = state.pending_images.len();
+    state
+        .pending_images
+        .push(sixel::PendingImage::new(result, rows, preview));
+    Some(id)
+}
+
 fn end_code_block(
     state: &mut RenderState,
     out: &mut String,
@@ -1660,7 +1689,8 @@ pub fn render(
     let options = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES;
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH;
     let parser = Parser::new_ext(markdown, options);
 
     let mut out = String::new();
@@ -1994,6 +2024,31 @@ pub fn render(
             Event::End(TagEnd::FootnoteDefinition) => {
                 flush_text(&mut out, &mut blocks);
                 blocks.push(OutputBlock::FootnoteDefEnd);
+            }
+
+            // ── Math ──────────────────────────────────────────────
+            Event::InlineMath(latex) => {
+                let text_width_px = latex.len() as u32 * sixel::cell_pixel_width();
+                let max_w = (text_width_px * 2).max(200);
+                if let Some(id) = render_math_image(&latex, false, max_w, &mut state) {
+                    // Flush preceding text so block ordering is correct;
+                    // flatten_blocks merges the Text + InlineImage into a RichText line
+                    flush_text(&mut out, &mut blocks);
+                    blocks.push(OutputBlock::InlineImage(id));
+                } else {
+                    out.push_str(&format!("\x1b[3m\x1b[36m{latex}\x1b[0m"));
+                }
+            }
+            Event::DisplayMath(latex) => {
+                let text_width_px = latex.len() as u32 * sixel::cell_pixel_width();
+                let max_w = (text_width_px * 2).max(200);
+                if let Some(id) = render_math_image(&latex, true, max_w, &mut state) {
+                    flush_text(&mut out, &mut blocks);
+                    blocks.push(OutputBlock::Image(id));
+                } else {
+                    flush_text(&mut out, &mut blocks);
+                    out.push_str(&format!("\x1b[3m\x1b[36m$${latex}$$\x1b[0m\n"));
+                }
             }
 
             _ => {}
