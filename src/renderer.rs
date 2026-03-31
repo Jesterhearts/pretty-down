@@ -1505,6 +1505,40 @@ fn end_code_block(
     state.in_code_block = false;
     let code = std::mem::take(&mut state.code_buf);
 
+    // Mermaid diagrams: render to SVG → sixel image
+    if state.code_lang.as_deref() == Some("mermaid") {
+        state.code_lang = None;
+        if let Ok(svg) = mermaid_rs_renderer::render(&code) {
+            let max_w = sixel::terminal_pixel_width();
+            if let Some(img) = sixel::render_svg_bytes(svg.as_bytes(), max_w) {
+                let estimated_rows = sixel::pixel_height_to_rows(img.height());
+                let preview = sixel::half_block_preview(
+                    &img,
+                    sixel::preview_columns(img.width()),
+                    estimated_rows,
+                );
+
+                let result = std::sync::Arc::new(std::sync::OnceLock::new());
+                let result_clone = result.clone();
+                std::thread::spawn(move || {
+                    let encoded = sixel::encode_rgba(img.width(), img.height(), img.as_raw());
+                    let _ = result_clone.set(encoded);
+                });
+
+                let id = state.pending_images.len();
+                state.pending_images.push(sixel::PendingImage::new(
+                    result,
+                    estimated_rows,
+                    preview,
+                ));
+                flush_text(out, blocks);
+                blocks.push(OutputBlock::Image(id));
+                return;
+            }
+        }
+        // Fall through to normal code block if rendering fails
+    }
+
     let highlighted = state
         .code_lang
         .as_deref()

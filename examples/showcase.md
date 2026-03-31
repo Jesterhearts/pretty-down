@@ -50,6 +50,17 @@ Gifs can also be used:
 
 ![Nature](example_video.webm)
 
+## Mermaid Diagrams
+
+```mermaid
+flowchart LR
+    A[Start] --> B{Decision}
+    B -->|Yes| C[OK]
+    B -->|No| D[Cancel]
+    C --> E[End]
+    D --> E
+```
+
 ## Code Blocks
 
 Syntax highlighting is applied automatically when a language is specified.

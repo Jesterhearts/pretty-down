@@ -27,6 +27,8 @@ images are displayed inline — all without leaving your terminal.
 - **Animated GIFs** — Decoded and animated in the pager with per-frame timing
 - **Video** — MP4, WebM, MKV, AVI, MOV playback via FFmpeg (requires
   FFmpeg libraries installed)
+- **Mermaid diagrams** — ` ```mermaid ` code blocks rendered as inline
+  sixel images via [mermaid-rs-renderer](https://crates.io/crates/mermaid-rs-renderer)
 - **Syntax highlighting** — Code blocks with language tags are highlighted
   via [syntect](https://crates.io/crates/syntect) with true-color output
 - **Horizontally scrollable code blocks** — Code doesn't wrap; scroll
@@ -135,6 +137,7 @@ collapsible sections, and styled HTML.
 - [ffmpeg-next](https://crates.io/crates/ffmpeg-next) — Video decoding
 - [ureq](https://crates.io/crates/ureq) — HTTP image fetching
 - [resvg](https://crates.io/crates/resvg) — SVG rendering
+- [mermaid-rs-renderer](https://crates.io/crates/mermaid-rs-renderer) — Mermaid diagram rendering
 
 ## License
 
