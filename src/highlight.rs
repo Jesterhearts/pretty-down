@@ -43,12 +43,6 @@ impl Highlighter {
         Ok(())
     }
 
-    /// List available theme names.
-    #[allow(dead_code)]
-    pub fn theme_names(&self) -> Vec<&str> {
-        self.theme_set.themes.keys().map(|s| s.as_str()).collect()
-    }
-
     /// Highlight a code block and return ANSI-colored text.
     ///
     /// `lang` is the language identifier (e.g. "rust", "python", "js").

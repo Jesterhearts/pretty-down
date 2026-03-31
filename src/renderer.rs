@@ -473,80 +473,7 @@ fn css_style_to_ansi(style: &str) -> String {
 
 /// Parse a CSS color value from a string (named colors, #hex, rgb()).
 fn parse_css_color_simple(style_value: &str) -> Option<(u8, u8, u8)> {
-    let val = style_value.trim();
-
-    // #rrggbb
-    if let Some(hex) = val.strip_prefix('#') {
-        return parse_hex_color(hex);
-    }
-
-    // rgb(r, g, b)
-    if let Some(inner) = val
-        .strip_prefix("rgb(")
-        .or_else(|| val.strip_prefix("RGB("))
-        && let Some(inner) = inner.strip_suffix(')')
-    {
-        let parts: Vec<&str> = inner.split(',').collect();
-        if parts.len() == 3 {
-            let r = parts[0].trim().parse().ok()?;
-            let g = parts[1].trim().parse().ok()?;
-            let b = parts[2].trim().parse().ok()?;
-            return Some((r, g, b));
-        }
-    }
-
-    // Named colors (common subset)
-    match val.to_ascii_lowercase().as_str() {
-        "black" => Some((0, 0, 0)),
-        "white" => Some((255, 255, 255)),
-        "red" => Some((255, 0, 0)),
-        "green" => Some((0, 128, 0)),
-        "blue" => Some((0, 0, 255)),
-        "yellow" => Some((255, 255, 0)),
-        "cyan" | "aqua" => Some((0, 255, 255)),
-        "magenta" | "fuchsia" => Some((255, 0, 255)),
-        "orange" => Some((255, 165, 0)),
-        "purple" => Some((128, 0, 128)),
-        "pink" => Some((255, 192, 203)),
-        "gray" | "grey" => Some((128, 128, 128)),
-        "lightgray" | "lightgrey" => Some((211, 211, 211)),
-        "darkgray" | "darkgrey" => Some((169, 169, 169)),
-        "brown" => Some((139, 69, 19)),
-        "navy" => Some((0, 0, 128)),
-        "teal" => Some((0, 128, 128)),
-        "olive" => Some((128, 128, 0)),
-        "maroon" => Some((128, 0, 0)),
-        "lime" => Some((0, 255, 0)),
-        "silver" => Some((192, 192, 192)),
-        "coral" => Some((255, 127, 80)),
-        "salmon" => Some((250, 128, 114)),
-        "gold" => Some((255, 215, 0)),
-        "skyblue" => Some((135, 206, 235)),
-        "violet" => Some((238, 130, 238)),
-        "indigo" => Some((75, 0, 130)),
-        "crimson" => Some((220, 20, 60)),
-        _ => None,
-    }
-}
-
-fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
-    match hex.len() {
-        // #rgb
-        3 => {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
-            Some((r * 17, g * 17, b * 17))
-        }
-        // #rrggbb
-        6 => {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            Some((r, g, b))
-        }
-        _ => None,
-    }
+    crate::theme::parse_color(style_value)
 }
 
 // ---------------------------------------------------------------------------
@@ -938,36 +865,10 @@ fn emit_block(
     match tag {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level: usize = tag[1..].parse().unwrap_or(1);
-            let idx = (level - 1).min(5);
             if !text.is_empty() {
-                let color = theme.heading_color(level);
-                let (w, h, pixels) =
-                    crate::font::render_text(font, &text, HEADING_SIZES[idx], color);
-                let max_w = sixel::terminal_pixel_width();
-                let (w, pixels) = if w > max_w {
-                    crop_pixels_width(&pixels, w, h, max_w)
-                } else {
-                    (w, pixels)
-                };
-                if w > 0 && h > 0 {
-                    let snapped_h = sixel::snap_height_to_cells(h);
-                    let pixels = if snapped_h > h {
-                        let mut padded = pixels;
-                        padded.resize((w * snapped_h * 4) as usize, 0);
-                        padded
-                    } else {
-                        pixels
-                    };
-                    let data = sixel::encode_rgba(w, snapped_h, &pixels);
-                    let height = sixel::pixel_height_to_rows(snapped_h);
-                    let preview = sixel::preview_from_pixels(&pixels, w, snapped_h, height);
-                    flush_text(out, blocks);
-                    blocks.push(OutputBlock::Sixel {
-                        data,
-                        height,
-                        preview,
-                    });
-                }
+                state.heading_text = text.to_string();
+                state.heading_level = level;
+                render_heading_sixel(state, out, blocks, font, theme);
             }
         }
         "p" => {

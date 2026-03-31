@@ -317,91 +317,6 @@ pub fn encode_image_file_async(
     Some(PendingImage::new(result, estimated_rows, preview))
 }
 
-/// Encode a static image from raw bytes asynchronously.
-#[allow(dead_code)]
-pub fn encode_image_bytes_async(
-    data: &[u8],
-    max_width: u32,
-) -> Option<PendingImage> {
-    let img = image::load_from_memory(data).ok()?.to_rgba8();
-    let img = scale_image(img, max_width);
-    let estimated_rows = pixel_height_to_rows(img.height());
-    let preview = half_block_preview(&img, preview_columns(img.width()), estimated_rows);
-
-    let result = Arc::new(OnceLock::new());
-    let result_clone = result.clone();
-
-    std::thread::spawn(move || {
-        let encoded = ImageEncoder::encode(img);
-        let _ = result_clone.set(encoded);
-    });
-
-    Some(PendingImage::new(result, estimated_rows, preview))
-}
-
-/// Encode a GIF from raw bytes asynchronously.
-#[allow(dead_code)]
-pub fn encode_gif_bytes_async(
-    data: Vec<u8>,
-    max_width: u32,
-) -> Option<PendingGif> {
-    use image::AnimationDecoder;
-    use image::codecs::gif::GifDecoder;
-
-    let cursor = std::io::Cursor::new(&data);
-    let decoder = GifDecoder::new(cursor).ok()?;
-    let raw_frames: Vec<_> = decoder.into_frames().collect();
-
-    if raw_frames.is_empty() {
-        return None;
-    }
-
-    let first = raw_frames.first()?.as_ref().ok()?;
-    let scaled = scale_image(first.buffer().clone(), max_width);
-    let estimated_rows = pixel_height_to_rows(scaled.height());
-    let preview = half_block_preview(&scaled, preview_columns(scaled.width()), estimated_rows);
-
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let done = Arc::new(OnceLock::new());
-    let frames_clone = frames.clone();
-    let done_clone = done.clone();
-
-    std::thread::spawn(move || {
-        // Re-decode from owned data
-        let cursor = std::io::Cursor::new(data);
-        let Ok(decoder) = GifDecoder::new(cursor) else {
-            let _ = done_clone.set(());
-            return;
-        };
-        for frame_result in decoder.into_frames() {
-            let Ok(frame) = frame_result else { continue };
-            let (numer, denom) = frame.delay().numer_denom_ms();
-            let delay_ms: u32 = if denom == 0 {
-                100
-            } else {
-                (numer / denom).max(10)
-            };
-            let img = scale_image(frame.into_buffer(), max_width);
-            let sixel = AnimEncoder::encode(img);
-            frames_clone
-                .lock()
-                .unwrap()
-                .push(GifFrame { sixel, delay_ms });
-        }
-        let _ = done_clone.set(());
-    });
-
-    Some(PendingGif {
-        frames,
-        done,
-        cycle_len: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        playback_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        estimated_rows,
-        preview,
-        is_video: false,
-    })
-}
-
 /// A single encoded GIF frame.
 pub struct GifFrame {
     pub sixel: String,
@@ -647,13 +562,6 @@ pub fn encode_video_async(
     let input = ffmpeg::format::input(path).ok()?;
     let stream = input.streams().best(ffmpeg::media::Type::Video)?;
 
-    let rate = stream.avg_frame_rate();
-    let _delay_ms = if rate.numerator() > 0 && rate.denominator() > 0 {
-        (1000 * rate.denominator() as u64 / rate.numerator() as u64) as u32
-    } else {
-        33
-    };
-
     let codec_params = stream.parameters();
     let decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)
         .ok()?
@@ -719,58 +627,50 @@ pub fn encode_video_async(
 
         const MAX_AHEAD: usize = 30;
 
-        loop {
-            for (s, packet) in input.packets() {
-                if s.index() != stream_index {
+        for (s, packet) in input.packets() {
+            if s.index() != stream_index {
+                continue;
+            }
+            let _ = decoder.send_packet(&packet);
+            let mut decoded = ffmpeg::frame::Video::empty();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let sws = scaler.get_or_insert_with(|| {
+                    ffmpeg::software::scaling::context::Context::get(
+                        decoded.format(),
+                        decoded.width(),
+                        decoded.height(),
+                        ffmpeg::format::Pixel::RGBA,
+                        dst_width,
+                        dst_height,
+                        ffmpeg::software::scaling::Flags::BILINEAR,
+                    )
+                    .expect("scaler")
+                });
+                let mut rgb_frame = ffmpeg::frame::Video::empty();
+                if sws.run(&decoded, &mut rgb_frame).is_err() {
                     continue;
                 }
-                let _ = decoder.send_packet(&packet);
-                let mut decoded = ffmpeg::frame::Video::empty();
-                while decoder.receive_frame(&mut decoded).is_ok() {
-                    let sws = scaler.get_or_insert_with(|| {
-                        ffmpeg::software::scaling::context::Context::get(
-                            decoded.format(),
-                            decoded.width(),
-                            decoded.height(),
-                            ffmpeg::format::Pixel::RGBA,
-                            dst_width,
-                            dst_height,
-                            ffmpeg::software::scaling::Flags::BILINEAR,
-                        )
-                        .expect("scaler")
-                    });
-                    let mut rgb_frame = ffmpeg::frame::Video::empty();
-                    if sws.run(&decoded, &mut rgb_frame).is_err() {
-                        continue;
+                if let Some(img) = frame_to_rgba(&rgb_frame, dst_width, dst_height) {
+                    // Throttle: wait if we're too far ahead of playback
+                    while frames_clone.lock().unwrap().len()
+                        > playback_clone.load(std::sync::atomic::Ordering::Relaxed) + MAX_AHEAD
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
-                    if let Some(img) = frame_to_rgba(&rgb_frame, dst_width, dst_height) {
-                        // Throttle: wait if we're too far ahead of playback
-                        loop {
-                            let count = frames_clone.lock().unwrap().len();
-                            let playback =
-                                playback_clone.load(std::sync::atomic::Ordering::Relaxed);
-                            if count <= playback + MAX_AHEAD {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
 
-                        let sixel = AnimEncoder::encode(img);
-                        frames_clone
-                            .lock()
-                            .unwrap()
-                            .push(GifFrame { sixel, delay_ms });
-                    }
+                    let sixel = AnimEncoder::encode(img);
+                    frames_clone
+                        .lock()
+                        .unwrap()
+                        .push(GifFrame { sixel, delay_ms });
                 }
             }
+        }
 
-            // First pass complete — record cycle length and stop encoding.
-            // Playback loops through the stored frames; no need to re-encode.
-            let count = frames_clone.lock().unwrap().len();
-            if count > 0 {
-                cycle_len_clone.store(count, std::sync::atomic::Ordering::Relaxed);
-            }
-            break;
+        // Record cycle length after encoding completes.
+        let count = frames_clone.lock().unwrap().len();
+        if count > 0 {
+            cycle_len_clone.store(count, std::sync::atomic::Ordering::Relaxed);
         }
 
         let _ = done_clone.set(());

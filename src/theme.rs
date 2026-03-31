@@ -16,7 +16,7 @@ impl Color {
         match self {
             Color::Ansi(n) => format!("\x1b[38;5;{n}m"),
             Color::Hex(s) => {
-                if let Some((r, g, b)) = parse_color_str(s) {
+                if let Some((r, g, b)) = parse_color(s) {
                     format!("\x1b[38;2;{r};{g};{b}m")
                 } else {
                     String::new()
@@ -30,7 +30,7 @@ impl Color {
         match self {
             Color::Ansi(n) => format!("\x1b[48;5;{n}m"),
             Color::Hex(s) => {
-                if let Some((r, g, b)) = parse_color_str(s) {
+                if let Some((r, g, b)) = parse_color(s) {
                     format!("\x1b[48;2;{r};{g};{b}m")
                 } else {
                     String::new()
@@ -42,7 +42,7 @@ impl Color {
     pub fn to_rgb(&self) -> Option<[u8; 3]> {
         match self {
             Color::Ansi(_) => None, // can't easily map to RGB
-            Color::Hex(s) => parse_color_str(s).map(|(r, g, b)| [r, g, b]),
+            Color::Hex(s) => parse_color(s).map(|(r, g, b)| [r, g, b]),
         }
     }
 }
@@ -223,10 +223,16 @@ impl Theme {
     }
 }
 
-/// Parse a color string: "#rrggbb", "#rgb", or named colors.
-fn parse_color_str(s: &str) -> Option<(u8, u8, u8)> {
-    if let Some(hex) = s.strip_prefix('#') {
-        match hex.len() {
+/// Parse a color string: "#rrggbb", "#rgb", "rgb(r,g,b)", or any CSS named
+/// color.
+pub fn parse_color(s: &str) -> Option<(u8, u8, u8)> {
+    use palette::Srgb;
+    use palette::named;
+
+    let val = s.trim();
+
+    if let Some(hex) = val.strip_prefix('#') {
+        return match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
                 let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
@@ -240,22 +246,24 @@ fn parse_color_str(s: &str) -> Option<(u8, u8, u8)> {
                 Some((r, g, b))
             }
             _ => None,
-        }
-    } else {
-        // Named colors
-        match s.to_ascii_lowercase().as_str() {
-            "white" => Some((255, 255, 255)),
-            "black" => Some((0, 0, 0)),
-            "red" => Some((255, 0, 0)),
-            "green" => Some((0, 128, 0)),
-            "blue" => Some((0, 0, 255)),
-            "yellow" => Some((255, 255, 0)),
-            "cyan" => Some((0, 255, 255)),
-            "magenta" => Some((255, 0, 255)),
-            "orange" => Some((255, 165, 0)),
-            "purple" => Some((128, 0, 128)),
-            "gray" | "grey" => Some((128, 128, 128)),
-            _ => None,
+        };
+    }
+
+    if let Some(inner) = val
+        .strip_prefix("rgb(")
+        .or_else(|| val.strip_prefix("RGB("))
+        && let Some(inner) = inner.strip_suffix(')')
+    {
+        let parts: Vec<&str> = inner.split(',').collect();
+        if parts.len() == 3 {
+            let r = parts[0].trim().parse().ok()?;
+            let g = parts[1].trim().parse().ok()?;
+            let b = parts[2].trim().parse().ok()?;
+            return Some((r, g, b));
         }
     }
+
+    // Named CSS colors via palette
+    let srgb: Srgb<u8> = named::from_str(&val.to_ascii_lowercase())?.into_format();
+    Some((srgb.red, srgb.green, srgb.blue))
 }

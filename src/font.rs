@@ -1,7 +1,3 @@
-use std::hash::BuildHasher;
-use std::hash::Hasher;
-use std::hash::RandomState;
-
 use raqote::DrawOptions;
 use raqote::DrawTarget;
 use raqote::PathBuilder;
@@ -13,42 +9,17 @@ use rustybuzz::ttf_parser::GlyphId;
 use rustybuzz::ttf_parser::RgbaColor;
 
 /// A parsed font face used for text rasterization.
-#[allow(dead_code)]
 pub struct Font<'a> {
     face: Face<'a>,
-    advance: f32,
-    id: u64,
 }
 
 impl<'a> Font<'a> {
     pub fn new(data: &'a [u8]) -> Option<Self> {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write(data);
-
-        Face::from_slice(data, 0).map(|face| {
-            let advance = face
-                .glyph_hor_advance(face.glyph_index('m').unwrap_or_default())
-                .unwrap_or_default() as f32;
-            Self {
-                face,
-                advance,
-                id: hasher.finish(),
-            }
-        })
+        Face::from_slice(data, 0).map(|face| Self { face })
     }
 
     pub fn face(&self) -> &Face<'_> {
         &self.face
-    }
-
-    /// Compute the pixel width of a single character at the given height.
-    #[allow(dead_code)]
-    pub fn char_width(
-        &self,
-        height_px: u32,
-    ) -> u32 {
-        let scale = height_px as f32 / self.face.height() as f32;
-        (self.advance * scale) as u32
     }
 }
 

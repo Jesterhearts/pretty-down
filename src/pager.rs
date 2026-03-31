@@ -791,6 +791,28 @@ pub fn run(
     // Track how many pending images were ready at the last flatten
     let mut images_ready_count: usize = pending.iter().filter(|p| p.is_ready()).count();
 
+    // Macro to apply a new render output: re-flatten, reset all state vecs.
+    macro_rules! apply_output {
+        ($new_output:expr) => {{
+            let new_output = $new_output;
+            lines = flatten_blocks(&new_output, &mut sixel_store);
+            visible = visible_indices(&lines, &collapsed);
+            current_output = Some(new_output);
+            pending = &current_output.as_ref().unwrap().pending_images;
+            pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
+            code_blocks = &current_output.as_ref().unwrap().code_blocks;
+            gif_state = vec![None; pending_gifs.len()];
+            video_paused = vec![false; pending_gifs.len()];
+            video_progress_pos = vec![0; pending_gifs.len()];
+            code_h_scroll = vec![0; code_blocks.len()];
+            if scroll_offset >= visible.len() {
+                scroll_offset = visible.len().saturating_sub(1);
+            }
+            images_ready_count = pending.iter().filter(|p| p.is_ready()).count();
+            needs_redraw = true;
+        }};
+    }
+
     loop {
         if advance_gif_frames(&mut gif_state, pending_gifs, &video_paused) {
             needs_redraw = true;
@@ -879,21 +901,7 @@ pub fn run(
         {
             while rx.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(50));
-            let new_output = render_fn();
-            lines = flatten_blocks(&new_output, &mut sixel_store);
-            visible = visible_indices(&lines, &collapsed);
-            current_output = Some(new_output);
-            pending = &current_output.as_ref().unwrap().pending_images;
-            pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
-            code_blocks = &current_output.as_ref().unwrap().code_blocks;
-            gif_state = vec![None; pending_gifs.len()];
-            video_paused = vec![false; pending_gifs.len()];
-            video_progress_pos = vec![0; pending_gifs.len()];
-            code_h_scroll = vec![0; code_blocks.len()];
-            if scroll_offset >= visible.len() {
-                scroll_offset = visible.len().saturating_sub(1);
-            }
-            needs_redraw = true;
+            apply_output!(render_fn());
             continue;
         }
 
@@ -927,27 +935,10 @@ pub fn run(
         // Handle terminal resize — re-render with new dimensions
         if let Event::Resize(cols, rows) = ev {
             term_cols = cols;
-            let new_viewport = rows.saturating_sub(1);
-            // Invalidate cached pixel width so re-render picks up new size
-            crate::sixel::invalidate_terminal_size();
-            let new_output = render_fn();
-            lines = flatten_blocks(&new_output, &mut sixel_store);
-            visible = visible_indices(&lines, &collapsed);
-            current_output = Some(new_output);
-            pending = &current_output.as_ref().unwrap().pending_images;
-            pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
-            code_blocks = &current_output.as_ref().unwrap().code_blocks;
-            gif_state = vec![None; pending_gifs.len()];
-            video_paused = vec![false; pending_gifs.len()];
-            video_progress_pos = vec![0; pending_gifs.len()];
-            code_h_scroll = vec![0; code_blocks.len()];
-            // Update viewport dimensions
-            viewport_rows = new_viewport;
+            viewport_rows = rows.saturating_sub(1);
             term_rows = rows;
-            if scroll_offset >= visible.len() {
-                scroll_offset = visible.len().saturating_sub(1);
-            }
-            needs_redraw = true;
+            crate::sixel::invalidate_terminal_size();
+            apply_output!(render_fn());
             continue;
         }
 
@@ -1215,21 +1206,7 @@ pub fn run(
                     code: KeyCode::Char('r'),
                     ..
                 } => {
-                    let new_output = render_fn();
-                    lines = flatten_blocks(&new_output, &mut sixel_store);
-                    visible = visible_indices(&lines, &collapsed);
-                    current_output = Some(new_output);
-                    pending = &current_output.as_ref().unwrap().pending_images;
-                    pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
-                    code_blocks = &current_output.as_ref().unwrap().code_blocks;
-                    gif_state = vec![None; pending_gifs.len()];
-                    video_paused = vec![false; pending_gifs.len()];
-                    video_progress_pos = vec![0; pending_gifs.len()];
-                    code_h_scroll = vec![0; code_blocks.len()];
-                    if scroll_offset >= visible.len() {
-                        scroll_offset = visible.len().saturating_sub(1);
-                    }
-                    needs_redraw = true;
+                    apply_output!(render_fn());
                 }
 
                 // Toggle details or video play/pause
