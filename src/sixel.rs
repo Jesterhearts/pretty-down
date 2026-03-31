@@ -2,15 +2,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use a_sixel::dither::Bayer;
 use a_sixel::dither::NoDither;
 use a_sixel::dither::Sierra;
+use a_sixel::dither::Sobol;
 use image::RgbaImage;
 
 type ImageEncoder = a_sixel::BitMergeSixelEncoderBest<Sierra>;
 type TextEncoder = a_sixel::BitSixelEncoder<NoDither>;
 /// Fast encoder for animated content (GIFs, videos) where speed > quality.
-type AnimEncoder = a_sixel::BitSixelEncoder<Bayer>;
+type AnimEncoder = a_sixel::BitSixelEncoder<Sobol>;
 
 /// Query the terminal's cell pixel height.
 /// Falls back to 20px if the query fails or returns 0.
