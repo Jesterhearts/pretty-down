@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::io::{
@@ -688,10 +687,13 @@ pub fn run(
         summary_rows: Vec::new(),
         video_control_rows: Vec::new(),
     };
-    // Per-GIF animation state: (current frame index, next frame deadline)
-    let mut gif_state: HashMap<usize, (usize, std::time::Instant)> = HashMap::new();
-    let mut code_h_scroll: HashMap<usize, usize> = HashMap::new();
-    let mut video_paused: HashSet<usize> = HashSet::new();
+    // Per-GIF animation state: (current frame index, next frame deadline).
+    // None = not yet visible / not registered.
+    let mut gif_state: Vec<Option<(usize, std::time::Instant)>> = vec![None; pending_gifs.len()];
+    let mut code_h_scroll: Vec<usize> = vec![0; output.code_blocks.len()];
+    let mut video_paused: Vec<bool> = vec![false; pending_gifs.len()];
+    // Track last progress dot position per GIF to prevent jitter during loading
+    let mut video_progress_pos: Vec<usize> = vec![0; pending_gifs.len()];
     // Track how many pending images were ready at the last flatten
     let mut images_ready_count: usize = pending.iter().filter(|p| p.is_ready()).count();
 
@@ -715,9 +717,11 @@ pub fn run(
         }
 
         if needs_redraw {
-            // Build the frame index map for draw_screen
-            let gif_frames: HashMap<usize, usize> =
-                gif_state.iter().map(|(id, (idx, _))| (*id, *idx)).collect();
+            // Build the frame index vec for draw_screen
+            let gif_frames: Vec<usize> = gif_state
+                .iter()
+                .map(|slot| slot.map(|(idx, _)| idx).unwrap_or(0))
+                .collect();
 
             last_draw = draw_screen(
                 &mut stdout,
@@ -729,6 +733,7 @@ pub fn run(
                 pending_gifs,
                 &gif_frames,
                 &video_paused,
+                &mut video_progress_pos,
                 code_blocks,
                 &code_h_scroll,
                 scroll_offset,
@@ -739,40 +744,32 @@ pub fn run(
             );
 
             // Register any newly visible GIFs that aren't tracked yet
+            let register_gif = |id: usize, state: &mut Vec<Option<(usize, std::time::Instant)>>| {
+                if let Some(slot) = state.get_mut(id) {
+                    if slot.is_none() {
+                        let delay = pending_gifs
+                            .get(id)
+                            .and_then(|g| g.frame(0))
+                            .map(|f| f.delay_ms)
+                            .unwrap_or(100);
+                        *slot = Some((
+                            0,
+                            std::time::Instant::now() + Duration::from_millis(delay as u64),
+                        ));
+                    }
+                }
+            };
             for &vi in &visible[scroll_offset..] {
                 match &lines[vi] {
                     Line::ImageRow {
                         group: ImageGroup::Gif(id),
                         row_in_group: 0,
                         ..
-                    } => {
-                        gif_state.entry(*id).or_insert_with(|| {
-                            let delay = pending_gifs
-                                .get(*id)
-                                .and_then(|g| g.frame(0))
-                                .map(|f| f.delay_ms)
-                                .unwrap_or(100);
-                            (
-                                0,
-                                std::time::Instant::now() + Duration::from_millis(delay as u64),
-                            )
-                        });
-                    }
+                    } => register_gif(*id, &mut gif_state),
                     Line::ImageStrip { sixels, .. } => {
                         for s in sixels {
                             if let PositionedSixel::Gif { gif_id, .. } = s {
-                                gif_state.entry(*gif_id).or_insert_with(|| {
-                                    let delay = pending_gifs
-                                        .get(*gif_id)
-                                        .and_then(|g| g.frame(0))
-                                        .map(|f| f.delay_ms)
-                                        .unwrap_or(100);
-                                    (
-                                        0,
-                                        std::time::Instant::now()
-                                            + Duration::from_millis(delay as u64),
-                                    )
-                                });
+                                register_gif(*gif_id, &mut gif_state);
                             }
                         }
                     }
@@ -795,7 +792,10 @@ pub fn run(
             pending = &current_output.as_ref().unwrap().pending_images;
             pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
             code_blocks = &current_output.as_ref().unwrap().code_blocks;
-            gif_state.clear();
+            gif_state = vec![None; pending_gifs.len()];
+            video_paused = vec![false; pending_gifs.len()];
+            video_progress_pos = vec![0; pending_gifs.len()];
+            code_h_scroll = vec![0; code_blocks.len()];
             if scroll_offset >= visible.len() {
                 scroll_offset = visible.len().saturating_sub(1);
             }
@@ -808,7 +808,10 @@ pub fn run(
         }
 
         // Find the earliest GIF frame deadline
-        let next_gif_deadline = gif_state.values().map(|(_, deadline)| *deadline).min();
+        let next_gif_deadline = gif_state
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|(_, deadline)| *deadline))
+            .min();
 
         let poll_timeout = if let Some(t) = next_gif_deadline {
             t.saturating_duration_since(std::time::Instant::now())
@@ -840,7 +843,10 @@ pub fn run(
             pending = &current_output.as_ref().unwrap().pending_images;
             pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
             code_blocks = &current_output.as_ref().unwrap().code_blocks;
-            gif_state.clear();
+            gif_state = vec![None; pending_gifs.len()];
+            video_paused = vec![false; pending_gifs.len()];
+            video_progress_pos = vec![0; pending_gifs.len()];
+            code_h_scroll = vec![0; code_blocks.len()];
             // Update viewport dimensions
             viewport_rows = new_viewport;
             term_rows = rows;
@@ -880,10 +886,8 @@ pub fn run(
         }) = ev
             && let Some(&(_, gif_id)) = last_draw.video_control_rows.iter().find(|(r, _)| *r == row)
         {
-            if video_paused.contains(&gif_id) {
-                video_paused.remove(&gif_id);
-            } else {
-                video_paused.insert(gif_id);
+            if let Some(p) = video_paused.get_mut(gif_id) {
+                *p = !*p;
             }
             needs_redraw = true;
             continue;
@@ -931,17 +935,18 @@ pub fn run(
                     viewport_rows,
                     row,
                 ) {
-                    let entry = code_h_scroll.entry(block_id).or_insert(0);
-                    let max = code_blocks[block_id]
-                        .max_width
-                        .saturating_sub(term_cols as usize);
-                    if right {
-                        *entry = (*entry + 4).min(max);
-                    } else {
-                        *entry = entry.saturating_sub(4);
+                    if let Some(entry) = code_h_scroll.get_mut(block_id) {
+                        let max = code_blocks[block_id]
+                            .max_width
+                            .saturating_sub(term_cols as usize);
+                        if right {
+                            *entry = (*entry + 4).min(max);
+                        } else {
+                            *entry = entry.saturating_sub(4);
+                        }
+                        needs_redraw = true;
+                        continue;
                     }
-                    needs_redraw = true;
-                    continue;
                 }
             }
         }
@@ -1072,8 +1077,9 @@ pub fn run(
                     if let Some(block_id) =
                         first_visible_code_block(&lines, &visible, scroll_offset)
                     {
-                        let entry = code_h_scroll.entry(block_id).or_insert(0);
-                        *entry = entry.saturating_sub(4);
+                        if let Some(entry) = code_h_scroll.get_mut(block_id) {
+                            *entry = entry.saturating_sub(4);
+                        }
                         needs_redraw = true;
                     }
                 }
@@ -1084,12 +1090,13 @@ pub fn run(
                     if let Some(block_id) =
                         first_visible_code_block(&lines, &visible, scroll_offset)
                     {
-                        let entry = code_h_scroll.entry(block_id).or_insert(0);
-                        let max = code_blocks
-                            .get(block_id)
-                            .map(|b| b.max_width.saturating_sub(term_cols as usize))
-                            .unwrap_or(0);
-                        *entry = (*entry + 4).min(max);
+                        if let Some(entry) = code_h_scroll.get_mut(block_id) {
+                            let max = code_blocks
+                                .get(block_id)
+                                .map(|b| b.max_width.saturating_sub(term_cols as usize))
+                                .unwrap_or(0);
+                            *entry = (*entry + 4).min(max);
+                        }
                         needs_redraw = true;
                     }
                 }
@@ -1104,7 +1111,10 @@ pub fn run(
                     pending = &current_output.as_ref().unwrap().pending_images;
                     pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
                     code_blocks = &current_output.as_ref().unwrap().code_blocks;
-                    gif_state.clear();
+                    gif_state = vec![None; pending_gifs.len()];
+                    video_paused = vec![false; pending_gifs.len()];
+                    video_progress_pos = vec![0; pending_gifs.len()];
+                    code_h_scroll = vec![0; code_blocks.len()];
                     if scroll_offset >= visible.len() {
                         scroll_offset = visible.len().saturating_sub(1);
                     }
@@ -1120,10 +1130,8 @@ pub fn run(
                     let toggled_video =
                         first_visible_video_controls(&lines, &visible, scroll_offset);
                     if let Some(gif_id) = toggled_video {
-                        if video_paused.contains(&gif_id) {
-                            video_paused.remove(&gif_id);
-                        } else {
-                            video_paused.insert(gif_id);
+                        if let Some(p) = video_paused.get_mut(gif_id) {
+                            *p = !*p;
                         }
                         needs_redraw = true;
                     } else if let Some(id) = first_visible_details(&lines, &visible, scroll_offset)
@@ -1267,16 +1275,19 @@ struct DrawResult {
 /// Try to render a full sixel image for an image group. Returns true if
 /// rendered.
 fn advance_gif_frames(
-    gif_state: &mut HashMap<usize, (usize, std::time::Instant)>,
+    gif_state: &mut [Option<(usize, std::time::Instant)>],
     pending_gifs: &[crate::sixel::PendingGif],
-    video_paused: &HashSet<usize>,
+    video_paused: &[bool],
 ) -> bool {
     let now = std::time::Instant::now();
     let mut any_advanced = false;
-    for (id, (frame_idx, deadline)) in gif_state.iter_mut() {
+    for (id, slot) in gif_state.iter_mut().enumerate() {
+        let Some((frame_idx, deadline)) = slot else {
+            continue;
+        };
         if now >= *deadline
-            && !video_paused.contains(id)
-            && let Some(gif) = pending_gifs.get(*id)
+            && !video_paused.get(id).copied().unwrap_or(false)
+            && let Some(gif) = pending_gifs.get(id)
         {
             let count = gif.frame_count();
             if count > 1 {
@@ -1341,7 +1352,7 @@ fn try_render_full_image(
     sixel_store: &[SixelData],
     pending_images: &[crate::sixel::PendingImage],
     gifs: &[crate::sixel::PendingGif],
-    gif_frames: &HashMap<usize, usize>,
+    gif_frames: &[usize],
 ) -> bool {
     crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
     match group {
@@ -1364,7 +1375,7 @@ fn try_render_full_image(
         }
         ImageGroup::Gif(id) => {
             if let Some(gif) = gifs.get(id) {
-                let frame_idx = gif_frames.get(&id).copied().unwrap_or(0);
+                let frame_idx = gif_frames.get(id).copied().unwrap_or(0);
                 if let Some(frame) = gif.frame(frame_idx) {
                     write!(stdout, "{}", frame.sixel).unwrap();
                     return true;
@@ -1384,10 +1395,11 @@ fn draw_screen(
     sixel_store: &[SixelData],
     pending_images: &[crate::sixel::PendingImage],
     gifs: &[crate::sixel::PendingGif],
-    gif_frames: &HashMap<usize, usize>,
-    video_paused: &HashSet<usize>,
+    gif_frames: &[usize],
+    video_paused: &[bool],
+    video_progress_pos: &mut [usize],
     code_blocks: &[crate::renderer::CodeBlock],
-    code_h_scroll: &HashMap<usize, usize>,
+    code_h_scroll: &[usize],
     scroll_offset: usize,
     viewport_rows: u16,
     term_cols: u16,
@@ -1538,7 +1550,7 @@ fn draw_screen(
                                 }
                             }
                             PositionedSixel::Gif { col, gif_id, .. } => {
-                                let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
+                                let frame_idx = gif_frames.get(*gif_id).copied().unwrap_or(0);
                                 if let Some(gif) = gifs.get(*gif_id)
                                     && let Some(frame) = gif.frame(frame_idx)
                                 {
@@ -1556,8 +1568,14 @@ fn draw_screen(
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{content}\r").unwrap();
                 for &(col, w, gif_id) in video_controls {
-                    let controls =
-                        format_video_controls(w as usize, gif_id, gifs, gif_frames, video_paused);
+                    let controls = format_video_controls(
+                        w as usize,
+                        gif_id,
+                        gifs,
+                        gif_frames,
+                        video_paused,
+                        video_progress_pos,
+                    );
                     crossterm::execute!(stdout, cursor::MoveTo(col, rows_used)).unwrap();
                     write!(stdout, "{controls}").unwrap();
                     video_control_rows.push((rows_used, gif_id));
@@ -1577,7 +1595,7 @@ fn draw_screen(
             }
             Line::CodeBlock { id, height } => {
                 if let Some(block) = code_blocks.get(*id) {
-                    let h_offset = code_h_scroll.get(id).copied().unwrap_or(0);
+                    let h_offset = code_h_scroll.get(*id).copied().unwrap_or(0);
                     let avail_cols = term_cols as usize;
 
                     // Render each code line with horizontal scroll
@@ -1612,8 +1630,14 @@ fn draw_screen(
                     .and_then(|g| g.preview.first())
                     .map(|p| crate::renderer::ansi::visible_len(p))
                     .unwrap_or(term_cols as usize);
-                let controls =
-                    format_video_controls(video_cols, *gif_id, gifs, gif_frames, video_paused);
+                let controls = format_video_controls(
+                    video_cols,
+                    *gif_id,
+                    gifs,
+                    gif_frames,
+                    video_paused,
+                    video_progress_pos,
+                );
                 write!(stdout, " {controls} \r").unwrap();
                 video_control_rows.push((rows_used, *gif_id));
                 rows_used += 1;
@@ -1696,25 +1720,42 @@ fn first_visible_details(
 
 /// Format a video progress bar: "▶  ───●──────" or "⏸  ───●──────".
 /// `width` is the total available columns for the controls.
+/// `last_pos` tracks the high-water mark to prevent jitter during loading.
 fn format_video_controls(
     width: usize,
     gif_id: usize,
     gifs: &[crate::sixel::PendingGif],
-    gif_frames: &HashMap<usize, usize>,
-    video_paused: &HashSet<usize>,
+    gif_frames: &[usize],
+    video_paused: &[bool],
+    last_pos: &mut [usize],
 ) -> String {
-    let paused = video_paused.contains(&gif_id);
+    let paused = video_paused.get(gif_id).copied().unwrap_or(false);
     let btn = if paused { "\u{25B6}" } else { "\u{23F8}" };
-    let frame_idx = gif_frames.get(&gif_id).copied().unwrap_or(0);
-    let cycle = gifs.get(gif_id).map(|g| g.cycle_length()).unwrap_or(0);
+    let frame_idx = gif_frames.get(gif_id).copied().unwrap_or(0);
+    let gif = gifs.get(gif_id);
+    let cycle = gif.map(|g| g.cycle_length()).unwrap_or(0);
+    let done = gif.is_some_and(|g| g.is_done());
     // btn(1) + 2 spaces = 3 chars overhead
     let bar_width = width.saturating_sub(3);
-    let progress_pos = if cycle > 1 && bar_width > 0 {
+    let mut progress_pos = if cycle > 1 && bar_width > 0 {
         let pos_in_cycle = frame_idx % cycle;
         (pos_in_cycle * bar_width / cycle).min(bar_width - 1)
     } else {
         0
     };
+
+    // While still loading, only allow forward movement to prevent jitter
+    // from cycle_length() estimate changing as frames are added.
+    // Once done, allow free movement (looping resets to 0).
+    if !done {
+        if let Some(prev) = last_pos.get_mut(gif_id) {
+            if progress_pos < *prev {
+                progress_pos = *prev;
+            }
+            *prev = progress_pos;
+        }
+    }
+
     let mut bar = String::new();
     for i in 0..bar_width {
         if i == progress_pos {
