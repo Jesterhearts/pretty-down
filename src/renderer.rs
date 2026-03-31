@@ -290,6 +290,8 @@ struct RenderState {
     term_width: u16,
     next_details_id: usize,
     para_images: Vec<ImageSource>,
+    /// Footnote label → display number mapping.
+    footnote_numbers: std::collections::HashMap<String, usize>,
 }
 
 impl RenderState {
@@ -317,7 +319,19 @@ impl RenderState {
             term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
             next_details_id: 0,
             para_images: Vec::new(),
+            footnote_numbers: std::collections::HashMap::new(),
         }
+    }
+
+    fn footnote_number(
+        &mut self,
+        label: &str,
+    ) -> usize {
+        let next = self.footnote_numbers.len() + 1;
+        *self
+            .footnote_numbers
+            .entry(label.to_string())
+            .or_insert(next)
     }
 
     fn in_table(&self) -> bool {
@@ -1150,6 +1164,12 @@ pub enum OutputBlock {
     DetailsSummary { id: usize, text: String },
     /// End of a collapsible details section.
     DetailsEnd { id: usize },
+    /// Invisible marker: a footnote reference (inline `[^label]`).
+    FootnoteRef { label: String, col: usize },
+    /// Start of a footnote definition block.
+    FootnoteDefStart { label: String },
+    /// End of a footnote definition block.
+    FootnoteDefEnd,
 }
 
 pub struct RenderOutput {
@@ -1603,8 +1623,10 @@ pub fn render(
     theme: &crate::theme::Theme,
     highlighter: &crate::highlight::Highlighter,
 ) -> RenderOutput {
-    let options =
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     let parser = Parser::new_ext(markdown, options);
 
     let mut out = String::new();
@@ -1917,7 +1939,29 @@ pub fn render(
                 }
             }
 
-            // Ignore everything else (footnotes, etc.)
+            // ── Footnotes ──────────────────────────────────────────
+            Event::FootnoteReference(label) => {
+                let num = state.footnote_number(&label);
+                let col = ansi::visible_len(&out);
+                blocks.push(OutputBlock::FootnoteRef {
+                    label: label.to_string(),
+                    col,
+                });
+                out.push_str(&format!("\x1b[36m\x1b[1m[{num}]\x1b[0m"));
+            }
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                let num = state.footnote_number(&label);
+                flush_text(&mut out, &mut blocks);
+                blocks.push(OutputBlock::FootnoteDefStart {
+                    label: label.to_string(),
+                });
+                out.push_str(&format!("\x1b[36m\x1b[1m[{num}]\x1b[0m "));
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                flush_text(&mut out, &mut blocks);
+                blocks.push(OutputBlock::FootnoteDefEnd);
+            }
+
             _ => {}
         }
     }

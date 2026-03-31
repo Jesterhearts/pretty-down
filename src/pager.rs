@@ -87,6 +87,12 @@ enum Line {
     },
     /// Video playback control bar (play/pause + progress).
     VideoControls { gif_id: usize },
+    /// Invisible marker: a footnote reference at this column in the text.
+    FootnoteRef { label: String, col: usize },
+    /// Invisible marker: start of a footnote definition.
+    FootnoteDefStart { label: String },
+    /// Invisible marker: end of a footnote definition.
+    FootnoteDefEnd,
 }
 
 impl Line {
@@ -100,7 +106,11 @@ impl Line {
             Line::CodeBlock { height, .. } => *height,
             Line::VideoControls { .. } => 1,
             Line::DetailsSummary { .. } => 1,
-            Line::DetailsStart { .. } | Line::DetailsEnd { .. } => 0,
+            Line::DetailsStart { .. }
+            | Line::DetailsEnd { .. }
+            | Line::FootnoteRef { .. }
+            | Line::FootnoteDefStart { .. }
+            | Line::FootnoteDefEnd => 0,
         }
     }
 }
@@ -221,6 +231,20 @@ fn flatten_blocks(
             }
             OutputBlock::DetailsEnd { id } => {
                 lines.push(Line::DetailsEnd { id: *id });
+            }
+            OutputBlock::FootnoteRef { label, col } => {
+                lines.push(Line::FootnoteRef {
+                    label: label.clone(),
+                    col: *col,
+                });
+            }
+            OutputBlock::FootnoteDefStart { label } => {
+                lines.push(Line::FootnoteDefStart {
+                    label: label.clone(),
+                });
+            }
+            OutputBlock::FootnoteDefEnd => {
+                lines.push(Line::FootnoteDefEnd);
             }
         }
     }
@@ -686,6 +710,7 @@ pub fn run(
     let mut last_draw = DrawResult {
         summary_rows: Vec::new(),
         video_control_rows: Vec::new(),
+        footnote_rows: Vec::new(),
     };
     // Per-GIF animation state: (current frame index, next frame deadline).
     // None = not yet visible / not registered.
@@ -745,18 +770,18 @@ pub fn run(
 
             // Register any newly visible GIFs that aren't tracked yet
             let register_gif = |id: usize, state: &mut Vec<Option<(usize, std::time::Instant)>>| {
-                if let Some(slot) = state.get_mut(id) {
-                    if slot.is_none() {
-                        let delay = pending_gifs
-                            .get(id)
-                            .and_then(|g| g.frame(0))
-                            .map(|f| f.delay_ms)
-                            .unwrap_or(100);
-                        *slot = Some((
-                            0,
-                            std::time::Instant::now() + Duration::from_millis(delay as u64),
-                        ));
-                    }
+                if let Some(slot) = state.get_mut(id)
+                    && slot.is_none()
+                {
+                    let delay = pending_gifs
+                        .get(id)
+                        .and_then(|g| g.frame(0))
+                        .map(|f| f.delay_ms)
+                        .unwrap_or(100);
+                    *slot = Some((
+                        0,
+                        std::time::Instant::now() + Duration::from_millis(delay as u64),
+                    ));
                 }
             };
             for &vi in &visible[scroll_offset..] {
@@ -893,6 +918,24 @@ pub fn run(
             continue;
         }
 
+        // Handle click on footnote (jump to def or back to ref)
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row,
+            column,
+            ..
+        }) = ev
+            && let Some((_, _, _, label, is_def)) = last_draw
+                .footnote_rows
+                .iter()
+                .find(|(r, c0, c1, _, _)| *r == row && column >= *c0 && column < *c1)
+            && let Some(target_vi) = find_footnote_target(&lines, &visible, label, !is_def)
+        {
+            scroll_offset = target_vi;
+            needs_redraw = true;
+            continue;
+        }
+
         // Handle mouse horizontal scroll on code blocks
         // Supports native ScrollLeft/ScrollRight and Shift+ScrollDown/ScrollUp
         {
@@ -934,19 +977,18 @@ pub fn run(
                     scroll_offset,
                     viewport_rows,
                     row,
-                ) {
-                    if let Some(entry) = code_h_scroll.get_mut(block_id) {
-                        let max = code_blocks[block_id]
-                            .max_width
-                            .saturating_sub(term_cols as usize);
-                        if right {
-                            *entry = (*entry + 4).min(max);
-                        } else {
-                            *entry = entry.saturating_sub(4);
-                        }
-                        needs_redraw = true;
-                        continue;
+                ) && let Some(entry) = code_h_scroll.get_mut(block_id)
+                {
+                    let max = code_blocks[block_id]
+                        .max_width
+                        .saturating_sub(term_cols as usize);
+                    if right {
+                        *entry = (*entry + 4).min(max);
+                    } else {
+                        *entry = entry.saturating_sub(4);
                     }
+                    needs_redraw = true;
+                    continue;
                 }
             }
         }
@@ -1218,7 +1260,11 @@ pub fn print_output(output: &RenderOutput) {
                     println!();
                 }
             }
-            Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {}
+            Line::DetailsStart { .. }
+            | Line::DetailsEnd { .. }
+            | Line::FootnoteRef { .. }
+            | Line::FootnoteDefStart { .. }
+            | Line::FootnoteDefEnd => {}
             Line::VideoControls { .. } => {} // no controls in non-pager mode
             Line::TableRow { content } => {
                 println!("{content}");
@@ -1268,6 +1314,9 @@ struct DrawResult {
     summary_rows: Vec<(u16, usize)>,
     /// Maps terminal row → gif_id for video control click handling.
     video_control_rows: Vec<(u16, usize)>,
+    /// Maps (terminal row, col_start, col_end, label, is_definition) for
+    /// navigation.
+    footnote_rows: Vec<(u16, u16, u16, String, bool)>,
 }
 
 /// Draw the current view.
@@ -1419,6 +1468,10 @@ fn draw_screen(
     let mut vis_idx = scroll_offset;
     let mut summary_rows: Vec<(u16, usize)> = Vec::new();
     let mut video_control_rows: Vec<(u16, usize)> = Vec::new();
+    let mut footnote_rows: Vec<(u16, u16, u16, String, bool)> = Vec::new();
+    // Pending footnote refs: (label, col_start) — associated with the next text row
+    let mut pending_footnote_refs: Vec<(String, usize)> = Vec::new();
+    let mut pending_footnote_def: Option<String> = None;
 
     while vis_idx < visible.len() && rows_used < viewport_rows {
         let line_idx = visible[vis_idx];
@@ -1426,6 +1479,16 @@ fn draw_screen(
             Line::Text(text) => {
                 crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
                 write!(stdout, "{text}\r").unwrap();
+                // Associate pending footnote markers with this row
+                for (label, col_start) in pending_footnote_refs.drain(..) {
+                    // [N] is typically 3-5 chars wide
+                    let col_end = col_start + 5;
+                    footnote_rows.push((rows_used, col_start as u16, col_end as u16, label, false));
+                }
+                if let Some(label) = pending_footnote_def.take() {
+                    // Definition [N] starts at column 0
+                    footnote_rows.push((rows_used, 0, 10, label, true));
+                }
                 rows_used += 1;
             }
             Line::ImageRow {
@@ -1582,9 +1645,14 @@ fn draw_screen(
                 }
                 rows_used += 1;
             }
-            Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {
-                // Invisible markers, zero height
+            Line::DetailsStart { .. } | Line::DetailsEnd { .. } => {}
+            Line::FootnoteRef { label, col } => {
+                pending_footnote_refs.push((label.clone(), *col));
             }
+            Line::FootnoteDefStart { label } => {
+                pending_footnote_def = Some(label.clone());
+            }
+            Line::FootnoteDefEnd => {}
             Line::DetailsSummary { id, text } => {
                 let is_collapsed = collapsed.contains(id);
                 let triangle = if is_collapsed { "\u{25B6}" } else { "\u{25BC}" };
@@ -1670,7 +1738,25 @@ fn draw_screen(
     DrawResult {
         summary_rows,
         video_control_rows,
+        footnote_rows,
     }
+}
+
+/// Find the visible index of a footnote's counterpart (ref→def or def→ref).
+fn find_footnote_target(
+    lines: &[Line],
+    visible: &[usize],
+    label: &str,
+    find_def: bool,
+) -> Option<usize> {
+    for (vi, &li) in visible.iter().enumerate() {
+        match &lines[li] {
+            Line::FootnoteDefStart { label: l } if find_def && l == label => return Some(vi),
+            Line::FootnoteRef { label: l, .. } if !find_def && l == label => return Some(vi),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Find the details block to toggle.
@@ -1747,13 +1833,11 @@ fn format_video_controls(
     // While still loading, only allow forward movement to prevent jitter
     // from cycle_length() estimate changing as frames are added.
     // Once done, allow free movement (looping resets to 0).
-    if !done {
-        if let Some(prev) = last_pos.get_mut(gif_id) {
-            if progress_pos < *prev {
-                progress_pos = *prev;
-            }
-            *prev = progress_pos;
+    if !done && let Some(prev) = last_pos.get_mut(gif_id) {
+        if progress_pos < *prev {
+            progress_pos = *prev;
         }
+        *prev = progress_pos;
     }
 
     let mut bar = String::new();

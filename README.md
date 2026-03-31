@@ -35,6 +35,8 @@ images are displayed inline — all without leaving your terminal.
   image previews inside cells
 - **Blockquotes** — Styled with `│` prefix on every line, supports nesting
 - **Lists** — Ordered, unordered, nested
+- **Footnotes** — Click a `[1]` reference to jump to its definition,
+  click the definition to jump back
 - **Horizontal rules**
 - **`<details>`/`<summary>`** — Collapsible sections, click or press Enter
   to toggle
