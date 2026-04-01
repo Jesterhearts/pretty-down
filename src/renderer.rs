@@ -1766,6 +1766,9 @@ pub fn render(
 
             // ── Block quote ──────────────────────────────────────────
             Event::Start(Tag::BlockQuote(_)) => {
+                // Flush any preceding paragraph text before changing depth,
+                // so it doesn't get the blockquote prefix.
+                flush_text(&mut out, &mut blocks);
                 state.blockquote_depth += 1;
             }
             Event::End(TagEnd::BlockQuote(_)) => {
