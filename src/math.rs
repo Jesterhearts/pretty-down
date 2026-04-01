@@ -90,20 +90,22 @@ impl typst::World for MathWorld {
 }
 
 /// Render a LaTeX math expression to SVG.
+/// `fg` is the text color as [r, g, b]. Background is transparent.
 /// Returns None if conversion or rendering fails.
 pub fn render_latex_to_svg(
     latex: &str,
     display: bool,
+    fg: [u8; 3],
 ) -> Option<String> {
     // Convert LaTeX → Typst math markup
     let typst_math = mitex::convert_math(latex, None).ok()?;
 
-    // Wrap in a minimal Typst document
-    let source = if display {
-        format!("#set page(width: auto, height: auto, margin: 5pt)\n$ {typst_math} $")
-    } else {
-        format!("#set page(width: auto, height: auto, margin: 2pt)\n$ {typst_math} $")
-    };
+    let margin = if display { 5 } else { 2 };
+    let source = format!(
+        "#set page(width: auto, height: auto, margin: {margin}pt, fill: none)\n#set text(fill: \
+         rgb({}, {}, {}))\n$ {typst_math} $",
+        fg[0], fg[1], fg[2]
+    );
 
     // Compile
     let world = MathWorld::new(&source);

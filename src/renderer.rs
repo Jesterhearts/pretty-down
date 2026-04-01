@@ -1404,9 +1404,10 @@ fn render_math_image(
     latex: &str,
     display: bool,
     max_width: u32,
+    fg: [u8; 3],
     state: &mut RenderState,
 ) -> Option<usize> {
-    let svg = crate::math::render_latex_to_svg(latex, display)?;
+    let svg = crate::math::render_latex_to_svg(latex, display, fg)?;
     let img = sixel::render_svg_bytes(svg.as_bytes(), max_width)?;
     let rows = sixel::pixel_height_to_rows(img.height());
     let preview = sixel::half_block_preview(&img, sixel::preview_columns(img.width()), rows);
@@ -1931,9 +1932,8 @@ pub fn render(
             Event::InlineMath(latex) => {
                 let text_width_px = latex.len() as u32 * sixel::cell_pixel_width();
                 let max_w = (text_width_px * 2).max(200);
-                if let Some(id) = render_math_image(&latex, false, max_w, &mut state) {
-                    // Flush preceding text so block ordering is correct;
-                    // flatten_blocks merges the Text + InlineImage into a RichText line
+                let math_fg = theme.heading_color(1);
+                if let Some(id) = render_math_image(&latex, false, max_w, math_fg, &mut state) {
                     flush_text(&mut out, &mut blocks);
                     blocks.push(OutputBlock::InlineImage(id));
                 } else {
@@ -1943,7 +1943,8 @@ pub fn render(
             Event::DisplayMath(latex) => {
                 let text_width_px = latex.len() as u32 * sixel::cell_pixel_width();
                 let max_w = (text_width_px * 2).max(200);
-                if let Some(id) = render_math_image(&latex, true, max_w, &mut state) {
+                let math_fg = theme.heading_color(1);
+                if let Some(id) = render_math_image(&latex, true, max_w, math_fg, &mut state) {
                     flush_text(&mut out, &mut blocks);
                     blocks.push(OutputBlock::Image(id));
                 } else {
