@@ -25,8 +25,8 @@ images are displayed inline — all without leaving your terminal.
   displayed inline as Sixel with half-block previews while loading
   or partially visible
 - **Animated GIFs** — Decoded and animated in the pager with per-frame timing
-- **Video** — MP4, WebM, MKV, AVI, MOV playback via FFmpeg (requires
-  FFmpeg libraries installed)
+- **Video** — MP4, WebM, MKV, AVI, MOV playback via FFmpeg (statically
+  linked, no system install required)
 - **LaTeX math** — `$inline$` and `$$display$$` math rendered as sixel
   images via [mitex](https://crates.io/crates/mitex) + [typst](https://crates.io/crates/typst)
 - **Mermaid diagrams** — ` ```mermaid ` code blocks rendered as inline
@@ -54,14 +54,14 @@ images are displayed inline — all without leaving your terminal.
 
 - A Sixel-capable terminal (e.g. WezTerm, foot, mlterm, xterm with `-ti vt340`)
 - Rust 2024 edition (1.85+)
-- **FFmpeg development libraries** (for video support):
+- `nasm` (for building FFmpeg from source):
   ```sh
   # Debian/Ubuntu
-  sudo apt install libavutil-dev libavformat-dev libavcodec-dev libswscale-dev libavfilter-dev libavdevice-dev pkg-config
+  sudo apt install nasm
   # Fedora
-  sudo dnf install ffmpeg-devel
+  sudo dnf install nasm
   # macOS
-  brew install ffmpeg pkg-config
+  brew install nasm
   ```
 
 ## Usage
