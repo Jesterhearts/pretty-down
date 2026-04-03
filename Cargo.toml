@@ -1,29 +1,37 @@
 [package]
-name = "pretty-down"
+name    = "pretty-down"
 version = "0.1.0"
 edition = "2024"
 license = "Unlicense"
 
 [dependencies]
-pulldown-cmark = "0.13.3"
-a-sixel = "0.6.1"
-rustybuzz = "0.20.1"
-raqote = { version = "0.8.5", default-features = false }
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
-clap = { version = "4.6.0", features = ["derive"] }
-crossterm = "0.29.0"
-quick-xml = "0.39.2"
-notify = "9.0.0-rc.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-syntect = "5.3.0"
-ffmpeg-next = { version = "8.1.0", features = ["build"] }
-resvg = "0.47.0"
-ureq = "3.3.0"
-fontdb = { version = "0.23.0", features = ["memmap"] }
+a-sixel             = { version = "0.6.1", default-features = false, features = [
+  "bit-merge"
+] }
+clap                = { version = "4.6.0", features = ["derive"] }
+crossterm           = "0.29.0"
+ffmpeg-next         = { version = "8.1.0", features = ["build"] }
+fontdb              = { version = "0.23.0", features = ["memmap"] }
+image               = { version = "0.25.10", default-features = false, features = [
+  "gif",
+  "jpeg",
+  "png"
+] }
 mermaid-rs-renderer = "0.2.1"
-mitex = "0.2.4"
-typst = "0.14.2"
-typst-svg = "0.14.2"
-typst-assets = { version = "0.14.2", features = ["fonts"] }
-palette = { version = "0.7.6", features = ["named_from_str"] }
+mitex               = "0.2.4"
+notify              = "9.0.0-rc.2"
+palette             = { version = "0.7.6", features = ["named_from_str"] }
+pulldown-cmark      = "0.13.3"
+quick-xml           = "0.39.2"
+raqote              = { version = "0.8.5", default-features = false }
+resvg               = "0.47.0"
+rustybuzz           = "0.20.1"
+serde               = { version = "1", features = ["derive"] }
+serde_json          = "1"
+syntect             = "5.3.0"
+typst               = "0.14.2"
+typst-assets        = { version = "0.14.2", features = ["fonts"] }
+typst-svg           = "0.14.2"
+unicode-width       = "0.2.2"
+ureq                = "3.3.0"
+vte                 = "0.15.0"

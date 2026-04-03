@@ -51,75 +51,153 @@ pub(crate) mod ansi {
         format!("\x1b[48;2;{r};{g};{b}m")
     }
 
-    /// Count the visible (non-escape) characters in a string.
+    /// VTE-based width counter. The parser calls `print` only for visible
+    /// characters — all escape sequences (CSI, OSC, DCS, etc.) are routed
+    /// to other `Perform` methods that we leave as no-ops.
+    struct WidthCounter(usize);
+
+    impl vte::Perform for WidthCounter {
+        fn print(
+            &mut self,
+            c: char,
+        ) {
+            self.0 += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+    }
+
+    /// Count the visible column width of a string, correctly skipping all
+    /// escape sequences (CSI, OSC 8 links, DCS, etc.) and accounting for
+    /// Unicode double-width characters.
     pub fn visible_len(s: &str) -> usize {
-        let mut len = 0;
-        let mut in_escape = false;
-        for ch in s.chars() {
-            if ch == '\x1b' {
-                in_escape = true;
-            } else if in_escape {
-                if ch.is_ascii_alphabetic() || ch == '\\' {
-                    in_escape = false;
-                }
-            } else {
-                len += 1;
+        let mut counter = WidthCounter(0);
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut counter, s.as_bytes());
+        counter.0
+    }
+
+    /// VTE-based slicer. Collects bytes into a result buffer, but only
+    /// includes visible characters that fall within the target column range.
+    /// Escape sequences are always passed through so ANSI state is preserved.
+    struct VisibleSlicer {
+        start: usize,
+        end: usize,
+        col: usize,
+        result: String,
+    }
+
+    impl vte::Perform for VisibleSlicer {
+        fn print(
+            &mut self,
+            c: char,
+        ) {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if self.col >= self.start && self.col + w <= self.end {
+                self.result.push(c);
+            }
+            self.col += w;
+        }
+
+        fn execute(
+            &mut self,
+            byte: u8,
+        ) {
+            // Pass through C0 controls (e.g. \n, \r) in the visible region
+            if self.col >= self.start && self.col < self.end {
+                self.result.push(byte as char);
             }
         }
-        len
+
+        fn csi_dispatch(
+            &mut self,
+            params: &vte::Params,
+            intermediates: &[u8],
+            _ignore: bool,
+            action: char,
+        ) {
+            // Reconstruct the CSI sequence and always include it
+            self.result.push('\x1b');
+            self.result.push('[');
+            let mut first_param = true;
+            for param in params.iter() {
+                if !first_param {
+                    self.result.push(';');
+                }
+                first_param = false;
+                let mut first_sub = true;
+                for &sub in param {
+                    if !first_sub {
+                        self.result.push(':');
+                    }
+                    first_sub = false;
+                    self.result.push_str(&sub.to_string());
+                }
+            }
+            for &b in intermediates {
+                self.result.push(b as char);
+            }
+            self.result.push(action);
+        }
+
+        fn osc_dispatch(
+            &mut self,
+            params: &[&[u8]],
+            bell_terminated: bool,
+        ) {
+            // Reconstruct OSC sequences (e.g. hyperlinks)
+            self.result.push('\x1b');
+            self.result.push(']');
+            for (i, param) in params.iter().enumerate() {
+                if i > 0 {
+                    self.result.push(';');
+                }
+                self.result.push_str(&String::from_utf8_lossy(param));
+            }
+            if bell_terminated {
+                self.result.push('\x07');
+            } else {
+                self.result.push('\x1b');
+                self.result.push('\\');
+            }
+        }
+
+        fn esc_dispatch(
+            &mut self,
+            intermediates: &[u8],
+            _ignore: bool,
+            byte: u8,
+        ) {
+            self.result.push('\x1b');
+            for &b in intermediates {
+                self.result.push(b as char);
+            }
+            self.result.push(byte as char);
+        }
     }
 
     /// Slice a string with ANSI escapes at visible column boundaries.
     /// Returns the substring from visible column `start` with `width` visible
-    /// chars. ANSI state is preserved at the boundaries.
+    /// chars, preserving all escape sequences so ANSI state carries through.
     pub fn visible_slice(
         s: &str,
         start: usize,
         width: usize,
     ) -> String {
-        let mut result = String::new();
-        let mut col = 0;
-        let mut in_escape = false;
-        let mut pending_escape = String::new();
-
-        for ch in s.chars() {
-            if ch == '\x1b' {
-                in_escape = true;
-                pending_escape.clear();
-                pending_escape.push(ch);
-                continue;
-            }
-            if in_escape {
-                pending_escape.push(ch);
-                if ch.is_ascii_alphabetic() || ch == '\\' {
-                    in_escape = false;
-                    // Include escapes in the visible region
-                    if col >= start && col < start + width {
-                        result.push_str(&pending_escape);
-                    } else if col < start {
-                        // Track style for when we enter the visible region
-                        result.push_str(&pending_escape);
-                    }
-                }
-                continue;
-            }
-
-            if col >= start && col < start + width {
-                result.push(ch);
-            }
-            col += 1;
-            if col >= start + width {
-                break;
-            }
-        }
-
-        result
+        let mut slicer = VisibleSlicer {
+            start,
+            end: start + width,
+            col: 0,
+            result: String::new(),
+        };
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut slicer, s.as_bytes());
+        slicer.result
     }
 
     /// Word-wrap a string that may contain ANSI escape sequences.
     ///
     /// Wraps at `width` visible columns, preserving escape sequences
-    /// (which don't consume column space).
+    /// (which don't consume column space). Uses `vte` to identify
+    /// visible characters vs escape bytes.
     pub fn wrap(
         text: &str,
         width: u16,
@@ -131,19 +209,47 @@ pub(crate) mod ansi {
 
         let mut result = String::with_capacity(text.len());
         let mut col = 0usize;
-        // Track the last word boundary: (byte pos in result, visible col at that point)
+        // Track the last word boundary: (byte pos in result, visible col)
         let mut last_break: Option<(usize, usize)> = None;
         let mut chars = text.chars().peekable();
 
         while let Some(ch) = chars.next() {
-            // Copy escape sequences verbatim (zero visible width)
+            // Copy escape sequences verbatim (zero visible width).
+            // We use a simple scan here because wrap only needs to skip
+            // escapes, not interpret them — the vte state machine is
+            // heavier than necessary for this pass.
             if ch == '\x1b' {
                 result.push(ch);
-                while let Some(&_next) = chars.peek() {
-                    let next = chars.next().unwrap();
-                    result.push(next);
-                    if next.is_ascii_alphabetic() || next == '\\' {
-                        break;
+                match chars.peek() {
+                    // CSI sequence: \x1b[ ... <letter>
+                    Some(&'[') => {
+                        while let Some(next) = chars.next() {
+                            result.push(next);
+                            if next.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    // OSC sequence: \x1b] ... (ST or BEL)
+                    Some(&']') => {
+                        while let Some(next) = chars.next() {
+                            result.push(next);
+                            if next == '\x07' {
+                                break;
+                            }
+                            if next == '\x1b' {
+                                if let Some(&'\\') = chars.peek() {
+                                    result.push(chars.next().unwrap());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Other escapes (e.g. \x1b( ): two-byte sequence
+                    _ => {
+                        if let Some(next) = chars.next() {
+                            result.push(next);
+                        }
                     }
                 }
                 continue;
@@ -156,26 +262,23 @@ pub(crate) mod ansi {
                 continue;
             }
 
-            // Record word boundary (space position)
             if ch == ' ' {
                 last_break = Some((result.len(), col));
             }
 
+            let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
             result.push(ch);
-            col += 1;
+            col += char_width;
 
-            // Check if we've exceeded the width
             if col > width {
                 if let Some((break_pos, break_col)) = last_break.take() {
-                    // Replace the space at the break point with a newline
                     result.replace_range(break_pos..break_pos + 1, "\n");
                     col -= break_col + 1;
                 } else {
-                    // No word boundary — insert a hard break before this char
                     let ch_len = ch.len_utf8();
                     let insert_pos = result.len() - ch_len;
                     result.insert(insert_pos, '\n');
-                    col = 1;
+                    col = char_width;
                 }
             }
         }
@@ -1968,5 +2071,274 @@ pub fn render(
         pending_images: state.pending_images,
         pending_gifs: state.pending_gifs,
         code_blocks: state.code_blocks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ansi::visible_len ────────────────────────────────────────
+
+    #[test]
+    fn visible_len_plain_text() {
+        assert_eq!(ansi::visible_len("hello"), 5);
+    }
+
+    #[test]
+    fn visible_len_empty() {
+        assert_eq!(ansi::visible_len(""), 0);
+    }
+
+    #[test]
+    fn visible_len_with_ansi_color() {
+        // "\x1b[31m" (red) + "hi" + "\x1b[0m" (reset)
+        assert_eq!(ansi::visible_len("\x1b[31mhi\x1b[0m"), 2);
+    }
+
+    #[test]
+    fn visible_len_with_24bit_color() {
+        let s = format!("{}abc{}", ansi::fg_rgb(255, 0, 0), ansi::RESET);
+        assert_eq!(ansi::visible_len(&s), 3);
+    }
+
+    #[test]
+    fn visible_len_osc8_link() {
+        let s = format!(
+            "{}click{}",
+            ansi::link_start("https://example.com"),
+            ansi::link_end()
+        );
+        assert_eq!(ansi::visible_len(&s), 5);
+    }
+
+    #[test]
+    fn visible_len_cjk_double_width() {
+        // CJK characters occupy 2 columns each
+        assert_eq!(ansi::visible_len("你好"), 4);
+        assert_eq!(ansi::visible_len("a你b"), 4);
+    }
+
+    #[test]
+    fn visible_len_multiple_escapes() {
+        let s = format!(
+            "{}{}bold and red{}",
+            ansi::BOLD,
+            ansi::fg_rgb(255, 0, 0),
+            ansi::RESET
+        );
+        assert_eq!(ansi::visible_len(&s), 12);
+    }
+
+    // ── ansi::visible_slice ──────────────────────────────────────
+
+    #[test]
+    fn visible_slice_plain() {
+        assert_eq!(ansi::visible_slice("hello world", 0, 5), "hello");
+        assert_eq!(ansi::visible_slice("hello world", 6, 5), "world");
+    }
+
+    #[test]
+    fn visible_slice_with_ansi() {
+        let s = format!("{}red{}", ansi::fg_rgb(255, 0, 0), ansi::RESET);
+        let sliced = ansi::visible_slice(&s, 0, 3);
+        // Should contain the color escape and the text "red"
+        assert!(sliced.contains("red"));
+        assert_eq!(ansi::visible_len(&sliced), 3);
+    }
+
+    #[test]
+    fn visible_slice_mid_styled_text() {
+        // "aaBBcc" where BB is bold
+        let s = format!("aa{}BB{}cc", ansi::BOLD, ansi::RESET);
+        let sliced = ansi::visible_slice(&s, 1, 4);
+        // Should get "aBBc" with appropriate escapes
+        assert_eq!(ansi::visible_len(&sliced), 4);
+    }
+
+    // ── ansi::wrap ───────────────────────────────────────────────
+
+    #[test]
+    fn wrap_short_text_unchanged() {
+        assert_eq!(ansi::wrap("hello", 80), "hello");
+    }
+
+    #[test]
+    fn wrap_at_word_boundary() {
+        let result = ansi::wrap("hello world", 5);
+        assert_eq!(result, "hello\nworld");
+    }
+
+    #[test]
+    fn wrap_long_word_hard_break() {
+        let result = ansi::wrap("abcdefghij", 5);
+        assert!(result.contains('\n'));
+        // Each line should be at most 5 visible chars
+        for line in result.lines() {
+            assert!(ansi::visible_len(line) <= 5);
+        }
+    }
+
+    #[test]
+    fn wrap_preserves_ansi() {
+        let s = format!("{}hello world{}", ansi::BOLD, ansi::RESET);
+        let result = ansi::wrap(&s, 5);
+        // Should still contain the BOLD escape
+        assert!(result.contains(ansi::BOLD));
+        // Should wrap
+        assert!(result.contains('\n'));
+    }
+
+    #[test]
+    fn wrap_zero_width_returns_input() {
+        assert_eq!(ansi::wrap("hello", 0), "hello");
+    }
+
+    #[test]
+    fn wrap_preserves_existing_newlines() {
+        assert_eq!(ansi::wrap("a\nb", 80), "a\nb");
+    }
+
+    // ── ansi formatters ──────────────────────────────────────────
+
+    #[test]
+    fn fg_rgb_format() {
+        assert_eq!(ansi::fg_rgb(10, 20, 30), "\x1b[38;2;10;20;30m");
+    }
+
+    #[test]
+    fn bg_rgb_format() {
+        assert_eq!(ansi::bg_rgb(10, 20, 30), "\x1b[48;2;10;20;30m");
+    }
+
+    #[test]
+    fn link_start_format() {
+        let s = ansi::link_start("https://example.com");
+        assert_eq!(s, "\x1b]8;;https://example.com\x1b\\");
+    }
+
+    #[test]
+    fn link_end_format() {
+        assert_eq!(ansi::link_end(), "\x1b]8;;\x1b\\");
+    }
+
+    // ── css_style_to_ansi ────────────────────────────────────────
+
+    #[test]
+    fn css_color_to_ansi() {
+        let result = css_style_to_ansi("color: #ff0000");
+        assert_eq!(result, ansi::fg_rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn css_background_color_to_ansi() {
+        let result = css_style_to_ansi("background-color: #00ff00");
+        assert_eq!(result, ansi::bg_rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn css_bold_to_ansi() {
+        assert_eq!(css_style_to_ansi("font-weight: bold"), ansi::BOLD);
+        assert_eq!(css_style_to_ansi("font-weight: 700"), ansi::BOLD);
+    }
+
+    #[test]
+    fn css_italic_to_ansi() {
+        assert_eq!(css_style_to_ansi("font-style: italic"), ansi::ITALIC);
+        assert_eq!(css_style_to_ansi("font-style: oblique"), ansi::ITALIC);
+    }
+
+    #[test]
+    fn css_text_decoration_to_ansi() {
+        let result = css_style_to_ansi("text-decoration: underline");
+        assert_eq!(result, ansi::UNDERLINE);
+
+        let result = css_style_to_ansi("text-decoration: line-through");
+        assert_eq!(result, ansi::STRIKETHROUGH);
+    }
+
+    #[test]
+    fn css_combined_styles() {
+        let result = css_style_to_ansi("color: #ff0000; font-weight: bold");
+        assert!(result.contains(&ansi::fg_rgb(255, 0, 0)));
+        assert!(result.contains(ansi::BOLD));
+    }
+
+    #[test]
+    fn css_empty_and_invalid() {
+        assert_eq!(css_style_to_ansi(""), "");
+        assert_eq!(css_style_to_ansi("  ;  ;  "), "");
+        assert_eq!(css_style_to_ansi("unknown-prop: value"), "");
+    }
+
+    // ── list_indent ──────────────────────────────────────────────
+
+    #[test]
+    fn list_indent_depth_zero() {
+        assert_eq!(list_indent(0), "");
+    }
+
+    #[test]
+    fn list_indent_depth_one() {
+        assert_eq!(list_indent(1), "");
+    }
+
+    #[test]
+    fn list_indent_depth_three() {
+        assert_eq!(list_indent(3), "    "); // 2 * 2 spaces
+    }
+
+    // ── crop_pixels_width ────────────────────────────────────────
+
+    #[test]
+    fn crop_pixels_no_crop_needed() {
+        // 2x2 image, max_w=10 → no change
+        let pixels = vec![0u8; 2 * 2 * 4];
+        let (new_w, out) = crop_pixels_width(&pixels, 2, 2, 10);
+        assert_eq!(new_w, 2);
+        assert_eq!(out.len(), pixels.len());
+    }
+
+    #[test]
+    fn crop_pixels_crops_to_max() {
+        // 4x1 image, crop to 2 pixels wide
+        let mut pixels = Vec::new();
+        for i in 0..4u8 {
+            pixels.extend_from_slice(&[i, i, i, 255]); // RGBA
+        }
+        let (new_w, out) = crop_pixels_width(&pixels, 4, 1, 2);
+        assert_eq!(new_w, 2);
+        assert_eq!(out.len(), 2 * 1 * 4);
+        // Should contain only the first 2 pixels
+        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&out[4..8], &[1, 1, 1, 255]);
+    }
+
+    // ── resolve_image_source ─────────────────────────────────────
+
+    #[test]
+    fn resolve_url_source() {
+        let src = resolve_image_source("https://example.com/img.png", &None);
+        assert!(matches!(src, Some(ImageSource::Url(ref u)) if u == "https://example.com/img.png"));
+    }
+
+    #[test]
+    fn resolve_absolute_path() {
+        let src = resolve_image_source("/tmp/img.png", &None);
+        assert!(matches!(src, Some(ImageSource::Local(ref p)) if p == Path::new("/tmp/img.png")));
+    }
+
+    #[test]
+    fn resolve_relative_path_with_base() {
+        let base = Some(std::path::PathBuf::from("/docs"));
+        let src = resolve_image_source("images/cat.png", &base);
+        assert!(
+            matches!(src, Some(ImageSource::Local(ref p)) if p == Path::new("/docs/images/cat.png"))
+        );
+    }
+
+    #[test]
+    fn resolve_relative_path_without_base() {
+        assert!(resolve_image_source("relative.png", &None).is_none());
     }
 }

@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 use std::io::Write;
-use std::io::{
-    self,
-};
+use std::io::{self};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -16,13 +14,9 @@ use crossterm::event::KeyModifiers;
 use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
-use crossterm::event::{
-    self,
-};
+use crossterm::event::{self};
 use crossterm::terminal::ClearType;
-use crossterm::terminal::{
-    self,
-};
+use crossterm::terminal::{self};
 
 use crate::renderer::RenderOutput;
 

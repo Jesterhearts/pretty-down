@@ -686,3 +686,117 @@ pub fn encode_video_async(
         is_video: true,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ── is_svg ───────────────────────────────────────────────────
+
+    #[test]
+    fn is_svg_recognizes_svg() {
+        assert!(is_svg(Path::new("image.svg")));
+        assert!(is_svg(Path::new("/path/to/file.SVG")));
+        assert!(is_svg(Path::new("chart.Svg")));
+    }
+
+    #[test]
+    fn is_svg_rejects_non_svg() {
+        assert!(!is_svg(Path::new("image.png")));
+        assert!(!is_svg(Path::new("noext")));
+        assert!(!is_svg(Path::new("svg"))); // no extension
+    }
+
+    // ── is_video ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_video_recognizes_video_formats() {
+        for ext in &["mp4", "webm", "mkv", "avi", "mov", "m4v", "ogv"] {
+            assert!(
+                is_video(Path::new(&format!("video.{ext}"))),
+                "should recognize .{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_video_case_insensitive() {
+        assert!(is_video(Path::new("video.MP4")));
+        assert!(is_video(Path::new("clip.MKV")));
+    }
+
+    #[test]
+    fn is_video_rejects_non_video() {
+        assert!(!is_video(Path::new("image.png")));
+        assert!(!is_video(Path::new("doc.pdf")));
+        assert!(!is_video(Path::new("noext")));
+    }
+
+    // ── scale_image ──────────────────────────────────────────────
+
+    #[test]
+    fn scale_image_no_resize_when_small() {
+        let img = RgbaImage::new(100, 50);
+        let result = scale_image(img, 200);
+        assert_eq!(result.dimensions(), (100, 50));
+    }
+
+    #[test]
+    fn scale_image_downscales_when_wider() {
+        let img = RgbaImage::new(1600, 800);
+        let result = scale_image(img, 400);
+        assert_eq!(result.width(), 400);
+        // Height should be proportionally scaled
+        assert_eq!(result.height(), 200);
+    }
+
+    #[test]
+    fn scale_image_capped_at_max_sixel_width() {
+        let img = RgbaImage::new(2000, 1000);
+        // Even though max_width is 1500, the MAX_SIXEL_WIDTH cap (800) wins
+        let result = scale_image(img, 1500);
+        assert_eq!(result.width(), 800);
+    }
+
+    // ── half_block_preview ───────────────────────────────────────
+
+    #[test]
+    fn half_block_preview_empty_on_zero_dims() {
+        let img = RgbaImage::new(10, 10);
+        assert!(half_block_preview(&img, 0, 1).is_empty());
+        assert!(half_block_preview(&img, 1, 0).is_empty());
+    }
+
+    #[test]
+    fn half_block_preview_produces_correct_row_count() {
+        let img = RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255]));
+        let lines = half_block_preview(&img, 5, 3);
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn half_block_preview_transparent_pixels_are_spaces() {
+        // Fully transparent image
+        let img = RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 0]));
+        let lines = half_block_preview(&img, 4, 2);
+        for line in &lines {
+            // Should contain spaces (not half-block chars) before the reset
+            let before_reset = line.strip_suffix("\x1b[0m").unwrap_or(line);
+            assert!(before_reset.chars().all(|c| c == ' '));
+        }
+    }
+
+    // ── encode_rgba ──────────────────────────────────────────────
+
+    #[test]
+    fn encode_rgba_produces_sixel() {
+        // Small 2x2 red image
+        let pixels = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let sixel = encode_rgba(2, 2, &pixels);
+        // Sixel data starts with DCS escape
+        assert!(sixel.starts_with("\x1bP"));
+    }
+}

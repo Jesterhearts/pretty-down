@@ -84,3 +84,53 @@ impl Highlighter {
         Some(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlight_known_language() {
+        let h = Highlighter::new();
+        let result = h.highlight("let x = 42;", "rust");
+        assert!(result.is_some());
+        let output = result.unwrap();
+        // Should contain ANSI color escapes
+        assert!(output.contains("\x1b[38;2;"));
+        // Should contain the original tokens
+        assert!(output.contains("let"));
+        assert!(output.contains("42"));
+    }
+
+    #[test]
+    fn highlight_unknown_language_returns_none() {
+        let h = Highlighter::new();
+        assert!(h.highlight("some code", "zzznotareallanguage").is_none());
+    }
+
+    #[test]
+    fn highlight_empty_code() {
+        let h = Highlighter::new();
+        let result = h.highlight("", "rust");
+        assert!(result.is_some());
+        // Should at least end with reset
+        assert!(result.unwrap().ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn set_theme_valid() {
+        let mut h = Highlighter::new();
+        h.set_theme("Solarized (dark)");
+        // Shouldn't panic; just changes internal state
+        let result = h.highlight("fn main() {}", "rust");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn set_theme_invalid_is_noop() {
+        let mut h = Highlighter::new();
+        h.set_theme("nonexistent-theme");
+        // Should still work with the old theme
+        assert!(h.highlight("x = 1", "python").is_some());
+    }
+}
