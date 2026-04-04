@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::io::{self};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -680,6 +681,442 @@ fn visible_indices(
     visible
 }
 
+/// Per-document state for the pager.
+struct DocumentState {
+    /// Display name (filename stem or "untitled")
+    name: String,
+    /// Absolute path, if from a file (None for stdin)
+    path: Option<PathBuf>,
+    /// The owned render output.
+    output: RenderOutput,
+    /// Sixel data store (referenced by ImageGroup::Sixel indices).
+    sixel_store: Vec<SixelData>,
+    /// Flattened display lines.
+    lines: Vec<Line>,
+    /// Visible line indices (accounting for collapsed details).
+    visible: Vec<usize>,
+    /// Current scroll position (index into `visible`).
+    scroll_offset: usize,
+    /// Collapsed details block IDs.
+    collapsed: HashSet<usize>,
+    /// Per-GIF animation state: (current frame index, next frame deadline).
+    gif_state: Vec<Option<(usize, std::time::Instant)>>,
+    /// Per-code-block horizontal scroll offset.
+    code_h_scroll: Vec<usize>,
+    /// Per-video paused state.
+    video_paused: Vec<bool>,
+    /// Per-video progress dot position (jitter prevention).
+    video_progress_pos: Vec<usize>,
+    /// Number of pending images that were ready at last flatten.
+    images_ready_count: usize,
+}
+
+impl DocumentState {
+    fn new(
+        name: String,
+        path: Option<PathBuf>,
+        output: RenderOutput,
+    ) -> Self {
+        let mut sixel_store = Vec::new();
+        let lines = flatten_blocks(&output, &mut sixel_store);
+        let collapsed: HashSet<usize> = lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::DetailsSummary { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let visible = visible_indices(&lines, &collapsed);
+        let gif_state = vec![None; output.pending_gifs.len()];
+        let code_h_scroll = vec![0; output.code_blocks.len()];
+        let video_paused = vec![false; output.pending_gifs.len()];
+        let video_progress_pos = vec![0; output.pending_gifs.len()];
+        let images_ready_count = output
+            .pending_images
+            .iter()
+            .filter(|p| p.is_ready())
+            .count();
+
+        Self {
+            name,
+            path,
+            output,
+            sixel_store,
+            lines,
+            visible,
+            scroll_offset: 0,
+            collapsed,
+            gif_state,
+            code_h_scroll,
+            video_paused,
+            video_progress_pos,
+            images_ready_count,
+        }
+    }
+
+    /// Recompute visible indices from current lines and collapsed state.
+    fn recompute_visible(&mut self) {
+        self.visible = visible_indices(&self.lines, &self.collapsed);
+        if self.scroll_offset >= self.visible.len() {
+            self.scroll_offset = self.visible.len().saturating_sub(1);
+        }
+    }
+
+    /// Re-render from a new output, preserving collapsed state.
+    fn apply_output(
+        &mut self,
+        new_output: RenderOutput,
+    ) {
+        self.lines = flatten_blocks(&new_output, &mut self.sixel_store);
+        self.visible = visible_indices(&self.lines, &self.collapsed);
+        self.gif_state = vec![None; new_output.pending_gifs.len()];
+        self.video_paused = vec![false; new_output.pending_gifs.len()];
+        self.video_progress_pos = vec![0; new_output.pending_gifs.len()];
+        self.code_h_scroll = vec![0; new_output.code_blocks.len()];
+        if self.scroll_offset >= self.visible.len() {
+            self.scroll_offset = self.visible.len().saturating_sub(1);
+        }
+        self.images_ready_count = new_output
+            .pending_images
+            .iter()
+            .filter(|p| p.is_ready())
+            .count();
+        self.output = new_output;
+    }
+
+    /// Re-flatten from the existing output (e.g. when a pending image finishes).
+    fn reflatten(&mut self) {
+        self.lines = flatten_blocks(&self.output, &mut self.sixel_store);
+        self.visible = visible_indices(&self.lines, &self.collapsed);
+        if self.scroll_offset >= self.visible.len() {
+            self.scroll_offset = self.visible.len().saturating_sub(1);
+        }
+        self.images_ready_count = self
+            .output
+            .pending_images
+            .iter()
+            .filter(|p| p.is_ready())
+            .count();
+    }
+}
+
+// ── Sidebar ──────────────────────────────────────────────────────────────
+
+/// Whether the sidebar is collapsed or expanded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarMode {
+    /// Hidden — shows a thin "│◂" strip that can be clicked to open.
+    Collapsed,
+    /// Expanded — shows document list with "│▸" collapse button.
+    Open,
+    /// File-open dialog is active.
+    FileDialog,
+}
+
+/// State for the file-open dialog with path autocomplete.
+struct FileDialogState {
+    /// Current typed text (partial path).
+    input: String,
+    /// Cursor position in `input`.
+    cursor: usize,
+    /// Filtered candidate file paths.
+    candidates: Vec<PathBuf>,
+    /// Index of the highlighted candidate.
+    selected: usize,
+}
+
+impl FileDialogState {
+    fn new() -> Self {
+        let mut s = Self {
+            input: String::new(),
+            cursor: 0,
+            candidates: Vec::new(),
+            selected: 0,
+        };
+        s.recompute_candidates();
+        s
+    }
+
+    fn recompute_candidates(&mut self) {
+        self.candidates.clear();
+        self.selected = 0;
+
+        // Expand ~ to home directory
+        let expanded = expand_path(&self.input);
+
+        let (dir, prefix) = if expanded.contains('/') {
+            let p = PathBuf::from(&expanded);
+            if expanded.ends_with('/') {
+                (p, String::new())
+            } else {
+                let parent = p.parent().unwrap_or(Path::new(".")).to_path_buf();
+                let prefix = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (parent, prefix)
+            }
+        } else {
+            (PathBuf::from("."), expanded.clone())
+        };
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+
+        let prefix_lower = prefix.to_ascii_lowercase();
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !prefix.is_empty() && !name.to_ascii_lowercase().starts_with(&prefix_lower) {
+                continue;
+            }
+            // Skip hidden files unless the prefix starts with '.'
+            if name.starts_with('.') && !prefix.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if is_markdown_file(&name) {
+                files.push(path);
+            }
+        }
+        dirs.sort();
+        files.sort();
+        self.candidates.extend(dirs);
+        self.candidates.extend(files);
+    }
+}
+
+/// Expand shell constructs in a path string:
+/// - `~` and `~user` via shellexpand (cross-platform)
+/// - `$VAR` and `${VAR}` via shellexpand
+/// - `%VAR%` on Windows via manual expansion
+fn expand_path(input: &str) -> String {
+    // shellexpand handles ~ (via dirs crate) and $VAR / ${VAR}
+    let expanded = shellexpand::full(input).unwrap_or(std::borrow::Cow::Borrowed(input));
+
+    // On Windows, also expand %VAR% patterns
+    #[cfg(windows)]
+    let expanded = expand_percent_vars(&expanded);
+
+    expanded.into_owned()
+}
+
+/// Expand `%VAR%` patterns using `std::env::var` (Windows batch syntax).
+#[cfg(windows)]
+fn expand_percent_vars(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let var_name: String = chars.by_ref().take_while(|&c| c != '%').collect();
+            if !var_name.is_empty() {
+                if let Ok(val) = std::env::var(&var_name) {
+                    result.push_str(&val);
+                    continue;
+                }
+            }
+            // Not a valid variable — put back the literal %name%
+            result.push('%');
+            result.push_str(&var_name);
+            result.push('%');
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn is_markdown_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdx")
+}
+
+struct SidebarState {
+    mode: SidebarMode,
+    /// Column width when open (0 when collapsed drawing is handled separately).
+    open_width: u16,
+    /// Index of the active document.
+    active_doc: usize,
+    /// File-open dialog state.
+    dialog: FileDialogState,
+}
+
+impl SidebarState {
+    fn new() -> Self {
+        Self {
+            mode: SidebarMode::Collapsed,
+            open_width: 26,
+            active_doc: 0,
+            dialog: FileDialogState::new(),
+        }
+    }
+
+    /// Effective column width consumed by the sidebar.
+    fn width(&self) -> u16 {
+        match self.mode {
+            SidebarMode::Collapsed => 2,
+            SidebarMode::Open | SidebarMode::FileDialog => self.open_width,
+        }
+    }
+}
+
+/// Draw the sidebar into the terminal.
+fn draw_sidebar(
+    stdout: &mut io::Stdout,
+    sidebar: &SidebarState,
+    doc_names: &[&str],
+    viewport_rows: u16,
+) {
+    let w = sidebar.width();
+
+    match sidebar.mode {
+        SidebarMode::Collapsed => {
+            // Draw thin vertical line with ◂ indicator
+            for row in 0..viewport_rows {
+                crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
+                if row == viewport_rows / 2 {
+                    write!(stdout, "\x1b[2m│\x1b[0m\x1b[1m❰\x1b[0m").unwrap();
+                } else {
+                    write!(stdout, "\x1b[2m│\x1b[0m ").unwrap();
+                }
+            }
+        }
+        SidebarMode::Open | SidebarMode::FileDialog => {
+            let content_w = w.saturating_sub(1) as usize; // -1 for separator
+
+            // Row 0: collapse button
+            crossterm::execute!(stdout, cursor::MoveTo(0, 0)).unwrap();
+            let header = format!(
+                " \x1b[1m▸\x1b[0m {:<width$}",
+                "Documents",
+                width = content_w.saturating_sub(3)
+            );
+            write!(stdout, "{}", &header[..header.len().min((w as usize) * 4)]).unwrap();
+
+            // Row 1: [+] Open file button
+            crossterm::execute!(stdout, cursor::MoveTo(0, 1)).unwrap();
+            let open_btn = format!(" \x1b[2m[+] Open...\x1b[0m");
+            write!(stdout, "{open_btn}").unwrap();
+            // Pad to sidebar width
+            let btn_vis = crate::renderer::ansi::visible_len(&open_btn);
+            for _ in btn_vis..content_w {
+                write!(stdout, " ").unwrap();
+            }
+
+            // Row 2+: document list
+            for (i, &name) in doc_names.iter().enumerate() {
+                let row = i as u16 + 2;
+                if row >= viewport_rows {
+                    break;
+                }
+                crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
+
+                // Truncate name to fit
+                let max_name = content_w.saturating_sub(2);
+                let display: String = if name.len() > max_name && max_name > 2 {
+                    format!("{}…", &name[..max_name - 1])
+                } else {
+                    name.to_string()
+                };
+
+                if i == sidebar.active_doc {
+                    write!(stdout, " \x1b[4m{display}\x1b[0m").unwrap();
+                } else {
+                    write!(stdout, " \x1b[2m{display}\x1b[0m").unwrap();
+                }
+                let name_len = display.len() + 1;
+                for _ in name_len..content_w {
+                    write!(stdout, " ").unwrap();
+                }
+            }
+
+            let doc_end = doc_names.len() as u16 + 2;
+            for row in doc_end..viewport_rows {
+                crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
+                for _ in 0..content_w {
+                    write!(stdout, " ").unwrap();
+                }
+            }
+
+            // Draw separator on rightmost column
+            for row in 0..viewport_rows {
+                crossterm::execute!(stdout, cursor::MoveTo(w - 1, row)).unwrap();
+                write!(stdout, "\x1b[2m│\x1b[0m").unwrap();
+            }
+
+            // File dialog overlay (if active)
+            if sidebar.mode == SidebarMode::FileDialog {
+                draw_file_dialog(stdout, sidebar, viewport_rows);
+            }
+        }
+    }
+}
+
+/// Draw the file-open dialog as an overlay.
+fn draw_file_dialog(
+    stdout: &mut io::Stdout,
+    sidebar: &SidebarState,
+    viewport_rows: u16,
+) {
+    let dialog = &sidebar.dialog;
+    let dialog_width = sidebar.open_width.max(40) as usize;
+
+    // Row 0: label
+    crossterm::execute!(stdout, cursor::MoveTo(1, 0)).unwrap();
+    write!(stdout, "\x1b[7m Open file: \x1b[0m").unwrap();
+
+    // Row 1: input field
+    crossterm::execute!(stdout, cursor::MoveTo(1, 1)).unwrap();
+    let input_display: String = if dialog.input.len() > dialog_width - 3 {
+        let start = dialog.input.len() - (dialog_width - 3);
+        format!("…{}", &dialog.input[start..])
+    } else {
+        dialog.input.clone()
+    };
+    write!(stdout, " {input_display}\x1b[7m \x1b[0m").unwrap();
+    // Pad
+    let used = input_display.len() + 2;
+    for _ in used..dialog_width {
+        write!(stdout, " ").unwrap();
+    }
+
+    // Row 2+: candidates
+    let max_candidates = (viewport_rows as usize).saturating_sub(3);
+    for (i, candidate) in dialog.candidates.iter().enumerate().take(max_candidates) {
+        let row = i as u16 + 2;
+        crossterm::execute!(stdout, cursor::MoveTo(1, row)).unwrap();
+
+        let display = candidate.to_string_lossy();
+        let is_dir = candidate.is_dir();
+        let suffix = if is_dir { "/" } else { "" };
+        let truncated: String = if display.len() + suffix.len() > dialog_width - 2 {
+            format!(
+                "…{}{}",
+                &display[display.len().saturating_sub(dialog_width - 3)..],
+                suffix
+            )
+        } else {
+            format!("{display}{suffix}")
+        };
+
+        if i == dialog.selected {
+            write!(
+                stdout,
+                " \x1b[7m{truncated:<width$}\x1b[0m",
+                width = dialog_width - 2
+            )
+            .unwrap();
+        } else {
+            write!(stdout, " {truncated:<width$}", width = dialog_width - 2).unwrap();
+        }
+    }
+}
+
 /// Set up a file watcher.
 fn setup_watcher(path: &Path) -> Option<(mpsc::Receiver<()>, notify::RecommendedWatcher)> {
     use notify::Watcher;
@@ -705,20 +1142,19 @@ fn setup_watcher(path: &Path) -> Option<(mpsc::Receiver<()>, notify::Recommended
 
 /// Run the interactive pager.
 pub fn run(
-    output: &RenderOutput,
+    output: RenderOutput,
+    file_name: Option<&str>,
+    file_path: Option<&Path>,
     watch_path: Option<&Path>,
-    render_fn: &dyn Fn() -> RenderOutput,
+    render_fn: &dyn Fn(&Path) -> RenderOutput,
 ) {
-    let mut sixel_store = Vec::new();
-    let mut lines = flatten_blocks(output, &mut sixel_store);
-    let mut pending = &output.pending_images;
-    let mut pending_gifs = &output.pending_gifs;
-    let mut code_blocks = &output.code_blocks;
-    // Owned storage for when we re-render
-    #[allow(unused_assignments)]
-    let mut current_output: Option<RenderOutput> = None;
+    let name = file_name.unwrap_or("untitled").to_string();
+    let doc_path = file_path.map(|p| p.to_path_buf());
 
-    if lines.is_empty() {
+    let mut documents = vec![DocumentState::new(name, doc_path, output)];
+    let mut sidebar = SidebarState::new();
+
+    if documents[sidebar.active_doc].lines.is_empty() {
         return;
     }
 
@@ -728,20 +1164,23 @@ pub fn run(
     let mut viewport_rows = term_rows.saturating_sub(1);
 
     // If content fits and no watch and no pending images, just print directly
-    let total_rows: u16 = lines.iter().map(|l| l.rows()).sum();
-    let has_pending = lines.iter().any(|l| {
-        matches!(
-            l,
-            Line::ImageRow {
-                group: ImageGroup::PendingImage(_),
-                ..
-            }
-        )
-    });
-    if total_rows <= viewport_rows && watch_path.is_none() && !has_pending {
-        // Print text, resolving any pending images inline
-        print_output(output);
-        return;
+    let has_pending;
+    {
+        let d = &documents[sidebar.active_doc];
+        let total_rows: u16 = d.lines.iter().map(|l| l.rows()).sum();
+        has_pending = d.lines.iter().any(|l| {
+            matches!(
+                l,
+                Line::ImageRow {
+                    group: ImageGroup::PendingImage(_),
+                    ..
+                }
+            )
+        });
+        if total_rows <= viewport_rows && watch_path.is_none() && !has_pending {
+            print_output(&d.output);
+            return;
+        }
     }
 
     let watcher_state = watch_path.and_then(setup_watcher);
@@ -758,132 +1197,112 @@ pub fn run(
     )
     .unwrap();
 
-    let mut scroll_offset: usize = 0; // index into `visible`
     let mut needs_redraw = true;
-    // Start with all details blocks collapsed (matches GitHub behavior)
-    let mut collapsed: HashSet<usize> = lines
-        .iter()
-        .filter_map(|l| match l {
-            Line::DetailsSummary { id, .. } => Some(*id),
-            _ => None,
-        })
-        .collect();
-    let mut visible = visible_indices(&lines, &collapsed);
 
     let mut last_draw = DrawResult {
         summary_rows: Vec::new(),
         video_control_rows: Vec::new(),
         footnote_rows: Vec::new(),
     };
-    // Per-GIF animation state: (current frame index, next frame deadline).
-    // None = not yet visible / not registered.
-    let mut gif_state: Vec<Option<(usize, std::time::Instant)>> = vec![None; pending_gifs.len()];
-    let mut code_h_scroll: Vec<usize> = vec![0; output.code_blocks.len()];
-    let mut video_paused: Vec<bool> = vec![false; pending_gifs.len()];
-    // Track last progress dot position per GIF to prevent jitter during loading
-    let mut video_progress_pos: Vec<usize> = vec![0; pending_gifs.len()];
-    // Track how many pending images were ready at the last flatten
-    let mut images_ready_count: usize = pending.iter().filter(|p| p.is_ready()).count();
-
-    // Macro to apply a new render output: re-flatten, reset all state vecs.
-    macro_rules! apply_output {
-        ($new_output:expr) => {{
-            let new_output = $new_output;
-            lines = flatten_blocks(&new_output, &mut sixel_store);
-            visible = visible_indices(&lines, &collapsed);
-            current_output = Some(new_output);
-            pending = &current_output.as_ref().unwrap().pending_images;
-            pending_gifs = &current_output.as_ref().unwrap().pending_gifs;
-            code_blocks = &current_output.as_ref().unwrap().code_blocks;
-            gif_state = vec![None; pending_gifs.len()];
-            video_paused = vec![false; pending_gifs.len()];
-            video_progress_pos = vec![0; pending_gifs.len()];
-            code_h_scroll = vec![0; code_blocks.len()];
-            if scroll_offset >= visible.len() {
-                scroll_offset = visible.len().saturating_sub(1);
-            }
-            images_ready_count = pending.iter().filter(|p| p.is_ready()).count();
-            needs_redraw = true;
-        }};
-    }
 
     loop {
-        if advance_gif_frames(&mut gif_state, pending_gifs, &video_paused) {
+        let i = sidebar.active_doc;
+
+        if {
+            let d = &mut documents[i];
+            advance_gif_frames(&mut d.gif_state, &d.output.pending_gifs, &d.video_paused)
+        } {
             needs_redraw = true;
         }
 
-        // Re-flatten if a pending image just finished loading (row count may have
-        // changed)
-        let ready_now = pending.iter().filter(|p| p.is_ready()).count();
-        if ready_now > images_ready_count {
-            images_ready_count = ready_now;
-            let output_ref = current_output.as_ref().unwrap_or(output);
-            lines = flatten_blocks(output_ref, &mut sixel_store);
-            visible = visible_indices(&lines, &collapsed);
-            if scroll_offset >= visible.len() {
-                scroll_offset = visible.len().saturating_sub(1);
+        // Re-flatten if a pending image just finished loading
+        {
+            let ready_now = documents[i]
+                .output
+                .pending_images
+                .iter()
+                .filter(|p| p.is_ready())
+                .count();
+            if ready_now > documents[i].images_ready_count {
+                documents[i].reflatten();
+                needs_redraw = true;
             }
-            needs_redraw = true;
         }
 
         if needs_redraw {
-            // Build the frame index vec for draw_screen
-            let gif_frames: Vec<usize> = gif_state
-                .iter()
-                .map(|slot| slot.map(|(idx, _)| idx).unwrap_or(0))
-                .collect();
+            // Begin synchronized update — all draws are batched until the
+            // matching end marker, preventing flicker.
+            write!(stdout, "\x1b[?2026h").unwrap();
 
-            last_draw = draw_screen(
-                &mut stdout,
-                &lines,
-                &visible,
-                &collapsed,
-                &sixel_store,
-                pending,
-                pending_gifs,
-                &gif_frames,
-                &video_paused,
-                &mut video_progress_pos,
-                code_blocks,
-                &code_h_scroll,
-                scroll_offset,
-                viewport_rows,
-                term_cols,
-                term_rows,
-                watching,
-            );
+            let sw = sidebar.width();
+            {
+                let d = &mut documents[i];
+                let gif_frames: Vec<usize> = d
+                    .gif_state
+                    .iter()
+                    .map(|slot| slot.map(|(idx, _)| idx).unwrap_or(0))
+                    .collect();
+
+                last_draw = draw_screen(
+                    &mut stdout,
+                    &d.lines,
+                    &d.visible,
+                    &d.collapsed,
+                    &d.sixel_store,
+                    &d.output.pending_images,
+                    &d.output.pending_gifs,
+                    &gif_frames,
+                    &d.video_paused,
+                    &mut d.video_progress_pos,
+                    &d.output.code_blocks,
+                    &d.code_h_scroll,
+                    d.scroll_offset,
+                    viewport_rows,
+                    term_cols,
+                    term_rows,
+                    watching,
+                    sw,
+                );
+            }
+            {
+                let names: Vec<&str> = documents.iter().map(|d| d.name.as_str()).collect();
+                draw_sidebar(&mut stdout, &sidebar, &names, viewport_rows);
+            }
+
+            // End synchronized update — terminal flushes the buffered frame.
+            write!(stdout, "\x1b[?2026l").unwrap();
+            stdout.flush().unwrap();
 
             // Register any newly visible GIFs that aren't tracked yet
-            let register_gif = |id: usize, state: &mut Vec<Option<(usize, std::time::Instant)>>| {
-                if let Some(slot) = state.get_mut(id)
-                    && slot.is_none()
-                {
-                    let delay = pending_gifs
-                        .get(id)
-                        .and_then(|g| g.frame(0))
-                        .map(|f| f.delay_ms)
-                        .unwrap_or(100);
-                    *slot = Some((
-                        0,
-                        std::time::Instant::now() + Duration::from_millis(delay as u64),
-                    ));
-                }
-            };
-            for &vi in &visible[scroll_offset..] {
-                match &lines[vi] {
-                    Line::ImageRow {
-                        group: ImageGroup::Gif(id),
-                        row_in_group: 0,
-                        ..
-                    } => register_gif(*id, &mut gif_state),
-                    Line::ImageStrip { sixels, .. } => {
-                        for s in sixels {
-                            if let PositionedSixel::Gif { gif_id, .. } = s {
-                                register_gif(*gif_id, &mut gif_state);
+            {
+                let d = &mut documents[i];
+                let scroll = d.scroll_offset;
+                let vis_len = d.visible.len();
+                for vi_idx in scroll..vis_len {
+                    let vi = d.visible[vi_idx];
+                    match &d.lines[vi] {
+                        Line::ImageRow {
+                            group: ImageGroup::Gif(id),
+                            row_in_group: 0,
+                            ..
+                        } => {
+                            let id = *id;
+                            register_gif(id, &mut d.gif_state, &d.output.pending_gifs);
+                        }
+                        Line::ImageStrip { sixels, .. } => {
+                            let gif_ids: Vec<usize> = sixels
+                                .iter()
+                                .filter_map(|s| match s {
+                                    PositionedSixel::Gif { gif_id, .. } => Some(*gif_id),
+                                    _ => None,
+                                })
+                                .collect();
+                            for gid in gif_ids {
+                                register_gif(gid, &mut d.gif_state, &d.output.pending_gifs);
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             needs_redraw = false;
@@ -895,16 +1314,29 @@ pub fn run(
         {
             while rx.try_recv().is_ok() {}
             std::thread::sleep(Duration::from_millis(50));
-            apply_output!(render_fn());
+
+            if let Some(p) = documents[i].path.clone() {
+                documents[i].apply_output(render_fn(&p));
+            }
+            needs_redraw = true;
             continue;
         }
 
-        if check_visible_images_ready(&lines, &visible, pending, scroll_offset, viewport_rows) {
-            needs_redraw = true;
+        {
+            if check_visible_images_ready(
+                &documents[i].lines,
+                &documents[i].visible,
+                &documents[i].output.pending_images,
+                documents[i].scroll_offset,
+                viewport_rows,
+            ) {
+                needs_redraw = true;
+            }
         }
 
         // Find the earliest GIF frame deadline
-        let next_gif_deadline = gif_state
+        let next_gif_deadline = documents[i]
+            .gif_state
             .iter()
             .filter_map(|slot| slot.as_ref().map(|(_, deadline)| *deadline))
             .min();
@@ -932,8 +1364,147 @@ pub fn run(
             viewport_rows = rows.saturating_sub(1);
             term_rows = rows;
             crate::sixel::invalidate_terminal_size();
-            apply_output!(render_fn());
+            if let Some(p) = documents[i].path.clone() {
+                documents[i].apply_output(render_fn(&p));
+            }
+            needs_redraw = true;
             continue;
+        }
+
+        // ── Sidebar events ────────────────────────────────────────
+
+        // File dialog keyboard handling (highest priority when active)
+        if sidebar.mode == SidebarMode::FileDialog {
+            if let Event::Key(key) = ev {
+                match key.code {
+                    KeyCode::Esc => {
+                        sidebar.mode = SidebarMode::Open;
+                        needs_redraw = true;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(selected) = sidebar
+                            .dialog
+                            .candidates
+                            .get(sidebar.dialog.selected)
+                            .cloned()
+                        {
+                            if selected.is_dir() {
+                                sidebar.dialog.input = selected.to_string_lossy().into_owned();
+                                if !sidebar.dialog.input.ends_with('/') {
+                                    sidebar.dialog.input.push('/');
+                                }
+                                sidebar.dialog.cursor = sidebar.dialog.input.len();
+                                sidebar.dialog.recompute_candidates();
+                            } else {
+                                // Open the file
+                                let new_output = render_fn(&selected);
+                                let name = selected
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "untitled".into());
+                                let doc_path = Some(selected);
+                                documents.push(DocumentState::new(name, doc_path, new_output));
+                                sidebar.active_doc = documents.len() - 1;
+                                sidebar.mode = SidebarMode::Open;
+                            }
+                        }
+                        needs_redraw = true;
+                    }
+                    KeyCode::Backspace => {
+                        if !sidebar.dialog.input.is_empty() {
+                            sidebar.dialog.input.pop();
+                            sidebar.dialog.cursor = sidebar.dialog.input.len();
+                            sidebar.dialog.recompute_candidates();
+                        }
+                        needs_redraw = true;
+                    }
+                    KeyCode::Up => {
+                        sidebar.dialog.selected = sidebar.dialog.selected.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    KeyCode::Down => {
+                        if sidebar.dialog.selected + 1 < sidebar.dialog.candidates.len() {
+                            sidebar.dialog.selected += 1;
+                        }
+                        needs_redraw = true;
+                    }
+                    KeyCode::Tab => {
+                        // Autocomplete: fill in selected candidate
+                        if let Some(selected) =
+                            sidebar.dialog.candidates.get(sidebar.dialog.selected)
+                        {
+                            sidebar.dialog.input = selected.to_string_lossy().into_owned();
+                            if selected.is_dir() && !sidebar.dialog.input.ends_with('/') {
+                                sidebar.dialog.input.push('/');
+                            }
+                            sidebar.dialog.cursor = sidebar.dialog.input.len();
+                            sidebar.dialog.recompute_candidates();
+                        }
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char(c) => {
+                        sidebar.dialog.input.push(c);
+                        sidebar.dialog.cursor = sidebar.dialog.input.len();
+                        sidebar.dialog.recompute_candidates();
+                        needs_redraw = true;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        }
+
+        // Sidebar mouse click handling
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            ..
+        }) = ev
+        {
+            let sw = sidebar.width();
+            if column < sw {
+                match sidebar.mode {
+                    SidebarMode::Collapsed => {
+                        sidebar.mode = SidebarMode::Open;
+                        needs_redraw = true;
+                        continue;
+                    }
+                    SidebarMode::Open => {
+                        if row == 0 {
+                            // Collapse button
+                            sidebar.mode = SidebarMode::Collapsed;
+                            needs_redraw = true;
+                            continue;
+                        }
+                        if row == 1 {
+                            // [+] Open button
+                            sidebar.dialog = FileDialogState::new();
+                            sidebar.mode = SidebarMode::FileDialog;
+                            needs_redraw = true;
+                            continue;
+                        }
+                        // Document list (row 2+)
+                        let doc_idx = (row - 2) as usize;
+                        if doc_idx < documents.len() && doc_idx != sidebar.active_doc {
+                            sidebar.active_doc = doc_idx;
+                            needs_redraw = true;
+                            continue;
+                        }
+                    }
+                    SidebarMode::FileDialog => {
+                        // Click on candidate in dialog
+                        if row >= 2 {
+                            let candidate_idx = (row - 2) as usize;
+                            if candidate_idx < sidebar.dialog.candidates.len() {
+                                sidebar.dialog.selected = candidate_idx;
+                                needs_redraw = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Handle mouse clicks on details summaries
@@ -944,15 +1515,12 @@ pub fn run(
         }) = ev
             && let Some(&(_, id)) = last_draw.summary_rows.iter().find(|(r, _)| *r == row)
         {
-            if collapsed.contains(&id) {
-                collapsed.remove(&id);
+            if documents[i].collapsed.contains(&id) {
+                documents[i].collapsed.remove(&id);
             } else {
-                collapsed.insert(id);
+                documents[i].collapsed.insert(id);
             }
-            visible = visible_indices(&lines, &collapsed);
-            if scroll_offset >= visible.len() {
-                scroll_offset = visible.len().saturating_sub(1);
-            }
+            documents[i].recompute_visible();
             needs_redraw = true;
             continue;
         }
@@ -965,7 +1533,7 @@ pub fn run(
         }) = ev
             && let Some(&(_, gif_id)) = last_draw.video_control_rows.iter().find(|(r, _)| *r == row)
         {
-            if let Some(p) = video_paused.get_mut(gif_id) {
+            if let Some(p) = documents[i].video_paused.get_mut(gif_id) {
                 *p = !*p;
             }
             needs_redraw = true;
@@ -983,15 +1551,15 @@ pub fn run(
                 .footnote_rows
                 .iter()
                 .find(|(r, c0, c1, _, _)| *r == row && column >= *c0 && column < *c1)
-            && let Some(target_vi) = find_footnote_target(&lines, &visible, label, !is_def)
+            && let Some(target_vi) =
+                find_footnote_target(&documents[i].lines, &documents[i].visible, label, !is_def)
         {
-            scroll_offset = target_vi;
+            documents[i].scroll_offset = target_vi;
             needs_redraw = true;
             continue;
         }
 
         // Handle mouse horizontal scroll on code blocks
-        // Supports native ScrollLeft/ScrollRight and Shift+ScrollDown/ScrollUp
         {
             let h_scroll_dir = match &ev {
                 Event::Mouse(MouseEvent {
@@ -1025,24 +1593,25 @@ pub fn run(
                     }
                 });
                 if let Some(block_id) = find_code_block_at_row(
-                    &lines,
-                    &visible,
-                    code_blocks,
-                    scroll_offset,
+                    &documents[i].lines,
+                    &documents[i].visible,
+                    &documents[i].output.code_blocks,
+                    documents[i].scroll_offset,
                     viewport_rows,
                     row,
-                ) && let Some(entry) = code_h_scroll.get_mut(block_id)
-                {
-                    let max = code_blocks[block_id]
+                ) {
+                    let max = documents[i].output.code_blocks[block_id]
                         .max_width
                         .saturating_sub(term_cols as usize);
-                    if right {
-                        *entry = (*entry + 4).min(max);
-                    } else {
-                        *entry = entry.saturating_sub(4);
+                    if let Some(entry) = documents[i].code_h_scroll.get_mut(block_id) {
+                        if right {
+                            *entry = (*entry + 4).min(max);
+                        } else {
+                            *entry = entry.saturating_sub(4);
+                        }
+                        needs_redraw = true;
+                        continue;
                     }
-                    needs_redraw = true;
-                    continue;
                 }
             }
         }
@@ -1053,7 +1622,8 @@ pub fn run(
             ..
         }) = ev
         {
-            scroll_offset = advance_lines(&visible, scroll_offset, 3);
+            documents[i].scroll_offset =
+                advance_lines(&documents[i].visible, documents[i].scroll_offset, 3);
             needs_redraw = true;
             continue;
         }
@@ -1062,13 +1632,36 @@ pub fn run(
             ..
         }) = ev
         {
-            scroll_offset = retreat_lines(scroll_offset, 3);
+            documents[i].scroll_offset = retreat_lines(documents[i].scroll_offset, 3);
             needs_redraw = true;
             continue;
         }
 
         if let Event::Key(key) = ev {
             match key {
+                // Toggle sidebar
+                KeyEvent {
+                    code: KeyCode::Tab, ..
+                } => {
+                    sidebar.mode = match sidebar.mode {
+                        SidebarMode::Collapsed => SidebarMode::Open,
+                        SidebarMode::Open => SidebarMode::Collapsed,
+                        SidebarMode::FileDialog => SidebarMode::Collapsed,
+                    };
+                    needs_redraw = true;
+                }
+
+                // Open file dialog
+                KeyEvent {
+                    code: KeyCode::Char('o'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => {
+                    sidebar.dialog = FileDialogState::new();
+                    sidebar.mode = SidebarMode::FileDialog;
+                    needs_redraw = true;
+                }
+
                 KeyEvent {
                     code: KeyCode::Char('q'),
                     ..
@@ -1087,7 +1680,8 @@ pub fn run(
                     code: KeyCode::Char('j') | KeyCode::Down,
                     ..
                 } => {
-                    scroll_offset = advance_lines(&visible, scroll_offset, 1);
+                    documents[i].scroll_offset =
+                        advance_lines(&documents[i].visible, documents[i].scroll_offset, 1);
                     needs_redraw = true;
                 }
                 // Scroll up
@@ -1095,7 +1689,7 @@ pub fn run(
                     code: KeyCode::Char('k') | KeyCode::Up,
                     ..
                 } => {
-                    scroll_offset = retreat_lines(scroll_offset, 1);
+                    documents[i].scroll_offset = retreat_lines(documents[i].scroll_offset, 1);
                     needs_redraw = true;
                 }
                 // Half page down
@@ -1113,7 +1707,8 @@ pub fn run(
                     ..
                 } => {
                     let half = (viewport_rows / 2) as usize;
-                    scroll_offset = advance_lines(&visible, scroll_offset, half);
+                    documents[i].scroll_offset =
+                        advance_lines(&documents[i].visible, documents[i].scroll_offset, half);
                     needs_redraw = true;
                 }
                 // Half page up
@@ -1131,7 +1726,7 @@ pub fn run(
                     ..
                 } => {
                     let half = (viewport_rows / 2) as usize;
-                    scroll_offset = retreat_lines(scroll_offset, half);
+                    documents[i].scroll_offset = retreat_lines(documents[i].scroll_offset, half);
                     needs_redraw = true;
                 }
                 // Top
@@ -1143,7 +1738,7 @@ pub fn run(
                     code: KeyCode::Home,
                     ..
                 } => {
-                    scroll_offset = 0;
+                    documents[i].scroll_offset = 0;
                     needs_redraw = true;
                 }
                 // Bottom
@@ -1154,7 +1749,8 @@ pub fn run(
                 | KeyEvent {
                     code: KeyCode::End, ..
                 } => {
-                    scroll_offset = scroll_to_end(&lines, &visible, viewport_rows);
+                    documents[i].scroll_offset =
+                        scroll_to_end(&documents[i].lines, &documents[i].visible, viewport_rows);
                     needs_redraw = true;
                 }
                 // Space = page down
@@ -1162,7 +1758,11 @@ pub fn run(
                     code: KeyCode::Char(' '),
                     ..
                 } => {
-                    scroll_offset = advance_lines(&visible, scroll_offset, viewport_rows as usize);
+                    documents[i].scroll_offset = advance_lines(
+                        &documents[i].visible,
+                        documents[i].scroll_offset,
+                        viewport_rows as usize,
+                    );
                     needs_redraw = true;
                 }
                 // Horizontal scroll code blocks
@@ -1170,10 +1770,12 @@ pub fn run(
                     code: KeyCode::Char('h') | KeyCode::Left,
                     ..
                 } => {
-                    if let Some(block_id) =
-                        first_visible_code_block(&lines, &visible, scroll_offset)
-                    {
-                        if let Some(entry) = code_h_scroll.get_mut(block_id) {
+                    if let Some(block_id) = first_visible_code_block(
+                        &documents[i].lines,
+                        &documents[i].visible,
+                        documents[i].scroll_offset,
+                    ) {
+                        if let Some(entry) = documents[i].code_h_scroll.get_mut(block_id) {
                             *entry = entry.saturating_sub(4);
                         }
                         needs_redraw = true;
@@ -1183,14 +1785,18 @@ pub fn run(
                     code: KeyCode::Char('l') | KeyCode::Right,
                     ..
                 } => {
-                    if let Some(block_id) =
-                        first_visible_code_block(&lines, &visible, scroll_offset)
-                    {
-                        if let Some(entry) = code_h_scroll.get_mut(block_id) {
-                            let max = code_blocks
-                                .get(block_id)
-                                .map(|b| b.max_width.saturating_sub(term_cols as usize))
-                                .unwrap_or(0);
+                    if let Some(block_id) = first_visible_code_block(
+                        &documents[i].lines,
+                        &documents[i].visible,
+                        documents[i].scroll_offset,
+                    ) {
+                        let max = documents[i]
+                            .output
+                            .code_blocks
+                            .get(block_id)
+                            .map(|b| b.max_width.saturating_sub(term_cols as usize))
+                            .unwrap_or(0);
+                        if let Some(entry) = documents[i].code_h_scroll.get_mut(block_id) {
                             *entry = (*entry + 4).min(max);
                         }
                         needs_redraw = true;
@@ -1200,7 +1806,10 @@ pub fn run(
                     code: KeyCode::Char('r'),
                     ..
                 } => {
-                    apply_output!(render_fn());
+                    if let Some(p) = documents[i].path.clone() {
+                        documents[i].apply_output(render_fn(&p));
+                    }
+                    needs_redraw = true;
                 }
 
                 // Toggle details or video play/pause
@@ -1208,25 +1817,27 @@ pub fn run(
                     code: KeyCode::Enter,
                     ..
                 } => {
-                    // Try toggling a video first
-                    let toggled_video =
-                        first_visible_video_controls(&lines, &visible, scroll_offset);
+                    let toggled_video = first_visible_video_controls(
+                        &documents[i].lines,
+                        &documents[i].visible,
+                        documents[i].scroll_offset,
+                    );
                     if let Some(gif_id) = toggled_video {
-                        if let Some(p) = video_paused.get_mut(gif_id) {
+                        if let Some(p) = documents[i].video_paused.get_mut(gif_id) {
                             *p = !*p;
                         }
                         needs_redraw = true;
-                    } else if let Some(id) = first_visible_details(&lines, &visible, scroll_offset)
-                    {
-                        if collapsed.contains(&id) {
-                            collapsed.remove(&id);
+                    } else if let Some(id) = first_visible_details(
+                        &documents[i].lines,
+                        &documents[i].visible,
+                        documents[i].scroll_offset,
+                    ) {
+                        if documents[i].collapsed.contains(&id) {
+                            documents[i].collapsed.remove(&id);
                         } else {
-                            collapsed.insert(id);
+                            documents[i].collapsed.insert(id);
                         }
-                        visible = visible_indices(&lines, &collapsed);
-                        if scroll_offset >= visible.len() {
-                            scroll_offset = visible.len().saturating_sub(1);
-                        }
+                        documents[i].recompute_visible();
                         needs_redraw = true;
                     }
                 }
@@ -1244,6 +1855,27 @@ pub fn run(
     )
     .unwrap();
     terminal::disable_raw_mode().unwrap();
+}
+
+/// Register a GIF for animation if not already tracked.
+fn register_gif(
+    id: usize,
+    gif_state: &mut [Option<(usize, std::time::Instant)>],
+    pending_gifs: &[crate::sixel::PendingGif],
+) {
+    if let Some(slot) = gif_state.get_mut(id)
+        && slot.is_none()
+    {
+        let delay = pending_gifs
+            .get(id)
+            .and_then(|g| g.frame(0))
+            .map(|f| f.delay_ms)
+            .unwrap_or(100);
+        *slot = Some((
+            0,
+            std::time::Instant::now() + Duration::from_millis(delay as u64),
+        ));
+    }
 }
 
 /// Print output directly, resolving pending images synchronously.
@@ -1458,8 +2090,9 @@ fn try_render_full_image(
     pending_images: &[crate::sixel::PendingImage],
     gifs: &[crate::sixel::PendingGif],
     gif_frames: &[usize],
+    content_col: u16,
 ) -> bool {
-    crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
+    crossterm::execute!(stdout, cursor::MoveTo(content_col, row)).unwrap();
     match group {
         ImageGroup::Sixel(id) => {
             if let Some(sd) = sixel_store.get(id) {
@@ -1510,13 +2143,12 @@ fn draw_screen(
     term_cols: u16,
     term_rows: u16,
     watching: bool,
+    content_col: u16,
 ) -> DrawResult {
-    write!(stdout, "\x1b[?2026h").unwrap();
-
     crossterm::execute!(
         stdout,
         terminal::Clear(ClearType::All),
-        cursor::MoveTo(0, 0),
+        cursor::MoveTo(content_col, 0),
     )
     .unwrap();
 
@@ -1533,7 +2165,7 @@ fn draw_screen(
         let line_idx = visible[vis_idx];
         match &lines[line_idx] {
             Line::Text(text) => {
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                 write!(stdout, "{text}\r").unwrap();
                 // Associate pending footnote markers with this row
                 for (label, col_start) in pending_footnote_refs.drain(..) {
@@ -1548,7 +2180,7 @@ fn draw_screen(
                 rows_used += 1;
             }
             Line::RichText { segments, height } => {
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                 // First pass: write text segments, leave gaps for images
                 let mut image_positions: Vec<(u16, usize)> = Vec::new();
                 let mut col: u16 = 0;
@@ -1578,8 +2210,11 @@ fn draw_screen(
                     {
                         let sixel = p.wait();
                         if !sixel.is_empty() {
-                            crossterm::execute!(stdout, cursor::MoveTo(*img_col, rows_used))
-                                .unwrap();
+                            crossterm::execute!(
+                                stdout,
+                                cursor::MoveTo(content_col + *img_col, rows_used)
+                            )
+                            .unwrap();
                             write!(stdout, "{sixel}").unwrap();
                         }
                     }
@@ -1604,6 +2239,7 @@ fn draw_screen(
                         pending_images,
                         gifs,
                         gif_frames,
+                        content_col,
                     );
 
                 if render_full {
@@ -1624,7 +2260,7 @@ fn draw_screen(
                     continue; // skip the vis_idx += 1 at bottom
                 } else {
                     // Render one preview row
-                    crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                    crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                     if preview_text.is_empty() {
                         write!(stdout, "\x1b[2m  [loading...]\x1b[0m\r").unwrap();
                     } else {
@@ -1634,7 +2270,7 @@ fn draw_screen(
                 }
             }
             Line::TableRow { content } => {
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                 write!(stdout, "{content}\r").unwrap();
                 rows_used += 1;
             }
@@ -1654,7 +2290,7 @@ fn draw_screen(
                 if render_sixels {
                     // Write content for all rows of this group first
                     let start_row = rows_used;
-                    crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                    crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                     write!(stdout, "{content}\r").unwrap();
                     rows_used += 1;
                     vis_idx += 1;
@@ -1662,7 +2298,8 @@ fn draw_screen(
                     while remaining > 0 && vis_idx < visible.len() && rows_used < viewport_rows {
                         let next = visible[vis_idx];
                         if let Line::ImageStrip { content: c, .. } = &lines[next] {
-                            crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                            crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used))
+                                .unwrap();
                             write!(stdout, "{c}\r").unwrap();
                             rows_used += 1;
                             vis_idx += 1;
@@ -1680,7 +2317,8 @@ fn draw_screen(
                         };
                         let blank: String = " ".repeat(w as usize);
                         for r in start_row..rows_used {
-                            crossterm::execute!(stdout, cursor::MoveTo(col, r)).unwrap();
+                            crossterm::execute!(stdout, cursor::MoveTo(content_col + col, r))
+                                .unwrap();
                             write!(stdout, "{blank}").unwrap();
                         }
                     }
@@ -1688,8 +2326,11 @@ fn draw_screen(
                     for s in sixels {
                         match s {
                             PositionedSixel::Static { col, data, .. } => {
-                                crossterm::execute!(stdout, cursor::MoveTo(*col, start_row))
-                                    .unwrap();
+                                crossterm::execute!(
+                                    stdout,
+                                    cursor::MoveTo(content_col + *col, start_row)
+                                )
+                                .unwrap();
                                 write!(stdout, "{data}").unwrap();
                             }
                             PositionedSixel::Pending { col, image_id, .. } => {
@@ -1700,7 +2341,7 @@ fn draw_screen(
                                     if !sixel.is_empty() {
                                         crossterm::execute!(
                                             stdout,
-                                            cursor::MoveTo(*col, start_row)
+                                            cursor::MoveTo(content_col + *col, start_row)
                                         )
                                         .unwrap();
                                         write!(stdout, "{sixel}").unwrap();
@@ -1712,8 +2353,11 @@ fn draw_screen(
                                 if let Some(gif) = gifs.get(*gif_id)
                                     && let Some(frame) = gif.frame(frame_idx)
                                 {
-                                    crossterm::execute!(stdout, cursor::MoveTo(*col, start_row))
-                                        .unwrap();
+                                    crossterm::execute!(
+                                        stdout,
+                                        cursor::MoveTo(content_col + *col, start_row)
+                                    )
+                                    .unwrap();
                                     write!(stdout, "{}", frame.sixel).unwrap();
                                 }
                             }
@@ -1723,7 +2367,7 @@ fn draw_screen(
                 }
 
                 // No sixel overlay — just render content (preview shows)
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                 write!(stdout, "{content}\r").unwrap();
                 for &(col, w, gif_id) in video_controls {
                     let controls = format_video_controls(
@@ -1734,7 +2378,8 @@ fn draw_screen(
                         video_paused,
                         video_progress_pos,
                     );
-                    crossterm::execute!(stdout, cursor::MoveTo(col, rows_used)).unwrap();
+                    crossterm::execute!(stdout, cursor::MoveTo(content_col + col, rows_used))
+                        .unwrap();
                     write!(stdout, "{controls}").unwrap();
                     video_control_rows.push((rows_used, gif_id));
                 }
@@ -1751,7 +2396,7 @@ fn draw_screen(
             Line::DetailsSummary { id, text } => {
                 let is_collapsed = collapsed.contains(id);
                 let triangle = if is_collapsed { "\u{25B6}" } else { "\u{25BC}" };
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                 write!(stdout, "\x1b[1m{triangle} {text}\x1b[0m\r").unwrap();
                 summary_rows.push((rows_used, *id));
                 rows_used += 1;
@@ -1759,14 +2404,15 @@ fn draw_screen(
             Line::CodeBlock { id, height } => {
                 if let Some(block) = code_blocks.get(*id) {
                     let h_offset = code_h_scroll.get(*id).copied().unwrap_or(0);
-                    let avail_cols = term_cols as usize;
+                    let avail_cols = term_cols.saturating_sub(content_col) as usize;
 
                     // Render each code line with horizontal scroll
                     for line in &block.lines {
                         if rows_used >= viewport_rows {
                             break;
                         }
-                        crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                        crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used))
+                            .unwrap();
                         let sliced =
                             crate::renderer::ansi::visible_slice(line, h_offset, avail_cols);
                         write!(stdout, "  {sliced}\x1b[0m\r").unwrap();
@@ -1775,7 +2421,8 @@ fn draw_screen(
 
                     // Scrollbar row
                     if rows_used < viewport_rows {
-                        crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                        crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used))
+                            .unwrap();
                         if block.max_width > avail_cols {
                             let bar = render_scrollbar(h_offset, block.max_width, avail_cols);
                             write!(stdout, "\x1b[2m{bar}\x1b[0m\r").unwrap();
@@ -1787,7 +2434,7 @@ fn draw_screen(
                 }
             }
             Line::VideoControls { gif_id } => {
-                crossterm::execute!(stdout, cursor::MoveTo(0, rows_used)).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(content_col, rows_used)).unwrap();
                 let video_cols = gifs
                     .get(*gif_id)
                     .and_then(|g| g.preview.first())
@@ -1816,19 +2463,15 @@ fn draw_screen(
         (vis_idx * 100) / visible.len()
     };
     let watch_indicator = if watching { " [watching]" } else { "" };
-    let cols = term_cols as usize;
+    let cols = term_cols.saturating_sub(content_col) as usize;
     let status = format!(
         " [{progress}%]{watch_indicator} j/k:scroll  h/l:code  d/u:half  g/G:top/end  \
          enter:toggle  r:reload  q:quit"
     );
     // Truncate to terminal width to prevent wrapping
     let status: String = status.chars().take(cols).collect();
-    crossterm::execute!(stdout, cursor::MoveTo(0, term_rows - 1)).unwrap();
+    crossterm::execute!(stdout, cursor::MoveTo(content_col, term_rows - 1)).unwrap();
     write!(stdout, "\x1b[7m{status:<width$}\x1b[0m", width = cols).unwrap();
-
-    // End synchronized update — terminal flushes the buffered frame at once.
-    write!(stdout, "\x1b[?2026l").unwrap();
-    stdout.flush().unwrap();
 
     DrawResult {
         summary_rows,

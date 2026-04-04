@@ -136,18 +136,29 @@ pub fn render_svg_file(
     render_svg_bytes(&data, max_width)
 }
 
-/// Render SVG from raw bytes to an RGBA image, scaling to fit `max_width`
-/// pixels.
+/// Render SVG from raw bytes to an RGBA image, scaling down to fit
+/// `max_width` pixels if the SVG is wider. Small SVGs are rendered at
+/// their intrinsic size.
 pub fn render_svg_bytes(
     data: &[u8],
     max_width: u32,
 ) -> Option<RgbaImage> {
-    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default()).ok()?;
+    let mut opts = resvg::usvg::Options::default();
+
+    // Load system fonts so <text> elements render correctly.
+    let mut fontdb = resvg::usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    opts.fontdb = std::sync::Arc::new(fontdb);
+
+    let tree = resvg::usvg::Tree::from_data(data, &opts).ok()?;
     let svg_size = tree.size();
 
-    let width = max_width.min(MAX_SIXEL_WIDTH);
+    // Only scale down, never up — prevents tiny badges from being blown up.
+    let cap = max_width.min(MAX_SIXEL_WIDTH);
+    let intrinsic_w = svg_size.width() as u32;
+    let width = intrinsic_w.min(cap);
     let scale = width as f32 / svg_size.width();
-    let height = (svg_size.height() * scale) as u32;
+    let height = (svg_size.height() * scale).max(1.0) as u32;
 
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
     let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);

@@ -150,23 +150,27 @@ fn main() {
             None
         };
 
-        let render_fn: Box<dyn Fn() -> renderer::RenderOutput> = if let Some(file) = &args.file {
-            let file = file.clone();
-            let base = base_path.clone();
+        let file_name = args
+            .file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+
+        let render_fn = {
             let theme = theme.clone();
-            Box::new(move || {
-                let md = std::fs::read_to_string(&file).unwrap_or_default();
+            move |path: &std::path::Path| {
+                let md = std::fs::read_to_string(path).unwrap_or_default();
+                let base = path.parent().map(|p| p.to_path_buf());
                 renderer::render(&md, &font, base.as_deref(), &theme, &highlighter)
-            })
-        } else {
-            Box::new(|| renderer::RenderOutput {
-                blocks: Vec::new(),
-                pending_images: Vec::new(),
-                pending_gifs: Vec::new(),
-                code_blocks: Vec::new(),
-            })
+            }
         };
 
-        pager::run(&output, watch_path, &render_fn);
+        pager::run(
+            output,
+            file_name.as_deref(),
+            args.file.as_deref(),
+            watch_path,
+            &render_fn,
+        );
     }
 }
