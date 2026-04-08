@@ -4,6 +4,7 @@ use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
 use pulldown_cmark::HeadingLevel;
+use pulldown_cmark::LinkType;
 use pulldown_cmark::Options;
 use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
@@ -376,6 +377,7 @@ struct RenderState {
     italic: bool,
     strikethrough: bool,
     link_url: Option<String>,
+    in_wikilink: bool,
     in_code_block: bool,
     in_image: bool,
     blockquote_depth: usize,
@@ -395,10 +397,15 @@ struct RenderState {
     para_images: Vec<ImageSource>,
     /// Footnote label → display number mapping.
     footnote_numbers: std::collections::HashMap<String, usize>,
+    /// Pending wikilinks accumulated during text processing.
+    pending_wikilinks: Vec<WikilinkInfo>,
 }
 
 impl RenderState {
-    fn new(base_path: Option<std::path::PathBuf>) -> Self {
+    fn new(
+        base_path: Option<std::path::PathBuf>,
+        term_width: u16,
+    ) -> Self {
         Self {
             heading_text: String::new(),
             heading_level: 0,
@@ -406,6 +413,7 @@ impl RenderState {
             italic: false,
             strikethrough: false,
             link_url: None,
+            in_wikilink: false,
             in_code_block: false,
             in_image: false,
             blockquote_depth: 0,
@@ -419,10 +427,11 @@ impl RenderState {
             pending_images: Vec::new(),
             code_blocks: Vec::new(),
             pending_gifs: Vec::new(),
-            term_width: crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80),
+            term_width,
             next_details_id: 0,
             para_images: Vec::new(),
             footnote_numbers: std::collections::HashMap::new(),
+            pending_wikilinks: Vec::new(),
         }
     }
 
@@ -453,7 +462,7 @@ impl RenderState {
     ) {
         let max_w = sixel::terminal_pixel_width();
         if let Some(media) = encode_from_source(source, max_w) {
-            flush_text(out, blocks);
+            flush_text(out, blocks, &mut self.pending_wikilinks);
             push_media(
                 media,
                 &mut self.pending_images,
@@ -857,7 +866,7 @@ fn handle_block_html(
                     "details" => {
                         let id = state.next_details_id;
                         state.next_details_id += 1;
-                        flush_text(out, blocks);
+                        flush_text(out, blocks, &mut state.pending_wikilinks);
                         blocks.push(OutputBlock::DetailsStart { id });
                     }
                     "hr" => {
@@ -921,7 +930,7 @@ fn handle_block_html(
                 if name == "details" {
                     // Emit end-of-details marker
                     let id = state.next_details_id.saturating_sub(1);
-                    flush_text(out, blocks);
+                    flush_text(out, blocks, &mut state.pending_wikilinks);
                     blocks.push(OutputBlock::DetailsEnd { id });
                 } else if block_tag.as_deref() == Some(name.as_str()) {
                     emit_block(&name, &text_buf, state, out, blocks, font, theme, in_pre);
@@ -1003,7 +1012,7 @@ fn emit_block(
                 // Emit a summary marker — the pager renders this with a
                 // disclosure triangle and handles expand/collapse.
                 let id = state.next_details_id.saturating_sub(1);
-                flush_text(out, blocks);
+                flush_text(out, blocks, &mut state.pending_wikilinks);
                 blocks.push(OutputBlock::DetailsSummary {
                     id,
                     text: text.to_string(),
@@ -1092,7 +1101,7 @@ fn flush_table(
         }
     }
 
-    flush_text(out, blocks);
+    flush_text(out, blocks, &mut state.pending_wikilinks);
     blocks.push(OutputBlock::Table(RenderedTable {
         col_widths,
         alignments,
@@ -1143,9 +1152,34 @@ pub enum SideBySideItem {
     Gif(usize),
 }
 
+/// Pre-wrap text stored for cheap re-wrapping on layout changes.
+pub enum RawText {
+    /// Plain paragraph text (wrap at full width).
+    Plain(String),
+    /// Blockquote text (wrap at width minus indent, then prepend prefix per line).
+    Blockquote { text: String, depth: usize },
+    /// Text that should not be re-wrapped (e.g. code, pre-formatted).
+    Verbatim,
+}
+
+/// A wikilink embedded in a text block.
+pub struct WikilinkInfo {
+    pub target: String,
+    /// Line index within the text block (0-based, counted by `\n`).
+    pub line: usize,
+    /// Visible column on that line where the link text starts.
+    pub col: usize,
+}
+
 pub enum OutputBlock {
     /// ANSI-styled text (may contain newlines).
-    Text(String),
+    /// `raw` stores the pre-wrap text for cheap re-wrapping on layout changes.
+    /// `wikilinks` stores positions of wikilinks within this text block.
+    Text {
+        wrapped: String,
+        raw: RawText,
+        wikilinks: Vec<WikilinkInfo>,
+    },
     /// A sixel image (e.g. a heading) with half-block preview.
     Sixel {
         data: String,
@@ -1186,13 +1220,48 @@ pub struct RenderOutput {
     pub code_blocks: Vec<CodeBlock>,
 }
 
+impl RenderOutput {
+    /// Re-wrap all text blocks at a new width without re-encoding images.
+    /// This is much cheaper than a full re-render.
+    pub fn rewrap(
+        &mut self,
+        width: u16,
+        theme: &crate::theme::Theme,
+    ) {
+        for block in &mut self.blocks {
+            if let OutputBlock::Text { wrapped, raw, .. } = block {
+                match raw {
+                    RawText::Plain(text) => {
+                        let mut new = ansi::wrap(text, width);
+                        new.push_str("\n\n");
+                        *wrapped = new;
+                    }
+                    RawText::Blockquote { text, depth } => {
+                        let mut new = wrap_blockquote(text, *depth, width, theme);
+                        new.push_str("\n\n");
+                        *wrapped = new;
+                    }
+                    RawText::Verbatim => {}
+                }
+            }
+        }
+    }
+}
+
 /// Flush the text buffer into a Text block if non-empty.
+/// Uses `Verbatim` raw text since this is pre-formatted content that
+/// doesn't need re-wrapping (list items, code output, HTML blocks, etc.).
 fn flush_text(
     out: &mut String,
     blocks: &mut Vec<OutputBlock>,
+    wikilinks: &mut Vec<WikilinkInfo>,
 ) {
     if !out.is_empty() {
-        blocks.push(OutputBlock::Text(std::mem::take(out)));
+        blocks.push(OutputBlock::Text {
+            wrapped: std::mem::take(out),
+            raw: RawText::Verbatim,
+            wikilinks: std::mem::take(wikilinks),
+        });
     }
 }
 
@@ -1388,7 +1457,7 @@ fn render_heading_sixel(
         let data = sixel::encode_rgba(w, snapped_h, &pixels);
         let height = sixel::pixel_height_to_rows(snapped_h);
         let preview = sixel::preview_from_pixels(&pixels, w, snapped_h, height);
-        flush_text(out, blocks);
+        flush_text(out, blocks, &mut state.pending_wikilinks);
         blocks.push(OutputBlock::Sixel {
             data,
             height,
@@ -1405,36 +1474,67 @@ fn end_paragraph(
     theme: &crate::theme::Theme,
 ) {
     out.push_str(ansi::RESET);
-    if state.blockquote_depth > 0 {
-        let prefix = format!(
-            "{}{}",
-            theme.blockquote.to_ansi(),
-            "  \u{2502} ".repeat(state.blockquote_depth)
-        );
-        let indent_width = 4 * state.blockquote_depth as u16;
-        let wrap_width = state.term_width.saturating_sub(indent_width);
-        let raw = std::mem::take(out);
-        let wrapped = ansi::wrap(&raw, wrap_width);
-        for (i, line) in wrapped.lines().enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
-            out.push_str(&prefix);
-            out.push_str(line);
-            out.push_str(ansi::RESET);
-        }
+    let raw_text = std::mem::take(out);
+
+    let (wrapped, raw) = if state.blockquote_depth > 0 {
+        let depth = state.blockquote_depth;
+        let wrapped = wrap_blockquote(&raw_text, depth, state.term_width, theme);
+        (
+            wrapped,
+            RawText::Blockquote {
+                text: raw_text,
+                depth,
+            },
+        )
     } else {
-        let wrapped = ansi::wrap(&std::mem::take(out), state.term_width);
-        out.push_str(&wrapped);
-    }
+        let wrapped = ansi::wrap(&raw_text, state.term_width);
+        (wrapped, RawText::Plain(raw_text))
+    };
+
+    out.push_str(&wrapped);
     out.push_str("\n\n");
+
+    // Flush as a re-wrappable text block
+    if !out.is_empty() {
+        blocks.push(OutputBlock::Text {
+            wrapped: std::mem::take(out),
+            raw,
+            wikilinks: std::mem::take(&mut state.pending_wikilinks),
+        });
+    }
 
     // Flush buffered paragraph images
     let images = std::mem::take(&mut state.para_images);
     if !images.is_empty() {
-        flush_text(out, blocks);
         flush_para_images(state, &images, blocks);
     }
+}
+
+/// Wrap text inside a blockquote, prepending the blockquote prefix to each line.
+fn wrap_blockquote(
+    text: &str,
+    depth: usize,
+    term_width: u16,
+    theme: &crate::theme::Theme,
+) -> String {
+    let prefix = format!(
+        "{}{}",
+        theme.blockquote.to_ansi(),
+        "  \u{2502} ".repeat(depth)
+    );
+    let indent_width = 4 * depth as u16;
+    let wrap_width = term_width.saturating_sub(indent_width);
+    let wrapped = ansi::wrap(text, wrap_width);
+    let mut result = String::new();
+    for (i, line) in wrapped.lines().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        result.push_str(&prefix);
+        result.push_str(line);
+        result.push_str(ansi::RESET);
+    }
+    result
 }
 
 /// Encode from either a local path or URL.
@@ -1471,10 +1571,11 @@ fn flush_para_images(
                 blocks,
             );
         } else {
-            blocks.push(OutputBlock::Text(format!(
-                "\x1b[2m[image: {}]\x1b[0m",
-                source_display(&images[0])
-            )));
+            blocks.push(OutputBlock::Text {
+                wrapped: format!("\x1b[2m[image: {}]\x1b[0m", source_display(&images[0])),
+                raw: RawText::Verbatim,
+                wikilinks: Vec::new(),
+            });
         }
         return;
     }
@@ -1493,10 +1594,11 @@ fn flush_para_images(
     }
     if items.is_empty() {
         let names: Vec<_> = images.iter().map(source_display).collect();
-        blocks.push(OutputBlock::Text(format!(
-            "\x1b[2m[images: {}]\x1b[0m",
-            names.join(", ")
-        )));
+        blocks.push(OutputBlock::Text {
+            wrapped: format!("\x1b[2m[images: {}]\x1b[0m", names.join(", ")),
+            raw: RawText::Verbatim,
+            wikilinks: Vec::new(),
+        });
     } else {
         blocks.push(OutputBlock::SideBySide(items));
     }
@@ -1565,7 +1667,7 @@ fn end_code_block(
                     estimated_rows,
                     preview,
                 ));
-                flush_text(out, blocks);
+                flush_text(out, blocks, &mut state.pending_wikilinks);
                 blocks.push(OutputBlock::Image(id));
                 return;
             }
@@ -1608,7 +1710,7 @@ fn end_code_block(
         .max()
         .unwrap_or(0);
 
-    flush_text(out, blocks);
+    flush_text(out, blocks, &mut state.pending_wikilinks);
     blocks.push(OutputBlock::Code(state.code_blocks.len()));
     state.code_blocks.push(CodeBlock {
         lines: styled_lines,
@@ -1690,17 +1792,19 @@ pub fn render(
     base_path: Option<&Path>,
     theme: &crate::theme::Theme,
     highlighter: &crate::highlight::Highlighter,
+    content_width: u16,
 ) -> RenderOutput {
     let options = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_MATH;
+        | Options::ENABLE_MATH
+        | Options::ENABLE_WIKILINKS;
     let parser = Parser::new_ext(markdown, options);
 
     let mut out = String::new();
     let mut blocks: Vec<OutputBlock> = Vec::new();
-    let mut state = RenderState::new(base_path.map(|p| p.to_path_buf()));
+    let mut state = RenderState::new(base_path.map(|p| p.to_path_buf()), content_width);
 
     for event in parser {
         match event {
@@ -1798,19 +1902,45 @@ pub fn render(
             }
 
             // ── Links ────────────────────────────────────────────────
-            Event::Start(Tag::Link { dest_url, .. }) => {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) => {
                 let url = dest_url.to_string();
+                let is_wikilink = matches!(link_type, LinkType::WikiLink { .. });
                 if state.heading_level == 0 {
-                    out.push_str(&ansi::link_start(&url));
-                    out.push_str(ansi::UNDERLINE);
+                    if is_wikilink {
+                        // Track the wikilink position within the current text buffer.
+                        // Line index = number of newlines so far in the buffer.
+                        let line = out.chars().filter(|&c| c == '\n').count();
+                        let col = out
+                            .rfind('\n')
+                            .map(|pos| ansi::visible_len(&out[pos + 1..]))
+                            .unwrap_or_else(|| ansi::visible_len(&out));
+                        state.pending_wikilinks.push(WikilinkInfo {
+                            target: url.clone(),
+                            line,
+                            col,
+                        });
+                        out.push_str(ansi::BOLD);
+                        out.push_str(ansi::ITALIC);
+                        state.in_wikilink = true;
+                    } else {
+                        out.push_str(&ansi::link_start(&url));
+                        out.push_str(ansi::UNDERLINE);
+                    }
                 }
                 state.link_url = Some(url);
             }
             Event::End(TagEnd::Link) => {
                 if state.heading_level == 0 {
                     out.push_str(ansi::RESET);
-                    out.push_str(&ansi::link_end());
+                    if !state.in_wikilink {
+                        out.push_str(&ansi::link_end());
+                    }
                 }
+                state.in_wikilink = false;
                 state.link_url = None;
             }
 
@@ -1823,7 +1953,7 @@ pub fn render(
                             render_image_in_table_cell(path, &mut state);
                         }
                     } else {
-                        flush_text(&mut out, &mut blocks);
+                        flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
                         state.para_images.push(source);
                     }
                 }
@@ -1871,7 +2001,7 @@ pub fn render(
             Event::Start(Tag::BlockQuote(_)) => {
                 // Flush any preceding paragraph text before changing depth,
                 // so it doesn't get the blockquote prefix.
-                flush_text(&mut out, &mut blocks);
+                flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
                 state.blockquote_depth += 1;
             }
             Event::End(TagEnd::BlockQuote(_)) => {
@@ -2023,14 +2153,14 @@ pub fn render(
             }
             Event::Start(Tag::FootnoteDefinition(label)) => {
                 let num = state.footnote_number(&label);
-                flush_text(&mut out, &mut blocks);
+                flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
                 blocks.push(OutputBlock::FootnoteDefStart {
                     label: label.to_string(),
                 });
                 out.push_str(&format!("\x1b[36m\x1b[1m[{num}]\x1b[0m "));
             }
             Event::End(TagEnd::FootnoteDefinition) => {
-                flush_text(&mut out, &mut blocks);
+                flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
                 blocks.push(OutputBlock::FootnoteDefEnd);
             }
 
@@ -2040,7 +2170,7 @@ pub fn render(
                 let max_w = (text_width_px * 2).max(200);
                 let math_fg = theme.heading_color(1);
                 if let Some(id) = render_math_image(&latex, false, max_w, math_fg, &mut state) {
-                    flush_text(&mut out, &mut blocks);
+                    flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
                     blocks.push(OutputBlock::InlineImage(id));
                 } else {
                     out.push_str(&format!("\x1b[3m\x1b[36m{latex}\x1b[0m"));
@@ -2051,10 +2181,10 @@ pub fn render(
                 let max_w = (text_width_px * 2).max(200);
                 let math_fg = theme.heading_color(1);
                 if let Some(id) = render_math_image(&latex, true, max_w, math_fg, &mut state) {
-                    flush_text(&mut out, &mut blocks);
+                    flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
                     blocks.push(OutputBlock::Image(id));
                 } else {
-                    flush_text(&mut out, &mut blocks);
+                    flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
                     out.push_str(&format!("\x1b[3m\x1b[36m$${latex}$$\x1b[0m\n"));
                 }
             }
@@ -2063,8 +2193,8 @@ pub fn render(
         }
     }
 
-    // Flush any remaining text
-    flush_text(&mut out, &mut blocks);
+    // Flush any remaining text (with accumulated wikilink positions)
+    flush_text(&mut out, &mut blocks, &mut state.pending_wikilinks);
 
     RenderOutput {
         blocks,

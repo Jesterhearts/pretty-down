@@ -136,7 +136,15 @@ fn main() {
         }
     };
 
-    let output = renderer::render(&markdown, &font, base_path.as_deref(), &theme, &highlighter);
+    let term_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+    let output = renderer::render(
+        &markdown,
+        &font,
+        base_path.as_deref(),
+        &theme,
+        &highlighter,
+        term_width,
+    );
 
     if args.no_pager || !std::io::stdout().is_terminal() {
         for p in &output.pending_images {
@@ -158,10 +166,17 @@ fn main() {
 
         let render_fn = {
             let theme = theme.clone();
-            move |path: &std::path::Path| {
+            move |path: &std::path::Path, content_width: u16| {
                 let md = std::fs::read_to_string(path).unwrap_or_default();
                 let base = path.parent().map(|p| p.to_path_buf());
-                renderer::render(&md, &font, base.as_deref(), &theme, &highlighter)
+                renderer::render(
+                    &md,
+                    &font,
+                    base.as_deref(),
+                    &theme,
+                    &highlighter,
+                    content_width,
+                )
             }
         };
 
@@ -171,6 +186,7 @@ fn main() {
             args.file.as_deref(),
             watch_path,
             &render_fn,
+            &theme,
         );
     }
 }

@@ -101,6 +101,8 @@ enum Line {
     FootnoteDefStart { label: String },
     /// Invisible marker: end of a footnote definition.
     FootnoteDefEnd,
+    /// Invisible marker: a wikilink at this column in the text.
+    WikilinkRef { target: String, col: usize },
 }
 
 impl Line {
@@ -119,7 +121,8 @@ impl Line {
             | Line::DetailsEnd { .. }
             | Line::FootnoteRef { .. }
             | Line::FootnoteDefStart { .. }
-            | Line::FootnoteDefEnd => 0,
+            | Line::FootnoteDefEnd
+            | Line::WikilinkRef { .. } => 0,
         }
     }
 }
@@ -146,7 +149,12 @@ fn flatten_blocks(
 
     for block in &output.blocks {
         match block {
-            OutputBlock::Text(text) => {
+            OutputBlock::Text {
+                wrapped: text,
+                wikilinks,
+                ..
+            } => {
+                let base_line_idx = lines.len();
                 let mut line_iter = text.split('\n');
                 // First line: if the previous line is a RichText (from InlineImage),
                 // append this text to it instead of creating a new line
@@ -159,6 +167,26 @@ fn flatten_blocks(
                 }
                 for line in line_iter {
                     lines.push(Line::Text(line.to_string()));
+                }
+                // Insert wikilink markers at the correct line positions
+                // (inserted after all text lines so indices are stable)
+                let mut insertions: Vec<(usize, Line)> = Vec::new();
+                for wl in wikilinks {
+                    let target_idx = base_line_idx + wl.line;
+                    insertions.push((
+                        target_idx,
+                        Line::WikilinkRef {
+                            target: wl.target.clone(),
+                            col: wl.col,
+                        },
+                    ));
+                }
+                // Insert in reverse order so indices stay valid
+                insertions.sort_by(|a, b| b.0.cmp(&a.0));
+                for (idx, line) in insertions {
+                    if idx <= lines.len() {
+                        lines.insert(idx, line);
+                    }
                 }
             }
             OutputBlock::InlineImage(id) => {
@@ -762,6 +790,20 @@ impl DocumentState {
         }
     }
 
+    /// Re-wrap text at a new width without re-encoding images.
+    fn rewrap(
+        &mut self,
+        width: u16,
+        theme: &crate::theme::Theme,
+    ) {
+        self.output.rewrap(width, theme);
+        self.lines = flatten_blocks(&self.output, &mut self.sixel_store);
+        self.visible = visible_indices(&self.lines, &self.collapsed);
+        if self.scroll_offset >= self.visible.len() {
+            self.scroll_offset = self.visible.len().saturating_sub(1);
+        }
+    }
+
     /// Re-render from a new output, preserving collapsed state.
     fn apply_output(
         &mut self,
@@ -976,14 +1018,15 @@ fn draw_sidebar(
 
     match sidebar.mode {
         SidebarMode::Collapsed => {
-            // Draw thin vertical line with ◂ indicator
-            for row in 0..viewport_rows {
+            // Row 0: bold ❰ with underline beneath it
+            crossterm::execute!(stdout, cursor::MoveTo(0, 0)).unwrap();
+            write!(stdout, "\x1b[1m❰\x1b[0m ").unwrap();
+            crossterm::execute!(stdout, cursor::MoveTo(0, 1)).unwrap();
+            write!(stdout, "\x1b[2m─\x1b[0m ").unwrap();
+            // Remaining rows: thin vertical line
+            for row in 2..viewport_rows {
                 crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
-                if row == viewport_rows / 2 {
-                    write!(stdout, "\x1b[2m│\x1b[0m\x1b[1m❰\x1b[0m").unwrap();
-                } else {
-                    write!(stdout, "\x1b[2m│\x1b[0m ").unwrap();
-                }
+                write!(stdout, "\x1b[2m│\x1b[0m ").unwrap();
             }
         }
         SidebarMode::Open | SidebarMode::FileDialog => {
@@ -1146,7 +1189,8 @@ pub fn run(
     file_name: Option<&str>,
     file_path: Option<&Path>,
     watch_path: Option<&Path>,
-    render_fn: &dyn Fn(&Path) -> RenderOutput,
+    render_fn: &dyn Fn(&Path, u16) -> RenderOutput,
+    theme: &crate::theme::Theme,
 ) {
     let name = file_name.unwrap_or("untitled").to_string();
     let doc_path = file_path.map(|p| p.to_path_buf());
@@ -1163,25 +1207,15 @@ pub fn run(
     let (mut term_cols, mut term_rows) = terminal::size().unwrap_or((80, 24));
     let mut viewport_rows = term_rows.saturating_sub(1);
 
-    // If content fits and no watch and no pending images, just print directly
-    let has_pending;
-    {
-        let d = &documents[sidebar.active_doc];
-        let total_rows: u16 = d.lines.iter().map(|l| l.rows()).sum();
-        has_pending = d.lines.iter().any(|l| {
-            matches!(
-                l,
-                Line::ImageRow {
-                    group: ImageGroup::PendingImage(_),
-                    ..
-                }
-            )
-        });
-        if total_rows <= viewport_rows && watch_path.is_none() && !has_pending {
-            print_output(&d.output);
-            return;
-        }
-    }
+    let has_pending = documents[sidebar.active_doc].lines.iter().any(|l| {
+        matches!(
+            l,
+            Line::ImageRow {
+                group: ImageGroup::PendingImage(_),
+                ..
+            }
+        )
+    });
 
     let watcher_state = watch_path.and_then(setup_watcher);
     let watch_rx = watcher_state.as_ref().map(|(rx, _)| rx);
@@ -1203,6 +1237,7 @@ pub fn run(
         summary_rows: Vec::new(),
         video_control_rows: Vec::new(),
         footnote_rows: Vec::new(),
+        wikilink_rows: Vec::new(),
     };
 
     loop {
@@ -1316,7 +1351,7 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(50));
 
             if let Some(p) = documents[i].path.clone() {
-                documents[i].apply_output(render_fn(&p));
+                documents[i].apply_output(render_fn(&p, term_cols.saturating_sub(sidebar.width())));
             }
             needs_redraw = true;
             continue;
@@ -1365,7 +1400,7 @@ pub fn run(
             term_rows = rows;
             crate::sixel::invalidate_terminal_size();
             if let Some(p) = documents[i].path.clone() {
-                documents[i].apply_output(render_fn(&p));
+                documents[i].apply_output(render_fn(&p, term_cols.saturating_sub(sidebar.width())));
             }
             needs_redraw = true;
             continue;
@@ -1397,7 +1432,8 @@ pub fn run(
                                 sidebar.dialog.recompute_candidates();
                             } else {
                                 // Open the file
-                                let new_output = render_fn(&selected);
+                                let new_output =
+                                    render_fn(&selected, term_cols.saturating_sub(sidebar.width()));
                                 let name = selected
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
@@ -1467,13 +1503,16 @@ pub fn run(
                 match sidebar.mode {
                     SidebarMode::Collapsed => {
                         sidebar.mode = SidebarMode::Open;
+                        let cw = term_cols.saturating_sub(sidebar.width());
+                        documents[i].rewrap(cw, theme);
                         needs_redraw = true;
                         continue;
                     }
                     SidebarMode::Open => {
                         if row == 0 {
-                            // Collapse button
                             sidebar.mode = SidebarMode::Collapsed;
+                            let cw = term_cols.saturating_sub(sidebar.width());
+                            documents[i].rewrap(cw, theme);
                             needs_redraw = true;
                             continue;
                         }
@@ -1557,6 +1596,41 @@ pub fn run(
             documents[i].scroll_offset = target_vi;
             needs_redraw = true;
             continue;
+        }
+
+        // Handle click on wikilink — open linked document
+        if let Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row,
+            column,
+            ..
+        }) = ev
+        {
+            if let Some((_, _, _, target)) = last_draw
+                .wikilink_rows
+                .iter()
+                .find(|(r, c0, c1, _)| *r == row && column >= *c0 && column < *c1)
+            {
+                // Resolve wikilink target relative to the current document's directory
+                let target_path = resolve_wikilink(target, &documents[i].path);
+                if let Some(path) = target_path {
+                    if path.exists() {
+                        let cw = term_cols.saturating_sub(sidebar.width());
+                        let new_output = render_fn(&path, cw);
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "untitled".into());
+                        documents.push(DocumentState::new(name, Some(path), new_output));
+                        sidebar.active_doc = documents.len() - 1;
+                        if sidebar.mode == SidebarMode::Collapsed {
+                            sidebar.mode = SidebarMode::Open;
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+                }
+            }
         }
 
         // Handle mouse horizontal scroll on code blocks
@@ -1648,6 +1722,9 @@ pub fn run(
                         SidebarMode::Open => SidebarMode::Collapsed,
                         SidebarMode::FileDialog => SidebarMode::Collapsed,
                     };
+                    // Re-wrap text at new content width (cheap, no image re-encoding)
+                    let cw = term_cols.saturating_sub(sidebar.width());
+                    documents[i].rewrap(cw, theme);
                     needs_redraw = true;
                 }
 
@@ -1807,7 +1884,8 @@ pub fn run(
                     ..
                 } => {
                     if let Some(p) = documents[i].path.clone() {
-                        documents[i].apply_output(render_fn(&p));
+                        documents[i]
+                            .apply_output(render_fn(&p, term_cols.saturating_sub(sidebar.width())));
                     }
                     needs_redraw = true;
                 }
@@ -1855,6 +1933,36 @@ pub fn run(
     )
     .unwrap();
     terminal::disable_raw_mode().unwrap();
+}
+
+/// Resolve a wikilink target to a filesystem path.
+///
+/// Wikilinks like `[[notes]]` resolve to `notes.md` (or `notes.markdown`)
+/// relative to the current document's directory.
+fn resolve_wikilink(
+    target: &str,
+    current_doc_path: &Option<PathBuf>,
+) -> Option<PathBuf> {
+    let base_dir = current_doc_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .unwrap_or(Path::new("."));
+
+    // Try exact path first (e.g. [[subdir/file.md]])
+    let exact = base_dir.join(target);
+    if exact.exists() {
+        return Some(exact);
+    }
+
+    // Try adding common markdown extensions
+    for ext in &["md", "markdown", "mdx"] {
+        let with_ext = base_dir.join(format!("{target}.{ext}"));
+        if with_ext.exists() {
+            return Some(with_ext);
+        }
+    }
+
+    None
 }
 
 /// Register a GIF for animation if not already tracked.
@@ -1952,7 +2060,8 @@ pub fn print_output(output: &RenderOutput) {
             | Line::DetailsEnd { .. }
             | Line::FootnoteRef { .. }
             | Line::FootnoteDefStart { .. }
-            | Line::FootnoteDefEnd => {}
+            | Line::FootnoteDefEnd
+            | Line::WikilinkRef { .. } => {}
             Line::VideoControls { .. } => {} // no controls in non-pager mode
             Line::TableRow { content } => {
                 println!("{content}");
@@ -2003,8 +2112,10 @@ struct DrawResult {
     /// Maps terminal row → gif_id for video control click handling.
     video_control_rows: Vec<(u16, usize)>,
     /// Maps (terminal row, col_start, col_end, label, is_definition) for
-    /// navigation.
+    /// footnote navigation.
     footnote_rows: Vec<(u16, u16, u16, String, bool)>,
+    /// Maps (terminal row, col_start, col_end, target) for wikilink clicks.
+    wikilink_rows: Vec<(u16, u16, u16, String)>,
 }
 
 /// Draw the current view.
@@ -2160,6 +2271,8 @@ fn draw_screen(
     // Pending footnote refs: (label, col_start) — associated with the next text row
     let mut pending_footnote_refs: Vec<(String, usize)> = Vec::new();
     let mut pending_footnote_def: Option<String> = None;
+    let mut pending_wikilinks: Vec<(String, usize)> = Vec::new();
+    let mut wikilink_rows: Vec<(u16, u16, u16, String)> = Vec::new();
 
     while vis_idx < visible.len() && rows_used < viewport_rows {
         let line_idx = visible[vis_idx];
@@ -2174,8 +2287,16 @@ fn draw_screen(
                     footnote_rows.push((rows_used, col_start as u16, col_end as u16, label, false));
                 }
                 if let Some(label) = pending_footnote_def.take() {
-                    // Definition [N] starts at column 0
                     footnote_rows.push((rows_used, 0, 10, label, true));
+                }
+                // Associate pending wikilink markers with this row
+                for (target, col_start) in pending_wikilinks.drain(..) {
+                    // Use the full line width from col_start to end as clickable
+                    // region — the link text extends from col_start and we don't
+                    // know its exact width, so be generous.
+                    let line_width = crate::renderer::ansi::visible_len(text);
+                    let col_end = line_width;
+                    wikilink_rows.push((rows_used, col_start as u16, col_end as u16, target));
                 }
                 rows_used += 1;
             }
@@ -2393,6 +2514,9 @@ fn draw_screen(
                 pending_footnote_def = Some(label.clone());
             }
             Line::FootnoteDefEnd => {}
+            Line::WikilinkRef { target, col } => {
+                pending_wikilinks.push((target.clone(), *col));
+            }
             Line::DetailsSummary { id, text } => {
                 let is_collapsed = collapsed.contains(id);
                 let triangle = if is_collapsed { "\u{25B6}" } else { "\u{25BC}" };
@@ -2477,6 +2601,7 @@ fn draw_screen(
         summary_rows,
         video_control_rows,
         footnote_rows,
+        wikilink_rows,
     }
 }
 
