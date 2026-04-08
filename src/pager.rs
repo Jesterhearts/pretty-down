@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::io::Write;
-use std::io::{self};
+use std::io::{
+    self,
+};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -15,9 +17,13 @@ use crossterm::event::KeyModifiers;
 use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
-use crossterm::event::{self};
+use crossterm::event::{
+    self,
+};
 use crossterm::terminal::ClearType;
-use crossterm::terminal::{self};
+use crossterm::terminal::{
+    self,
+};
 
 use crate::renderer::RenderOutput;
 
@@ -826,7 +832,8 @@ impl DocumentState {
         self.output = new_output;
     }
 
-    /// Re-flatten from the existing output (e.g. when a pending image finishes).
+    /// Re-flatten from the existing output (e.g. when a pending image
+    /// finishes).
     fn reflatten(&mut self) {
         self.lines = flatten_blocks(&self.output, &mut self.sixel_store);
         self.visible = visible_indices(&self.lines, &self.collapsed);

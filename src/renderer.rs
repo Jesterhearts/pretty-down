@@ -1156,7 +1156,8 @@ pub enum SideBySideItem {
 pub enum RawText {
     /// Plain paragraph text (wrap at full width).
     Plain(String),
-    /// Blockquote text (wrap at width minus indent, then prepend prefix per line).
+    /// Blockquote text (wrap at width minus indent, then prepend prefix per
+    /// line).
     Blockquote { text: String, depth: usize },
     /// Text that should not be re-wrapped (e.g. code, pre-formatted).
     Verbatim,
@@ -1510,7 +1511,8 @@ fn end_paragraph(
     }
 }
 
-/// Wrap text inside a blockquote, prepending the blockquote prefix to each line.
+/// Wrap text inside a blockquote, prepending the blockquote prefix to each
+/// line.
 fn wrap_blockquote(
     text: &str,
     depth: usize,

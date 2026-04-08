@@ -700,8 +700,9 @@ pub fn encode_video_async(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::Path;
+
+    use super::*;
 
     // ── is_svg ───────────────────────────────────────────────────
 
