@@ -228,7 +228,7 @@ impl PendingImage {
     }
 
     pub fn preview(&self) -> Vec<String> {
-        self.preview.lock().unwrap().clone()
+        self.preview.lock().map(|p| p.clone()).unwrap_or_default()
     }
 
     /// Check if encoding is complete.

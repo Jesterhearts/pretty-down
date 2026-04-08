@@ -10,6 +10,8 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
 
+use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
 
 /// Render markdown with sixel graphics for headings and inline images.
@@ -78,60 +80,41 @@ fn load_font(user_font: Option<&PathBuf>) -> Vec<u8> {
     EMBEDDED_FONT.to_vec()
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args = Args::parse();
 
     let font_data = load_font(args.font.as_ref());
-    let font = font::Font::new(&font_data).unwrap_or_else(|| {
-        eprintln!("error: failed to parse font file");
-        std::process::exit(1);
-    });
+    let font = font::Font::new(&font_data).context("failed to parse font file")?;
 
-    // Load theme
     let theme = match &args.theme {
-        Some(p) => theme::Theme::from_file(p).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }),
+        Some(p) => theme::Theme::from_file(p)
+            .with_context(|| format!("loading theme from {}", p.display()))?,
         None => theme::Theme::default(),
     };
 
-    // Set up syntax highlighter
     let mut highlighter = highlight::Highlighter::new();
     if let Some(ref st) = args.syntax_theme {
         let path = std::path::Path::new(st);
         if path.exists() {
-            highlighter.load_theme_file(path).unwrap_or_else(|e| {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            });
+            highlighter.load_theme_file(path)?;
         } else {
             highlighter.set_theme(st);
         }
     }
 
-    // Read markdown
     let (markdown, base_path) = match &args.file {
         Some(p) => {
-            let md = std::fs::read_to_string(p).unwrap_or_else(|e| {
-                eprintln!("error: cannot read {}: {e}", p.display());
-                std::process::exit(1);
-            });
+            let md = std::fs::read_to_string(p)
+                .with_context(|| format!("cannot read {}", p.display()))?;
             let base = p.parent().map(|p| p.to_path_buf());
             (md, base)
         }
         None => {
-            if args.watch {
-                eprintln!("error: --watch requires a file argument");
-                std::process::exit(1);
-            }
+            anyhow::ensure!(!args.watch, "--watch requires a file argument");
             let mut md = String::new();
             std::io::stdin()
                 .read_to_string(&mut md)
-                .unwrap_or_else(|e| {
-                    eprintln!("error: cannot read stdin: {e}");
-                    std::process::exit(1);
-                });
+                .context("cannot read stdin")?;
             (md, None)
         }
     };
@@ -189,4 +172,6 @@ fn main() {
             &theme,
         );
     }
+
+    Ok(())
 }

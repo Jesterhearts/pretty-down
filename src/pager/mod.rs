@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 use std::io::Write;
-use std::io::{
-    self,
-};
+use std::io::{self};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -17,703 +15,24 @@ use crossterm::event::KeyModifiers;
 use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
-use crossterm::event::{
-    self,
-};
+use crossterm::event::{self};
 use crossterm::terminal::ClearType;
-use crossterm::terminal::{
-    self,
-};
+use crossterm::terminal::{self};
 
 use crate::renderer::RenderOutput;
+use crate::renderer::rewrap_output;
 
-/// Identifies an image group (for sixel replacement of preview rows).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum ImageGroup {
-    Sixel(usize),        // index into a vec of sixel data
-    PendingImage(usize), // index into pending_images
-    Gif(usize),          // index into pending_gifs
-}
+mod flatten;
+mod line;
 
-/// Sixel data for an image inside a table cell or side-by-side group.
-#[derive(Clone)]
-enum PositionedSixel {
-    /// Static sixel image at the given column offset.
-    Static { col: u16, width: u16, data: String },
-    /// Pending image at the given column offset (resolved at draw time).
-    Pending {
-        col: u16,
-        width: u16,
-        image_id: usize,
-    },
-    /// Animated GIF at the given column offset (frame looked up at draw time).
-    Gif { col: u16, width: u16, gif_id: usize },
-}
+use line::ImageGroup;
+use line::Line;
+use line::PositionedSixel;
+use line::RichSegment;
+use line::SixelData;
 
-/// A segment of a rich text line (text mixed with inline images).
-#[derive(Clone)]
-enum RichSegment {
-    Text(String),
-    Image { image_id: usize, width_cols: u16 },
-}
-
-/// A display line.
-#[derive(Clone)]
-enum Line {
-    /// A regular text line (may contain ANSI escapes).
-    Text(String),
-    /// A text line containing inline images (e.g. math equations).
-    /// Height may be >1 if an inline image is taller than one row.
-    RichText {
-        segments: Vec<RichSegment>,
-        height: u16,
-    },
-    /// One row of a half-block image preview, belonging to an image group.
-    /// When all rows of the group are visible, the pager replaces them
-    /// with the full sixel image.
-    ImageRow {
-        group: ImageGroup,
-        row_in_group: u16,
-        total_rows: u16,
-        preview_text: String,
-    },
-    /// Start of a `<details>` block (invisible marker, zero height).
-    #[allow(dead_code)]
-    DetailsStart { id: usize },
-    /// The `<summary>` line for a details block.
-    DetailsSummary { id: usize, text: String },
-    /// End of a `<details>` block (invisible marker, zero height).
-    DetailsEnd { id: usize },
-    /// A horizontally scrollable code block.
-    CodeBlock { id: usize, height: u16 },
-    /// A pure-text table row (borders, text-only cells).
-    TableRow { content: String },
-    /// A row containing positioned images (table cells or side-by-side).
-    /// Shows half-block preview while scrolling; overlays sixels when
-    /// all rows of the group are on screen.
-    ImageStrip {
-        content: String,
-        sixels: Vec<PositionedSixel>,
-        row_in_group: u16,
-        total_rows: u16,
-        /// Video controls to render on this row: (col, width, gif_id).
-        video_controls: Vec<(u16, u16, usize)>,
-    },
-    /// Video playback control bar (play/pause + progress).
-    VideoControls { gif_id: usize },
-    /// Invisible marker: a footnote reference at this column in the text.
-    FootnoteRef { label: String, col: usize },
-    /// Invisible marker: start of a footnote definition.
-    FootnoteDefStart { label: String },
-    /// Invisible marker: end of a footnote definition.
-    FootnoteDefEnd,
-    /// Invisible marker: a wikilink at this column in the text.
-    WikilinkRef { target: String, col: usize },
-}
-
-impl Line {
-    /// Number of terminal rows this line occupies.
-    fn rows(&self) -> u16 {
-        match self {
-            Line::Text(_)
-            | Line::ImageRow { .. }
-            | Line::TableRow { .. }
-            | Line::ImageStrip { .. } => 1,
-            Line::RichText { height, .. } => *height,
-            Line::CodeBlock { height, .. } => *height,
-            Line::VideoControls { .. } => 1,
-            Line::DetailsSummary { .. } => 1,
-            Line::DetailsStart { .. }
-            | Line::DetailsEnd { .. }
-            | Line::FootnoteRef { .. }
-            | Line::FootnoteDefStart { .. }
-            | Line::FootnoteDefEnd
-            | Line::WikilinkRef { .. } => 0,
-        }
-    }
-}
-
-/// Sixel data stored separately, referenced by ImageGroup.
-struct SixelData {
-    data: String,
-    #[allow(dead_code)]
-    height: u16,
-}
-
-/// Flatten output blocks into display lines for the pager.
-/// Each image/sixel is expanded into individual preview rows that scroll
-/// naturally. The draw loop replaces them with the full sixel when all
-/// rows are visible.
-fn flatten_blocks(
-    output: &crate::renderer::RenderOutput,
-    sixel_store: &mut Vec<SixelData>,
-) -> Vec<Line> {
-    use crate::renderer::OutputBlock;
-
-    let mut lines = Vec::new();
-    sixel_store.clear();
-
-    for block in &output.blocks {
-        match block {
-            OutputBlock::Text {
-                wrapped: text,
-                wikilinks,
-                ..
-            } => {
-                let base_line_idx = lines.len();
-                let mut line_iter = text.split('\n');
-                // First line: if the previous line is a RichText (from InlineImage),
-                // append this text to it instead of creating a new line
-                if let Some(first) = line_iter.next() {
-                    if let Some(Line::RichText { segments, .. }) = lines.last_mut() {
-                        segments.push(RichSegment::Text(first.to_string()));
-                    } else {
-                        lines.push(Line::Text(first.to_string()));
-                    }
-                }
-                for line in line_iter {
-                    lines.push(Line::Text(line.to_string()));
-                }
-                // Insert wikilink markers at the correct line positions
-                // (inserted after all text lines so indices are stable)
-                let mut insertions: Vec<(usize, Line)> = Vec::new();
-                for wl in wikilinks {
-                    let target_idx = base_line_idx + wl.line;
-                    insertions.push((
-                        target_idx,
-                        Line::WikilinkRef {
-                            target: wl.target.clone(),
-                            col: wl.col,
-                        },
-                    ));
-                }
-                // Insert in reverse order so indices stay valid
-                insertions.sort_by(|a, b| b.0.cmp(&a.0));
-                for (idx, line) in insertions {
-                    if idx <= lines.len() {
-                        lines.insert(idx, line);
-                    }
-                }
-            }
-            OutputBlock::InlineImage(id) => {
-                let p = output.pending_images.get(*id);
-                let _rows = p.map(|p| p.estimated_rows()).unwrap_or(1);
-                let cols = p
-                    .map(|p| {
-                        p.preview()
-                            .first()
-                            .map(|l| crate::renderer::ansi::visible_len(l) as u16)
-                            .unwrap_or(4)
-                    })
-                    .unwrap_or(4);
-
-                // Convert the last Text line to a RichText, or start a new one
-                let prev = lines.pop();
-                let mut segments = match prev {
-                    Some(Line::Text(t)) => vec![RichSegment::Text(t)],
-                    Some(Line::RichText { segments, .. }) => segments,
-                    other => {
-                        if let Some(line) = other {
-                            lines.push(line);
-                        }
-                        vec![]
-                    }
-                };
-                segments.push(RichSegment::Image {
-                    image_id: *id,
-                    width_cols: cols,
-                });
-
-                // Height is max of all inline images in this line
-                let height = segments
-                    .iter()
-                    .filter_map(|s| match s {
-                        RichSegment::Image { image_id, .. } => output
-                            .pending_images
-                            .get(*image_id)
-                            .map(|p| p.estimated_rows()),
-                        _ => None,
-                    })
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
-
-                lines.push(Line::RichText { segments, height });
-            }
-            OutputBlock::Sixel {
-                data,
-                height,
-                preview,
-            } => {
-                let group_id = sixel_store.len();
-                sixel_store.push(SixelData {
-                    data: data.clone(),
-                    height: *height,
-                });
-                let group = ImageGroup::Sixel(group_id);
-                let total = *height;
-                for (i, pline) in preview.iter().enumerate().take(total as usize) {
-                    lines.push(Line::ImageRow {
-                        group,
-                        row_in_group: i as u16,
-                        total_rows: total,
-                        preview_text: pline.clone(),
-                    });
-                }
-                // Pad if preview has fewer lines than height
-                for i in preview.len()..total as usize {
-                    lines.push(Line::ImageRow {
-                        group,
-                        row_in_group: i as u16,
-                        total_rows: total,
-                        preview_text: String::new(),
-                    });
-                }
-            }
-            OutputBlock::Image(id) => {
-                let p = output.pending_images.get(*id);
-                let rows = p.map(|p| p.estimated_rows()).unwrap_or(1);
-                let group = ImageGroup::PendingImage(*id);
-                let preview = p.map(|p| p.preview()).unwrap_or_default();
-                for i in 0..rows {
-                    let preview_text = preview.get(i as usize).cloned().unwrap_or_default();
-                    lines.push(Line::ImageRow {
-                        group,
-                        row_in_group: i,
-                        total_rows: rows,
-                        preview_text,
-                    });
-                }
-            }
-            OutputBlock::Gif(id) => {
-                let g = output.pending_gifs.get(*id);
-                let rows = g.map(|g| g.estimated_rows).unwrap_or(1);
-                let preview = g.map(|g| &g.preview[..]).unwrap_or(&[]);
-                let is_video = g.is_some_and(|g| g.is_video);
-                let group = ImageGroup::Gif(*id);
-                for i in 0..rows {
-                    let preview_text = preview.get(i as usize).cloned().unwrap_or_default();
-                    lines.push(Line::ImageRow {
-                        group,
-                        row_in_group: i,
-                        total_rows: rows,
-                        preview_text,
-                    });
-                }
-                if is_video {
-                    lines.push(Line::VideoControls { gif_id: *id });
-                }
-            }
-            OutputBlock::Code(id) => {
-                let height = output
-                    .code_blocks
-                    .get(*id)
-                    .map(|b| b.lines.len() as u16 + 1) // +1 for scrollbar
-                    .unwrap_or(1);
-                lines.push(Line::CodeBlock { id: *id, height });
-            }
-            OutputBlock::SideBySide(items) => {
-                flatten_side_by_side(items, output, &mut lines);
-            }
-            OutputBlock::Table(table) => {
-                flatten_table(table, &output.pending_gifs, &mut lines);
-            }
-            OutputBlock::DetailsStart { id } => {
-                lines.push(Line::DetailsStart { id: *id });
-            }
-            OutputBlock::DetailsSummary { id, text } => {
-                lines.push(Line::DetailsSummary {
-                    id: *id,
-                    text: text.clone(),
-                });
-            }
-            OutputBlock::DetailsEnd { id } => {
-                lines.push(Line::DetailsEnd { id: *id });
-            }
-            OutputBlock::FootnoteRef { label, col } => {
-                lines.push(Line::FootnoteRef {
-                    label: label.clone(),
-                    col: *col,
-                });
-            }
-            OutputBlock::FootnoteDefStart { label } => {
-                lines.push(Line::FootnoteDefStart {
-                    label: label.clone(),
-                });
-            }
-            OutputBlock::FootnoteDefEnd => {
-                lines.push(Line::FootnoteDefEnd);
-            }
-        }
-    }
-
-    // Remove trailing empty lines
-    while matches!(lines.last(), Some(Line::Text(t)) if t.is_empty()) {
-        lines.pop();
-    }
-
-    lines
-}
-
-fn flatten_side_by_side(
-    items: &[crate::renderer::SideBySideItem],
-    output: &crate::renderer::RenderOutput,
-    lines: &mut Vec<Line>,
-) {
-    use crate::renderer::SideBySideItem;
-
-    struct ItemInfo {
-        preview: Vec<String>,
-        cols: u16,
-        rows: u16,
-        sixel: PositionedSixel,
-    }
-
-    let mut infos = Vec::new();
-    let gap = 1u16; // columns between images
-
-    for item in items {
-        match item {
-            SideBySideItem::Image(id) => {
-                if let Some(p) = output.pending_images.get(*id) {
-                    let pv = p.preview();
-                    let cols = pv
-                        .first()
-                        .map(|l| crate::renderer::ansi::visible_len(l) as u16)
-                        .unwrap_or(1);
-                    infos.push(ItemInfo {
-                        preview: pv,
-                        cols,
-                        rows: p.estimated_rows(),
-                        sixel: PositionedSixel::Pending {
-                            col: 0, // filled in below
-                            width: cols,
-                            image_id: *id,
-                        },
-                    });
-                }
-            }
-            SideBySideItem::Gif(id) => {
-                if let Some(g) = output.pending_gifs.get(*id) {
-                    let cols = g
-                        .preview
-                        .first()
-                        .map(|l| crate::renderer::ansi::visible_len(l) as u16)
-                        .unwrap_or(1);
-                    infos.push(ItemInfo {
-                        preview: g.preview.clone(),
-                        cols,
-                        rows: g.estimated_rows,
-                        sixel: PositionedSixel::Gif {
-                            col: 0, // filled in below
-                            width: cols,
-                            gif_id: *id,
-                        },
-                    });
-                }
-            }
-        }
-    }
-
-    if infos.is_empty() {
-        return;
-    }
-
-    // Assign column offsets
-    let mut col_offset: u16 = 0;
-    for info in &mut infos {
-        match &mut info.sixel {
-            PositionedSixel::Static { col, .. }
-            | PositionedSixel::Pending { col, .. }
-            | PositionedSixel::Gif { col, .. } => {
-                *col = col_offset;
-            }
-        }
-        col_offset += info.cols + gap;
-    }
-
-    let max_rows = infos.iter().map(|i| i.rows).max().unwrap_or(0);
-
-    for row_idx in 0..max_rows {
-        let mut content = String::new();
-        let mut sixels = Vec::new();
-
-        // On first row, record sixels for overlay when fully visible
-        if row_idx == 0 {
-            for info in &infos {
-                sixels.push(info.sixel.clone());
-            }
-        }
-
-        // Build content with half-block preview text for each image
-        for (i, info) in infos.iter().enumerate() {
-            if i > 0 {
-                for _ in 0..gap {
-                    content.push(' ');
-                }
-            }
-            let preview_line = info
-                .preview
-                .get(row_idx as usize)
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            content.push_str(preview_line);
-            // Pad to full width if preview line is shorter
-            let vis_len = crate::renderer::ansi::visible_len(preview_line);
-            for _ in vis_len..info.cols as usize {
-                content.push(' ');
-            }
-        }
-
-        lines.push(Line::ImageStrip {
-            content,
-            sixels,
-            row_in_group: row_idx,
-            total_rows: max_rows,
-            video_controls: vec![],
-        });
-    }
-}
-
-fn flatten_table(
-    table: &crate::renderer::RenderedTable,
-    pending_gifs: &[crate::sixel::PendingGif],
-    lines: &mut Vec<Line>,
-) {
-    use pulldown_cmark::Alignment;
-
-    let w = &table.col_widths;
-
-    // Top border
-    lines.push(Line::TableRow {
-        content: render_border_str(w, '╭', '┬', '╮', '─'),
-    });
-
-    let all_rows: Vec<(&Vec<crate::renderer::RenderedTableCell>, bool)> = table
-        .header
-        .iter()
-        .map(|h| (h, true))
-        .chain(table.rows.iter().map(|r| (r, false)))
-        .collect();
-
-    for (row, is_header) in &all_rows {
-        let row_height = row.iter().map(|c| c.height).max().unwrap_or(1);
-        let has_images = row.iter().any(|c| c.sixel.is_some() || c.gif_id.is_some());
-
-        for line_idx in 0..row_height {
-            let mut content = String::new();
-            let mut sixels: Vec<PositionedSixel> = vec![];
-            let mut col_offset: u16 = 0;
-
-            content.push('│');
-            col_offset += 1;
-
-            for (col, width) in w.iter().enumerate() {
-                content.push(' ');
-                col_offset += 1;
-
-                let cell = row.get(col);
-                let align = table
-                    .alignments
-                    .get(col)
-                    .copied()
-                    .unwrap_or(Alignment::None);
-
-                if let Some(cell) = cell {
-                    if cell.sixel.is_some() || cell.gif_id.is_some() {
-                        // Image cell: record sixel/gif position on first line
-                        if line_idx == 0 {
-                            let w = *width as u16;
-                            if let Some(gif_id) = cell.gif_id {
-                                sixels.push(PositionedSixel::Gif {
-                                    col: col_offset,
-                                    width: w,
-                                    gif_id,
-                                });
-                            } else if let Some(ref sixel_data) = cell.sixel {
-                                sixels.push(PositionedSixel::Static {
-                                    col: col_offset,
-                                    width: w,
-                                    data: sixel_data.clone(),
-                                });
-                            }
-                        }
-                        // Use half-block preview text (visible while scrolling)
-                        let preview_line = cell
-                            .text_lines
-                            .get(line_idx)
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        let vis_len = crate::renderer::ansi::visible_len(preview_line);
-                        content.push_str(preview_line);
-                        for _ in vis_len..*width {
-                            content.push(' ');
-                        }
-                    } else {
-                        let line = cell
-                            .text_lines
-                            .get(line_idx)
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        let vis_len = crate::renderer::ansi::visible_len(line);
-                        let padding = width.saturating_sub(vis_len);
-
-                        match align {
-                            Alignment::Right => {
-                                for _ in 0..padding {
-                                    content.push(' ');
-                                }
-                                content.push_str(line);
-                            }
-                            Alignment::Center => {
-                                let left = padding / 2;
-                                for _ in 0..left {
-                                    content.push(' ');
-                                }
-                                content.push_str(line);
-                                for _ in 0..padding - left {
-                                    content.push(' ');
-                                }
-                            }
-                            _ => {
-                                content.push_str(line);
-                                for _ in 0..padding {
-                                    content.push(' ');
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    for _ in 0..*width {
-                        content.push(' ');
-                    }
-                }
-
-                col_offset += *width as u16;
-                content.push(' ');
-                col_offset += 1;
-
-                if col < w.len() - 1 {
-                    content.push('┆');
-                    col_offset += 1;
-                }
-            }
-            content.push('│');
-
-            if has_images {
-                lines.push(Line::ImageStrip {
-                    content,
-                    sixels,
-                    row_in_group: line_idx as u16,
-                    total_rows: row_height as u16,
-                    video_controls: vec![],
-                });
-            } else {
-                lines.push(Line::TableRow { content });
-            }
-        }
-
-        // Emit video controls row for cells that contain videos
-        let mut vid_controls: Vec<(u16, u16, usize)> = Vec::new();
-        let mut col_off: u16 = 1; // after leading │
-        for (col, width) in w.iter().enumerate() {
-            col_off += 1; // space padding
-            if let Some(cell) = row.get(col)
-                && let Some(gif_id) = cell.gif_id
-                && pending_gifs.get(gif_id).is_some_and(|g| g.is_video)
-            {
-                vid_controls.push((col_off, *width as u16, gif_id));
-            }
-            col_off += *width as u16 + 1; // cell width + trailing space
-            if col < w.len() - 1 {
-                col_off += 1; // separator ┆
-            }
-        }
-        if !vid_controls.is_empty() {
-            let mut ctrl_content = String::new();
-            ctrl_content.push('│');
-            for (col, width) in w.iter().enumerate() {
-                ctrl_content.push(' ');
-                for _ in 0..*width {
-                    ctrl_content.push(' ');
-                }
-                ctrl_content.push(' ');
-                if col < w.len() - 1 {
-                    ctrl_content.push('┆');
-                }
-            }
-            ctrl_content.push('│');
-            lines.push(Line::ImageStrip {
-                content: ctrl_content,
-                sixels: vec![],
-                row_in_group: 0,
-                total_rows: 0,
-                video_controls: vid_controls,
-            });
-        }
-
-        // Header separator
-        if *is_header {
-            lines.push(Line::TableRow {
-                content: render_border_str(w, '╞', '╪', '╡', '═'),
-            });
-        }
-    }
-
-    // Bottom border
-    lines.push(Line::TableRow {
-        content: render_border_str(w, '╰', '┴', '╯', '─'),
-    });
-}
-
-fn render_border_str(
-    widths: &[usize],
-    left: char,
-    mid: char,
-    right: char,
-    fill: char,
-) -> String {
-    let mut s = String::new();
-    s.push(left);
-    for (i, w) in widths.iter().enumerate() {
-        for _ in 0..w + 2 {
-            s.push(fill);
-        }
-        if i < widths.len() - 1 {
-            s.push(mid);
-        }
-    }
-    s.push(right);
-    s
-}
-
-/// Compute indices of lines that are visible given the current collapsed state.
-/// Lines inside collapsed `<details>` blocks are excluded (except the summary).
-fn visible_indices(
-    lines: &[Line],
-    collapsed: &HashSet<usize>,
-) -> Vec<usize> {
-    let mut visible = Vec::new();
-    let mut skip_id: Option<usize> = None;
-    for (i, line) in lines.iter().enumerate() {
-        if let Some(sid) = skip_id {
-            if matches!(line, Line::DetailsEnd { id } if *id == sid) {
-                skip_id = None;
-                // Include the DetailsEnd so draw knows the block ended
-                visible.push(i);
-            }
-            continue;
-        }
-        match line {
-            Line::DetailsSummary { id, .. } if collapsed.contains(id) => {
-                visible.push(i);
-                skip_id = Some(*id);
-            }
-            _ => visible.push(i),
-        }
-    }
-    visible
-}
+use flatten::flatten_blocks;
+use flatten::visible_indices;
 
 /// Per-document state for the pager.
 struct DocumentState {
@@ -787,66 +106,65 @@ impl DocumentState {
             images_ready_count,
         }
     }
+}
 
-    /// Recompute visible indices from current lines and collapsed state.
-    fn recompute_visible(&mut self) {
-        self.visible = visible_indices(&self.lines, &self.collapsed);
-        if self.scroll_offset >= self.visible.len() {
-            self.scroll_offset = self.visible.len().saturating_sub(1);
-        }
+/// Recompute visible indices from current lines and collapsed state.
+fn recompute_visible(doc: &mut DocumentState) {
+    doc.visible = visible_indices(&doc.lines, &doc.collapsed);
+    if doc.scroll_offset >= doc.visible.len() {
+        doc.scroll_offset = doc.visible.len().saturating_sub(1);
     }
+}
 
-    /// Re-wrap text at a new width without re-encoding images.
-    fn rewrap(
-        &mut self,
-        width: u16,
-        theme: &crate::theme::Theme,
-    ) {
-        self.output.rewrap(width, theme);
-        self.lines = flatten_blocks(&self.output, &mut self.sixel_store);
-        self.visible = visible_indices(&self.lines, &self.collapsed);
-        if self.scroll_offset >= self.visible.len() {
-            self.scroll_offset = self.visible.len().saturating_sub(1);
-        }
+/// Re-wrap text at a new width without re-encoding images.
+fn rewrap_document(
+    doc: &mut DocumentState,
+    width: u16,
+    theme: &crate::theme::Theme,
+) {
+    rewrap_output(&mut doc.output, width, theme);
+    doc.lines = flatten_blocks(&doc.output, &mut doc.sixel_store);
+    doc.visible = visible_indices(&doc.lines, &doc.collapsed);
+    if doc.scroll_offset >= doc.visible.len() {
+        doc.scroll_offset = doc.visible.len().saturating_sub(1);
     }
+}
 
-    /// Re-render from a new output, preserving collapsed state.
-    fn apply_output(
-        &mut self,
-        new_output: RenderOutput,
-    ) {
-        self.lines = flatten_blocks(&new_output, &mut self.sixel_store);
-        self.visible = visible_indices(&self.lines, &self.collapsed);
-        self.gif_state = vec![None; new_output.pending_gifs.len()];
-        self.video_paused = vec![false; new_output.pending_gifs.len()];
-        self.video_progress_pos = vec![0; new_output.pending_gifs.len()];
-        self.code_h_scroll = vec![0; new_output.code_blocks.len()];
-        if self.scroll_offset >= self.visible.len() {
-            self.scroll_offset = self.visible.len().saturating_sub(1);
-        }
-        self.images_ready_count = new_output
-            .pending_images
-            .iter()
-            .filter(|p| p.is_ready())
-            .count();
-        self.output = new_output;
+/// Re-render from a new output, preserving collapsed state.
+fn apply_output(
+    doc: &mut DocumentState,
+    new_output: RenderOutput,
+) {
+    doc.lines = flatten_blocks(&new_output, &mut doc.sixel_store);
+    doc.visible = visible_indices(&doc.lines, &doc.collapsed);
+    doc.gif_state = vec![None; new_output.pending_gifs.len()];
+    doc.video_paused = vec![false; new_output.pending_gifs.len()];
+    doc.video_progress_pos = vec![0; new_output.pending_gifs.len()];
+    doc.code_h_scroll = vec![0; new_output.code_blocks.len()];
+    if doc.scroll_offset >= doc.visible.len() {
+        doc.scroll_offset = doc.visible.len().saturating_sub(1);
     }
+    doc.images_ready_count = new_output
+        .pending_images
+        .iter()
+        .filter(|p| p.is_ready())
+        .count();
+    doc.output = new_output;
+}
 
-    /// Re-flatten from the existing output (e.g. when a pending image
-    /// finishes).
-    fn reflatten(&mut self) {
-        self.lines = flatten_blocks(&self.output, &mut self.sixel_store);
-        self.visible = visible_indices(&self.lines, &self.collapsed);
-        if self.scroll_offset >= self.visible.len() {
-            self.scroll_offset = self.visible.len().saturating_sub(1);
-        }
-        self.images_ready_count = self
-            .output
-            .pending_images
-            .iter()
-            .filter(|p| p.is_ready())
-            .count();
+/// Re-flatten from the existing output (e.g. when a pending image finishes).
+fn reflatten(doc: &mut DocumentState) {
+    doc.lines = flatten_blocks(&doc.output, &mut doc.sixel_store);
+    doc.visible = visible_indices(&doc.lines, &doc.collapsed);
+    if doc.scroll_offset >= doc.visible.len() {
+        doc.scroll_offset = doc.visible.len().saturating_sub(1);
     }
+    doc.images_ready_count = doc
+        .output
+        .pending_images
+        .iter()
+        .filter(|p| p.is_ready())
+        .count();
 }
 
 // ── Sidebar ──────────────────────────────────────────────────────────────
@@ -882,62 +200,61 @@ impl FileDialogState {
             candidates: Vec::new(),
             selected: 0,
         };
-        s.recompute_candidates();
+        recompute_candidates(&mut s);
         s
     }
+}
 
-    fn recompute_candidates(&mut self) {
-        self.candidates.clear();
-        self.selected = 0;
+/// Recompute file dialog candidates from the current input.
+fn recompute_candidates(dialog: &mut FileDialogState) {
+    dialog.candidates.clear();
+    dialog.selected = 0;
 
-        // Expand ~ to home directory
-        let expanded = expand_path(&self.input);
+    let expanded = expand_path(&dialog.input);
 
-        let (dir, prefix) = if expanded.contains('/') {
-            let p = PathBuf::from(&expanded);
-            if expanded.ends_with('/') {
-                (p, String::new())
-            } else {
-                let parent = p.parent().unwrap_or(Path::new(".")).to_path_buf();
-                let prefix = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                (parent, prefix)
-            }
+    let (dir, prefix) = if expanded.contains('/') {
+        let p = PathBuf::from(&expanded);
+        if expanded.ends_with('/') {
+            (p, String::new())
         } else {
-            (PathBuf::from("."), expanded.clone())
-        };
-
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
-        };
-
-        let prefix_lower = prefix.to_ascii_lowercase();
-
-        let mut dirs = Vec::new();
-        let mut files = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !prefix.is_empty() && !name.to_ascii_lowercase().starts_with(&prefix_lower) {
-                continue;
-            }
-            // Skip hidden files unless the prefix starts with '.'
-            if name.starts_with('.') && !prefix.starts_with('.') {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if is_markdown_file(&name) {
-                files.push(path);
-            }
+            let parent = p.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let prefix = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (parent, prefix)
         }
-        dirs.sort();
-        files.sort();
-        self.candidates.extend(dirs);
-        self.candidates.extend(files);
+    } else {
+        (PathBuf::from("."), expanded.clone())
+    };
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !prefix.is_empty() && !name.to_ascii_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if name.starts_with('.') && !prefix.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        } else if is_markdown_file(&name) {
+            files.push(path);
+        }
     }
+    dirs.sort();
+    files.sort();
+    dialog.candidates.extend(dirs);
+    dialog.candidates.extend(files);
 }
 
 /// Expand shell constructs in a path string:
@@ -1020,53 +337,44 @@ fn draw_sidebar(
     sidebar: &SidebarState,
     doc_names: &[&str],
     viewport_rows: u16,
-) {
+) -> io::Result<()> {
     let w = sidebar.width();
 
     match sidebar.mode {
         SidebarMode::Collapsed => {
-            // Row 0: bold ❰ with underline beneath it
-            crossterm::execute!(stdout, cursor::MoveTo(0, 0)).unwrap();
-            write!(stdout, "\x1b[1m❰\x1b[0m ").unwrap();
-            crossterm::execute!(stdout, cursor::MoveTo(0, 1)).unwrap();
-            write!(stdout, "\x1b[2m─\x1b[0m ").unwrap();
-            // Remaining rows: thin vertical line
+            crossterm::execute!(stdout, cursor::MoveTo(0, 0))?;
+            write!(stdout, "\x1b[1m❰\x1b[0m ")?;
+            crossterm::execute!(stdout, cursor::MoveTo(0, 1))?;
+            write!(stdout, "\x1b[2m─\x1b[0m ")?;
             for row in 2..viewport_rows {
-                crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
-                write!(stdout, "\x1b[2m│\x1b[0m ").unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(0, row))?;
+                write!(stdout, "\x1b[2m│\x1b[0m ")?;
             }
         }
         SidebarMode::Open | SidebarMode::FileDialog => {
-            let content_w = w.saturating_sub(1) as usize; // -1 for separator
+            let content_w = w.saturating_sub(1) as usize;
 
-            // Row 0: collapse button
-            crossterm::execute!(stdout, cursor::MoveTo(0, 0)).unwrap();
+            crossterm::execute!(stdout, cursor::MoveTo(0, 0))?;
             let header = format!(
                 " \x1b[1m▸\x1b[0m {:<width$}",
                 "Documents",
                 width = content_w.saturating_sub(3)
             );
-            write!(stdout, "{}", &header[..header.len().min((w as usize) * 4)]).unwrap();
+            write!(stdout, "{}", &header[..header.len().min((w as usize) * 4)])?;
 
-            // Row 1: [+] Open file button
-            crossterm::execute!(stdout, cursor::MoveTo(0, 1)).unwrap();
+            crossterm::execute!(stdout, cursor::MoveTo(0, 1))?;
             let open_btn = format!(" \x1b[2m[+] Open...\x1b[0m");
-            write!(stdout, "{open_btn}").unwrap();
-            // Pad to sidebar width
+            write!(stdout, "{open_btn}")?;
             let btn_vis = crate::renderer::ansi::visible_len(&open_btn);
-            for _ in btn_vis..content_w {
-                write!(stdout, " ").unwrap();
-            }
+            write!(stdout, "{}", " ".repeat(content_w.saturating_sub(btn_vis)))?;
 
-            // Row 2+: document list
             for (i, &name) in doc_names.iter().enumerate() {
                 let row = i as u16 + 2;
                 if row >= viewport_rows {
                     break;
                 }
-                crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(0, row))?;
 
-                // Truncate name to fit
                 let max_name = content_w.saturating_sub(2);
                 let display: String = if name.len() > max_name && max_name > 2 {
                     format!("{}…", &name[..max_name - 1])
@@ -1075,36 +383,31 @@ fn draw_sidebar(
                 };
 
                 if i == sidebar.active_doc {
-                    write!(stdout, " \x1b[4m{display}\x1b[0m").unwrap();
+                    write!(stdout, " \x1b[4m{display}\x1b[0m")?;
                 } else {
-                    write!(stdout, " \x1b[2m{display}\x1b[0m").unwrap();
+                    write!(stdout, " \x1b[2m{display}\x1b[0m")?;
                 }
                 let name_len = display.len() + 1;
-                for _ in name_len..content_w {
-                    write!(stdout, " ").unwrap();
-                }
+                write!(stdout, "{}", " ".repeat(content_w.saturating_sub(name_len)))?;
             }
 
             let doc_end = doc_names.len() as u16 + 2;
             for row in doc_end..viewport_rows {
-                crossterm::execute!(stdout, cursor::MoveTo(0, row)).unwrap();
-                for _ in 0..content_w {
-                    write!(stdout, " ").unwrap();
-                }
+                crossterm::execute!(stdout, cursor::MoveTo(0, row))?;
+                write!(stdout, "{}", " ".repeat(content_w))?;
             }
 
-            // Draw separator on rightmost column
             for row in 0..viewport_rows {
-                crossterm::execute!(stdout, cursor::MoveTo(w - 1, row)).unwrap();
-                write!(stdout, "\x1b[2m│\x1b[0m").unwrap();
+                crossterm::execute!(stdout, cursor::MoveTo(w - 1, row))?;
+                write!(stdout, "\x1b[2m│\x1b[0m")?;
             }
 
-            // File dialog overlay (if active)
             if sidebar.mode == SidebarMode::FileDialog {
-                draw_file_dialog(stdout, sidebar, viewport_rows);
+                draw_file_dialog(stdout, sidebar, viewport_rows)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Draw the file-open dialog as an overlay.
@@ -1112,34 +415,31 @@ fn draw_file_dialog(
     stdout: &mut io::Stdout,
     sidebar: &SidebarState,
     viewport_rows: u16,
-) {
+) -> io::Result<()> {
     let dialog = &sidebar.dialog;
     let dialog_width = sidebar.open_width.max(40) as usize;
 
-    // Row 0: label
-    crossterm::execute!(stdout, cursor::MoveTo(1, 0)).unwrap();
-    write!(stdout, "\x1b[7m Open file: \x1b[0m").unwrap();
+    crossterm::execute!(stdout, cursor::MoveTo(1, 0))?;
+    write!(stdout, "\x1b[7m Open file: \x1b[0m")?;
 
-    // Row 1: input field
-    crossterm::execute!(stdout, cursor::MoveTo(1, 1)).unwrap();
+    crossterm::execute!(stdout, cursor::MoveTo(1, 1))?;
     let input_display: String = if dialog.input.len() > dialog_width - 3 {
         let start = dialog.input.len() - (dialog_width - 3);
         format!("…{}", &dialog.input[start..])
     } else {
         dialog.input.clone()
     };
-    write!(stdout, " {input_display}\x1b[7m \x1b[0m").unwrap();
-    // Pad
-    let used = input_display.len() + 2;
-    for _ in used..dialog_width {
-        write!(stdout, " ").unwrap();
-    }
+    write!(stdout, " {input_display}\x1b[7m \x1b[0m")?;
+    write!(
+        stdout,
+        "{}",
+        " ".repeat(dialog_width.saturating_sub(input_display.len() + 2))
+    )?;
 
-    // Row 2+: candidates
     let max_candidates = (viewport_rows as usize).saturating_sub(3);
     for (i, candidate) in dialog.candidates.iter().enumerate().take(max_candidates) {
         let row = i as u16 + 2;
-        crossterm::execute!(stdout, cursor::MoveTo(1, row)).unwrap();
+        crossterm::execute!(stdout, cursor::MoveTo(1, row))?;
 
         let display = candidate.to_string_lossy();
         let is_dir = candidate.is_dir();
@@ -1159,12 +459,12 @@ fn draw_file_dialog(
                 stdout,
                 " \x1b[7m{truncated:<width$}\x1b[0m",
                 width = dialog_width - 2
-            )
-            .unwrap();
+            )?;
         } else {
-            write!(stdout, " {truncated:<width$}", width = dialog_width - 2).unwrap();
+            write!(stdout, " {truncated:<width$}", width = dialog_width - 2)?;
         }
     }
+    Ok(())
 }
 
 /// Set up a file watcher.
@@ -1266,7 +566,7 @@ pub fn run(
                 .filter(|p| p.is_ready())
                 .count();
             if ready_now > documents[i].images_ready_count {
-                documents[i].reflatten();
+                reflatten(&mut documents[i]);
                 needs_redraw = true;
             }
         }
@@ -1308,7 +608,7 @@ pub fn run(
             }
             {
                 let names: Vec<&str> = documents.iter().map(|d| d.name.as_str()).collect();
-                draw_sidebar(&mut stdout, &sidebar, &names, viewport_rows);
+                let _ = draw_sidebar(&mut stdout, &sidebar, &names, viewport_rows);
             }
 
             // End synchronized update — terminal flushes the buffered frame.
@@ -1358,7 +658,10 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(50));
 
             if let Some(p) = documents[i].path.clone() {
-                documents[i].apply_output(render_fn(&p, term_cols.saturating_sub(sidebar.width())));
+                apply_output(
+                    &mut documents[i],
+                    render_fn(&p, term_cols.saturating_sub(sidebar.width())),
+                );
             }
             needs_redraw = true;
             continue;
@@ -1407,7 +710,10 @@ pub fn run(
             term_rows = rows;
             crate::sixel::invalidate_terminal_size();
             if let Some(p) = documents[i].path.clone() {
-                documents[i].apply_output(render_fn(&p, term_cols.saturating_sub(sidebar.width())));
+                apply_output(
+                    &mut documents[i],
+                    render_fn(&p, term_cols.saturating_sub(sidebar.width())),
+                );
             }
             needs_redraw = true;
             continue;
@@ -1436,7 +742,7 @@ pub fn run(
                                     sidebar.dialog.input.push('/');
                                 }
                                 sidebar.dialog.cursor = sidebar.dialog.input.len();
-                                sidebar.dialog.recompute_candidates();
+                                recompute_candidates(&mut sidebar.dialog);
                             } else {
                                 // Open the file
                                 let new_output =
@@ -1457,7 +763,7 @@ pub fn run(
                         if !sidebar.dialog.input.is_empty() {
                             sidebar.dialog.input.pop();
                             sidebar.dialog.cursor = sidebar.dialog.input.len();
-                            sidebar.dialog.recompute_candidates();
+                            recompute_candidates(&mut sidebar.dialog);
                         }
                         needs_redraw = true;
                     }
@@ -1481,14 +787,14 @@ pub fn run(
                                 sidebar.dialog.input.push('/');
                             }
                             sidebar.dialog.cursor = sidebar.dialog.input.len();
-                            sidebar.dialog.recompute_candidates();
+                            recompute_candidates(&mut sidebar.dialog);
                         }
                         needs_redraw = true;
                     }
                     KeyCode::Char(c) => {
                         sidebar.dialog.input.push(c);
                         sidebar.dialog.cursor = sidebar.dialog.input.len();
-                        sidebar.dialog.recompute_candidates();
+                        recompute_candidates(&mut sidebar.dialog);
                         needs_redraw = true;
                     }
                     _ => {}
@@ -1511,7 +817,7 @@ pub fn run(
                     SidebarMode::Collapsed => {
                         sidebar.mode = SidebarMode::Open;
                         let cw = term_cols.saturating_sub(sidebar.width());
-                        documents[i].rewrap(cw, theme);
+                        rewrap_document(&mut documents[i], cw, theme);
                         needs_redraw = true;
                         continue;
                     }
@@ -1519,7 +825,7 @@ pub fn run(
                         if row == 0 {
                             sidebar.mode = SidebarMode::Collapsed;
                             let cw = term_cols.saturating_sub(sidebar.width());
-                            documents[i].rewrap(cw, theme);
+                            rewrap_document(&mut documents[i], cw, theme);
                             needs_redraw = true;
                             continue;
                         }
@@ -1566,7 +872,7 @@ pub fn run(
             } else {
                 documents[i].collapsed.insert(id);
             }
-            documents[i].recompute_visible();
+            recompute_visible(&mut documents[i]);
             needs_redraw = true;
             continue;
         }
@@ -1731,7 +1037,7 @@ pub fn run(
                     };
                     // Re-wrap text at new content width (cheap, no image re-encoding)
                     let cw = term_cols.saturating_sub(sidebar.width());
-                    documents[i].rewrap(cw, theme);
+                    rewrap_document(&mut documents[i], cw, theme);
                     needs_redraw = true;
                 }
 
@@ -1891,8 +1197,10 @@ pub fn run(
                     ..
                 } => {
                     if let Some(p) = documents[i].path.clone() {
-                        documents[i]
-                            .apply_output(render_fn(&p, term_cols.saturating_sub(sidebar.width())));
+                        apply_output(
+                            &mut documents[i],
+                            render_fn(&p, term_cols.saturating_sub(sidebar.width())),
+                        );
                     }
                     needs_redraw = true;
                 }
@@ -1922,7 +1230,7 @@ pub fn run(
                         } else {
                             documents[i].collapsed.insert(id);
                         }
-                        documents[i].recompute_visible();
+                        recompute_visible(&mut documents[i]);
                         needs_redraw = true;
                     }
                 }

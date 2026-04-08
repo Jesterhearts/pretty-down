@@ -2734,6 +2734,7 @@ name = "pretty-down"
 version = "0.1.0"
 dependencies = [
  "a-sixel",
+ "anyhow",
  "clap",
  "crossterm 0.29.0",
  "ffmpeg-next",

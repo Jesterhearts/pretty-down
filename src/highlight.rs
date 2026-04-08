@@ -33,8 +33,9 @@ impl Highlighter {
     pub fn load_theme_file(
         &mut self,
         path: &std::path::Path,
-    ) -> Result<(), String> {
-        let theme = ThemeSet::get_theme(path).map_err(|e| format!("cannot load theme: {e}"))?;
+    ) -> anyhow::Result<()> {
+        let theme =
+            ThemeSet::get_theme(path).map_err(|e| anyhow::anyhow!("cannot load theme: {e}"))?;
         self.theme_name = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())

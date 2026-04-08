@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::Deserialize;
 
 /// A color value — either an ANSI 256 number or a hex RGB string.
@@ -190,9 +191,9 @@ impl Default for Theme {
 
 impl Theme {
     /// Load a theme from a JSON file.
-    pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
-        let data = std::fs::read_to_string(path).map_err(|e| format!("cannot read theme: {e}"))?;
-        serde_json::from_str(&data).map_err(|e| format!("invalid theme JSON: {e}"))
+    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        let data = std::fs::read_to_string(path).context("cannot read theme file")?;
+        serde_json::from_str(&data).context("invalid theme JSON")
     }
 
     /// Get the heading style and color for a given level (1-6).

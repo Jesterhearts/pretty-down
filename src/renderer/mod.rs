@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
 use pulldown_cmark::HeadingLevel;
@@ -13,280 +12,10 @@ use pulldown_cmark::TagEnd;
 use crate::font::Font;
 use crate::sixel;
 
-/// ANSI escape helpers
-pub(crate) mod ansi {
-    pub const RESET: &str = "\x1b[0m";
-    pub const BOLD: &str = "\x1b[1m";
-    pub const DIM: &str = "\x1b[2m";
-    pub const ITALIC: &str = "\x1b[3m";
-    pub const UNDERLINE: &str = "\x1b[4m";
-    pub const STRIKETHROUGH: &str = "\x1b[9m";
-
-    pub const OVERLINE: &str = "\x1b[53m";
-
-    /// OSC 8 hyperlink start
-    pub fn link_start(url: &str) -> String {
-        format!("\x1b]8;;{url}\x1b\\")
-    }
-
-    /// OSC 8 hyperlink end
-    pub fn link_end() -> String {
-        "\x1b]8;;\x1b\\".to_string()
-    }
-
-    /// Set foreground color using 24-bit true color.
-    pub fn fg_rgb(
-        r: u8,
-        g: u8,
-        b: u8,
-    ) -> String {
-        format!("\x1b[38;2;{r};{g};{b}m")
-    }
-
-    /// Set background color using 24-bit true color.
-    pub fn bg_rgb(
-        r: u8,
-        g: u8,
-        b: u8,
-    ) -> String {
-        format!("\x1b[48;2;{r};{g};{b}m")
-    }
-
-    /// VTE-based width counter. The parser calls `print` only for visible
-    /// characters — all escape sequences (CSI, OSC, DCS, etc.) are routed
-    /// to other `Perform` methods that we leave as no-ops.
-    struct WidthCounter(usize);
-
-    impl vte::Perform for WidthCounter {
-        fn print(
-            &mut self,
-            c: char,
-        ) {
-            self.0 += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        }
-    }
-
-    /// Count the visible column width of a string, correctly skipping all
-    /// escape sequences (CSI, OSC 8 links, DCS, etc.) and accounting for
-    /// Unicode double-width characters.
-    pub fn visible_len(s: &str) -> usize {
-        let mut counter = WidthCounter(0);
-        let mut parser = vte::Parser::new();
-        parser.advance(&mut counter, s.as_bytes());
-        counter.0
-    }
-
-    /// VTE-based slicer. Collects bytes into a result buffer, but only
-    /// includes visible characters that fall within the target column range.
-    /// Escape sequences are always passed through so ANSI state is preserved.
-    struct VisibleSlicer {
-        start: usize,
-        end: usize,
-        col: usize,
-        result: String,
-    }
-
-    impl vte::Perform for VisibleSlicer {
-        fn print(
-            &mut self,
-            c: char,
-        ) {
-            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if self.col >= self.start && self.col + w <= self.end {
-                self.result.push(c);
-            }
-            self.col += w;
-        }
-
-        fn execute(
-            &mut self,
-            byte: u8,
-        ) {
-            // Pass through C0 controls (e.g. \n, \r) in the visible region
-            if self.col >= self.start && self.col < self.end {
-                self.result.push(byte as char);
-            }
-        }
-
-        fn csi_dispatch(
-            &mut self,
-            params: &vte::Params,
-            intermediates: &[u8],
-            _ignore: bool,
-            action: char,
-        ) {
-            // Reconstruct the CSI sequence and always include it
-            self.result.push('\x1b');
-            self.result.push('[');
-            let mut first_param = true;
-            for param in params.iter() {
-                if !first_param {
-                    self.result.push(';');
-                }
-                first_param = false;
-                let mut first_sub = true;
-                for &sub in param {
-                    if !first_sub {
-                        self.result.push(':');
-                    }
-                    first_sub = false;
-                    self.result.push_str(&sub.to_string());
-                }
-            }
-            for &b in intermediates {
-                self.result.push(b as char);
-            }
-            self.result.push(action);
-        }
-
-        fn osc_dispatch(
-            &mut self,
-            params: &[&[u8]],
-            bell_terminated: bool,
-        ) {
-            // Reconstruct OSC sequences (e.g. hyperlinks)
-            self.result.push('\x1b');
-            self.result.push(']');
-            for (i, param) in params.iter().enumerate() {
-                if i > 0 {
-                    self.result.push(';');
-                }
-                self.result.push_str(&String::from_utf8_lossy(param));
-            }
-            if bell_terminated {
-                self.result.push('\x07');
-            } else {
-                self.result.push('\x1b');
-                self.result.push('\\');
-            }
-        }
-
-        fn esc_dispatch(
-            &mut self,
-            intermediates: &[u8],
-            _ignore: bool,
-            byte: u8,
-        ) {
-            self.result.push('\x1b');
-            for &b in intermediates {
-                self.result.push(b as char);
-            }
-            self.result.push(byte as char);
-        }
-    }
-
-    /// Slice a string with ANSI escapes at visible column boundaries.
-    /// Returns the substring from visible column `start` with `width` visible
-    /// chars, preserving all escape sequences so ANSI state carries through.
-    pub fn visible_slice(
-        s: &str,
-        start: usize,
-        width: usize,
-    ) -> String {
-        let mut slicer = VisibleSlicer {
-            start,
-            end: start + width,
-            col: 0,
-            result: String::new(),
-        };
-        let mut parser = vte::Parser::new();
-        parser.advance(&mut slicer, s.as_bytes());
-        slicer.result
-    }
-
-    /// Word-wrap a string that may contain ANSI escape sequences.
-    ///
-    /// Wraps at `width` visible columns, preserving escape sequences
-    /// (which don't consume column space). Uses `vte` to identify
-    /// visible characters vs escape bytes.
-    pub fn wrap(
-        text: &str,
-        width: u16,
-    ) -> String {
-        let width = width as usize;
-        if width == 0 {
-            return text.to_string();
-        }
-
-        let mut result = String::with_capacity(text.len());
-        let mut col = 0usize;
-        // Track the last word boundary: (byte pos in result, visible col)
-        let mut last_break: Option<(usize, usize)> = None;
-        let mut chars = text.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            // Copy escape sequences verbatim (zero visible width).
-            // We use a simple scan here because wrap only needs to skip
-            // escapes, not interpret them — the vte state machine is
-            // heavier than necessary for this pass.
-            if ch == '\x1b' {
-                result.push(ch);
-                match chars.peek() {
-                    // CSI sequence: \x1b[ ... <letter>
-                    Some(&'[') => {
-                        while let Some(next) = chars.next() {
-                            result.push(next);
-                            if next.is_ascii_alphabetic() {
-                                break;
-                            }
-                        }
-                    }
-                    // OSC sequence: \x1b] ... (ST or BEL)
-                    Some(&']') => {
-                        while let Some(next) = chars.next() {
-                            result.push(next);
-                            if next == '\x07' {
-                                break;
-                            }
-                            if next == '\x1b' {
-                                if let Some(&'\\') = chars.peek() {
-                                    result.push(chars.next().unwrap());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // Other escapes (e.g. \x1b( ): two-byte sequence
-                    _ => {
-                        if let Some(next) = chars.next() {
-                            result.push(next);
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if ch == '\n' {
-                result.push('\n');
-                col = 0;
-                last_break = None;
-                continue;
-            }
-
-            if ch == ' ' {
-                last_break = Some((result.len(), col));
-            }
-
-            let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            result.push(ch);
-            col += char_width;
-
-            if col > width {
-                if let Some((break_pos, break_col)) = last_break.take() {
-                    result.replace_range(break_pos..break_pos + 1, "\n");
-                    col -= break_col + 1;
-                } else {
-                    let ch_len = ch.len_utf8();
-                    let insert_pos = result.len() - ch_len;
-                    result.insert(insert_pos, '\n');
-                    col = char_width;
-                }
-            }
-        }
-
-        result
-    }
-}
+/// ANSI escape helpers and text measurement/wrapping.
+pub(crate) mod ansi;
+mod html;
+mod table;
 
 /// Crop an RGBA pixel buffer to a maximum width, keeping the left portion.
 fn crop_pixels_width(
@@ -296,79 +25,17 @@ fn crop_pixels_width(
     max_w: u32,
 ) -> (u32, Vec<u8>) {
     let new_w = max_w.min(w);
-    let mut out = Vec::with_capacity((new_w * h * 4) as usize);
-    for y in 0..h {
-        let row_start = (y * w * 4) as usize;
-        let row_end = row_start + (new_w * 4) as usize;
-        out.extend_from_slice(&pixels[row_start..row_end]);
-    }
+    let stride = (w * 4) as usize;
+    let row_bytes = (new_w * 4) as usize;
+    let out: Vec<u8> = (0..h as usize)
+        .flat_map(|y| &pixels[y * stride..y * stride + row_bytes])
+        .copied()
+        .collect();
     (new_w, out)
 }
 
 /// Heading font sizes in pixels for h1..h6
 const HEADING_SIZES: [u32; 6] = [48, 40, 32, 28, 24, 20];
-
-/// A fully laid-out table ready for direct rendering to stdout.
-pub struct RenderedTable {
-    /// Pre-computed column widths in visible characters.
-    pub col_widths: Vec<usize>,
-    /// Column alignments.
-    pub alignments: Vec<Alignment>,
-    /// Header row (if any).
-    pub header: Option<Vec<RenderedTableCell>>,
-    /// Data rows.
-    pub rows: Vec<Vec<RenderedTableCell>>,
-}
-
-/// A cell in a rendered table.
-pub struct RenderedTableCell {
-    /// Styled text lines for this cell.
-    pub text_lines: Vec<String>,
-    /// Optional sixel image to render in the cell.
-    pub sixel: Option<String>,
-    /// Optional animated GIF ID (index into pending_gifs).
-    pub gif_id: Option<usize>,
-    /// Visible width of the cell content (for text: max line width; for images:
-    /// image cols).
-    pub width: usize,
-    /// Number of terminal rows this cell occupies.
-    pub height: usize,
-}
-
-/// Image data embedded in a table cell.
-struct TableCellImage {
-    /// Static sixel data (None if animated GIF).
-    sixel: Option<String>,
-    /// Animated GIF ID (index into pending_gifs), if this is a GIF.
-    gif_id: Option<usize>,
-    /// Half-block preview lines (fallback while scrolling / non-pager).
-    preview: Vec<String>,
-    width_cols: u32,
-    height_rows: u16,
-}
-
-/// A table cell — either text with styling, or an image.
-struct TableCell {
-    text: String,
-    bold: bool,
-    italic: bool,
-    code: bool,
-    image: Option<TableCellImage>,
-}
-
-/// State for table parsing — created on Start(Table), consumed on flush.
-struct TableState {
-    alignments: Vec<Alignment>,
-    in_head: bool,
-    cell_buf: String,
-    cell_image: Option<TableCellImage>,
-    row_cells: Vec<TableCell>,
-    header: Option<Vec<TableCell>>,
-    rows: Vec<Vec<TableCell>>,
-    cell_bold: bool,
-    cell_italic: bool,
-    cell_code: bool,
-}
 
 struct RenderState {
     heading_text: String,
@@ -453,28 +120,28 @@ impl RenderState {
     fn table(&mut self) -> &mut TableState {
         self.table.as_mut().expect("not inside a table")
     }
+}
 
-    fn emit_image_source(
-        &mut self,
-        source: &ImageSource,
-        out: &mut String,
-        blocks: &mut Vec<OutputBlock>,
-    ) {
-        let max_w = sixel::terminal_pixel_width();
-        if let Some(media) = encode_from_source(source, max_w) {
-            flush_text(out, blocks, &mut self.pending_wikilinks);
-            push_media(
-                media,
-                &mut self.pending_images,
-                &mut self.pending_gifs,
-                blocks,
-            );
-        } else {
-            out.push_str(&format!(
-                "\x1b[2m[image: {}]\x1b[0m",
-                source_display(source)
-            ));
-        }
+fn emit_image_source(
+    state: &mut RenderState,
+    source: &ImageSource,
+    out: &mut String,
+    blocks: &mut Vec<OutputBlock>,
+) {
+    let max_w = sixel::terminal_pixel_width();
+    if let Some(media) = encode_from_source(source, max_w) {
+        flush_text(out, blocks, &mut state.pending_wikilinks);
+        push_media(
+            media,
+            &mut state.pending_images,
+            &mut state.pending_gifs,
+            blocks,
+        );
+    } else {
+        out.push_str(&format!(
+            "\x1b[2m[image: {}]\x1b[0m",
+            source_display(source)
+        ));
     }
 }
 
@@ -519,620 +186,18 @@ fn resolve_image_source(
     }
 }
 
-// ---------------------------------------------------------------------------
-// CSS style → ANSI escape conversion
-// ---------------------------------------------------------------------------
+// CSS/HTML processing is in the html submodule.
+use html::handle_block_html;
+use html::handle_inline_html;
 
-/// Parse a CSS `style` attribute value and return ANSI escape sequences.
-///
-/// Handles `color`, `background-color`, `font-weight`, `font-style`,
-/// and `text-decoration` properties.
-fn css_style_to_ansi(style: &str) -> String {
-    let mut result = String::new();
+// Table types and rendering are in the table submodule.
+pub use table::RenderedTable;
+pub use table::RenderedTableCell;
+use table::TableCell;
+use table::TableState;
+use table::flush_table;
+use table::render_image_in_table_cell;
 
-    for decl in style.split(';') {
-        let decl = decl.trim();
-        if decl.is_empty() {
-            continue;
-        }
-        let Some((prop, value)) = decl.split_once(':') else {
-            continue;
-        };
-        let prop = prop.trim().to_ascii_lowercase();
-        let value = value.trim();
-
-        match prop.as_str() {
-            "color" => {
-                if let Some((r, g, b)) = parse_css_color_simple(value) {
-                    result.push_str(&ansi::fg_rgb(r, g, b));
-                }
-            }
-            "background-color" | "background" => {
-                if let Some((r, g, b)) = parse_css_color_simple(value) {
-                    result.push_str(&ansi::bg_rgb(r, g, b));
-                }
-            }
-            "font-weight" => {
-                let v = value.to_ascii_lowercase();
-                if v == "bold" || v == "700" || v == "800" || v == "900" {
-                    result.push_str(ansi::BOLD);
-                }
-            }
-            "font-style" => {
-                let v = value.to_ascii_lowercase();
-                if v == "italic" || v == "oblique" {
-                    result.push_str(ansi::ITALIC);
-                }
-            }
-            "text-decoration" | "text-decoration-line" => {
-                let v = value.to_ascii_lowercase();
-                if v.contains("underline") {
-                    result.push_str(ansi::UNDERLINE);
-                }
-                if v.contains("line-through") {
-                    result.push_str(ansi::STRIKETHROUGH);
-                }
-                if v.contains("overline") {
-                    result.push_str(ansi::OVERLINE);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    result
-}
-
-/// Parse a CSS color value from a string (named colors, #hex, rgb()).
-fn parse_css_color_simple(style_value: &str) -> Option<(u8, u8, u8)> {
-    crate::theme::parse_color(style_value)
-}
-
-// ---------------------------------------------------------------------------
-// HTML parsing via quick-xml
-// ---------------------------------------------------------------------------
-
-use quick_xml::events::Event as XmlEvent;
-use quick_xml::reader::Reader as XmlReader;
-
-/// Get an attribute value from a quick-xml `BytesStart` tag.
-fn xml_attr(
-    tag: &quick_xml::events::BytesStart<'_>,
-    name: &[u8],
-) -> Option<String> {
-    tag.attributes()
-        .filter_map(|a| a.ok())
-        .find(|a| a.key.as_ref() == name)
-        .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
-}
-
-/// Get the lowercase tag name from a quick-xml `BytesStart`.
-fn xml_tag_name(tag: &quick_xml::events::BytesStart<'_>) -> String {
-    String::from_utf8_lossy(tag.name().as_ref()).to_ascii_lowercase()
-}
-
-/// Handle an inline HTML tag event, modifying state and appending to output.
-///
-/// pulldown-cmark emits each inline HTML tag as a separate string like
-/// `<b>`, `</b>`, `<a href="...">`, `<br>`, `<img src="...">`.
-fn handle_inline_html(
-    tag_str: &str,
-    state: &mut RenderState,
-    out: &mut String,
-    blocks: &mut Vec<OutputBlock>,
-) {
-    let mut reader = XmlReader::from_str(tag_str);
-    reader.config_mut().check_end_names = false;
-    reader.config_mut().allow_unmatched_ends = true;
-
-    while let Ok(event) = reader.read_event() {
-        match event {
-            XmlEvent::Start(ref e) | XmlEvent::Empty(ref e) => {
-                handle_html_open_tag(&xml_tag_name(e), e, state, out, blocks);
-            }
-            XmlEvent::End(ref e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
-                handle_html_close_tag(&name, state, out);
-            }
-            XmlEvent::Eof => break,
-            _ => {}
-        }
-    }
-}
-
-/// Process an opening (or self-closing) HTML tag.
-fn handle_html_open_tag(
-    name: &str,
-    tag: &quick_xml::events::BytesStart<'_>,
-    state: &mut RenderState,
-    out: &mut String,
-    blocks: &mut Vec<OutputBlock>,
-) {
-    match name {
-        "b" | "strong" => {
-            state.bold = true;
-            if state.heading_level == 0 {
-                out.push_str(ansi::BOLD);
-            }
-        }
-        "i" | "em" => {
-            state.italic = true;
-            if state.heading_level == 0 {
-                out.push_str(ansi::ITALIC);
-            }
-        }
-        "del" | "s" | "strike" => {
-            state.strikethrough = true;
-            if state.heading_level == 0 {
-                out.push_str(ansi::STRIKETHROUGH);
-            }
-        }
-        "code" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::DIM);
-            }
-        }
-        "a" => {
-            let url = xml_attr(tag, b"href").unwrap_or_default();
-            if state.heading_level == 0 {
-                out.push_str(&ansi::link_start(&url));
-                out.push_str(ansi::UNDERLINE);
-            }
-            state.link_url = Some(url);
-        }
-        "br" => {
-            if state.heading_level > 0 {
-                state.heading_text.push(' ');
-            } else {
-                out.push('\n');
-            }
-        }
-        "img" | "video" => {
-            if let Some(src) = xml_attr(tag, b"src")
-                && let Some(source) = resolve_image_source(&src, &state.base_path)
-            {
-                state.emit_image_source(&source, out, blocks);
-            }
-        }
-        "hr" => {
-            out.push_str(&"\u{2500}".repeat(40));
-            out.push('\n');
-        }
-        "u" | "ins" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::UNDERLINE);
-            }
-        }
-        "mark" => {
-            if state.heading_level == 0 {
-                // Yellow background highlight
-                out.push_str(&ansi::bg_rgb(255, 255, 0));
-                out.push_str(&ansi::fg_rgb(0, 0, 0));
-            }
-        }
-        "kbd" | "samp" => {
-            if state.heading_level == 0 {
-                // Reverse video for keyboard/sample
-                out.push_str(ansi::DIM);
-                out.push(' ');
-            }
-        }
-        "var" | "cite" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::ITALIC);
-            }
-        }
-        "sup" => {
-            // Terminal can't do real superscript — just use dim
-            if state.heading_level == 0 {
-                out.push_str(ansi::DIM);
-            }
-        }
-        "sub" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::DIM);
-            }
-        }
-        // <span> and <div> — apply CSS styles if present
-        "span" | "div" | "p" => {
-            if state.heading_level == 0
-                && let Some(style) = xml_attr(tag, b"style")
-            {
-                out.push_str(&css_style_to_ansi(&style));
-            }
-        }
-        _ => {
-            // For any unknown tag, still try to apply style attribute
-            if state.heading_level == 0
-                && let Some(style) = xml_attr(tag, b"style")
-            {
-                out.push_str(&css_style_to_ansi(&style));
-            }
-        }
-    }
-}
-
-/// Process a closing HTML tag.
-fn handle_html_close_tag(
-    name: &str,
-    state: &mut RenderState,
-    out: &mut String,
-) {
-    match name {
-        "b" | "strong" => {
-            state.bold = false;
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-        "i" | "em" | "var" | "cite" => {
-            state.italic = false;
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-        "del" | "s" | "strike" => {
-            state.strikethrough = false;
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-        "code" | "sup" | "sub" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-        "u" | "ins" | "mark" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-        "kbd" | "samp" => {
-            if state.heading_level == 0 {
-                out.push(' ');
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-        "a" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                out.push_str(&ansi::link_end());
-            }
-            state.link_url = None;
-        }
-        // Styled elements — just reset
-        "span" | "div" => {
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-        _ => {
-            // Reset after any unknown styled element
-            if state.heading_level == 0 {
-                out.push_str(ansi::RESET);
-                push_active_styles(state.bold, state.italic, state.strikethrough, out);
-            }
-        }
-    }
-}
-
-/// Handle a block-level HTML string accumulated from one or more `Html` events.
-///
-/// Uses quick-xml to walk the tags and text, dispatching to the same rendering
-/// logic used for inline tags, plus block-level elements like `<h1>`-`<h6>`,
-/// `<pre>`, `<hr>`, `<blockquote>`, etc.
-fn handle_block_html(
-    html: &str,
-    state: &mut RenderState,
-    out: &mut String,
-    blocks: &mut Vec<OutputBlock>,
-    font: &Font,
-    theme: &crate::theme::Theme,
-) {
-    let html = html.trim();
-    if html.is_empty() {
-        return;
-    }
-
-    let mut reader = XmlReader::from_str(html);
-    reader.config_mut().check_end_names = false;
-    reader.config_mut().allow_unmatched_ends = true;
-
-    // Track the outermost block element so we know how to wrap content.
-    let mut block_tag: Option<String> = None;
-    let mut text_buf = String::new();
-    let mut in_pre = false;
-
-    loop {
-        match reader.read_event() {
-            Ok(XmlEvent::Start(ref e)) => {
-                let name = xml_tag_name(e);
-                match name.as_str() {
-                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "pre" | "blockquote"
-                    | "summary" => {
-                        block_tag = Some(name.clone());
-                        text_buf.clear();
-                        if name == "pre" {
-                            in_pre = true;
-                        }
-                    }
-                    "details" => {
-                        let id = state.next_details_id;
-                        state.next_details_id += 1;
-                        flush_text(out, blocks, &mut state.pending_wikilinks);
-                        blocks.push(OutputBlock::DetailsStart { id });
-                    }
-                    "hr" => {
-                        out.push_str(&"\u{2500}".repeat(40));
-                        out.push('\n');
-                    }
-                    "img" | "video" => {
-                        if let Some(src) = xml_attr(e, b"src")
-                            && let Some(source) = resolve_image_source(&src, &state.base_path)
-                        {
-                            state.emit_image_source(&source, out, blocks);
-                        }
-                    }
-                    "br" => {
-                        if block_tag.is_some() {
-                            text_buf.push('\n');
-                        } else {
-                            out.push('\n');
-                        }
-                    }
-                    // Nested inline tags inside blocks — just collect text
-                    "code" | "b" | "strong" | "i" | "em" | "a" | "del" | "s" | "strike" => {}
-                    _ => {}
-                }
-            }
-            Ok(XmlEvent::Empty(ref e)) => {
-                let name = xml_tag_name(e);
-                match name.as_str() {
-                    "hr" => {
-                        out.push_str(&"\u{2500}".repeat(40));
-                        out.push('\n');
-                    }
-                    "br" => {
-                        if block_tag.is_some() {
-                            text_buf.push('\n');
-                        } else {
-                            out.push('\n');
-                        }
-                    }
-                    "img" | "video" => {
-                        if let Some(src) = xml_attr(e, b"src")
-                            && let Some(source) = resolve_image_source(&src, &state.base_path)
-                        {
-                            state.emit_image_source(&source, out, blocks);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(XmlEvent::Text(ref e)) => {
-                if let Ok(text) = e.html_content() {
-                    if block_tag.is_some() {
-                        text_buf.push_str(&text);
-                    } else {
-                        out.push_str(&text);
-                    }
-                }
-            }
-            Ok(XmlEvent::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
-                if name == "details" {
-                    // Emit end-of-details marker
-                    let id = state.next_details_id.saturating_sub(1);
-                    flush_text(out, blocks, &mut state.pending_wikilinks);
-                    blocks.push(OutputBlock::DetailsEnd { id });
-                } else if block_tag.as_deref() == Some(name.as_str()) {
-                    emit_block(&name, &text_buf, state, out, blocks, font, theme, in_pre);
-                    block_tag = None;
-                    text_buf.clear();
-                    in_pre = false;
-                }
-            }
-            Ok(XmlEvent::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-    }
-
-    // If there's leftover text with no block wrapper, output it
-    if !text_buf.is_empty() {
-        if let Some(tag) = &block_tag {
-            emit_block(tag, &text_buf, state, out, blocks, font, theme, in_pre);
-        } else {
-            out.push_str(&text_buf);
-            out.push('\n');
-        }
-    }
-}
-
-/// Emit a completed block element.
-#[allow(clippy::too_many_arguments)]
-fn emit_block(
-    tag: &str,
-    text: &str,
-    state: &mut RenderState,
-    out: &mut String,
-    blocks: &mut Vec<OutputBlock>,
-    font: &Font,
-    theme: &crate::theme::Theme,
-    in_pre: bool,
-) {
-    let text = if in_pre {
-        text.to_string()
-    } else {
-        text.trim().to_string()
-    };
-
-    match tag {
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-            let level: usize = tag[1..].parse().unwrap_or(1);
-            if !text.is_empty() {
-                state.heading_text = text.to_string();
-                state.heading_level = level;
-                render_heading_sixel(state, out, blocks, font, theme);
-            }
-        }
-        "p" => {
-            out.push_str(&text);
-            out.push_str(ansi::RESET);
-            out.push_str("\n\n");
-        }
-        "pre" => {
-            out.push_str(ansi::DIM);
-            out.push_str("  ");
-            for (i, line) in text.lines().enumerate() {
-                if i > 0 {
-                    out.push_str("\n  ");
-                }
-                out.push_str(line);
-            }
-            out.push_str(ansi::RESET);
-            out.push_str("\n\n");
-        }
-        "blockquote" => {
-            out.push_str(ansi::DIM);
-            out.push_str("  \u{2502} ");
-            out.push_str(&text);
-            out.push_str(ansi::RESET);
-            out.push_str("\n\n");
-        }
-        "summary" => {
-            if !text.is_empty() {
-                // Emit a summary marker — the pager renders this with a
-                // disclosure triangle and handles expand/collapse.
-                let id = state.next_details_id.saturating_sub(1);
-                flush_text(out, blocks, &mut state.pending_wikilinks);
-                blocks.push(OutputBlock::DetailsSummary {
-                    id,
-                    text: text.to_string(),
-                });
-            }
-        }
-        _ => {
-            if !text.is_empty() {
-                out.push_str(&text);
-                out.push('\n');
-            }
-        }
-    }
-
-    let _ = state; // avoid unused warning
-}
-
-/// Render a table with Unicode box-drawing borders.
-fn flush_table(
-    state: &mut RenderState,
-    out: &mut String,
-    blocks: &mut Vec<OutputBlock>,
-) {
-    let table = state
-        .table
-        .take()
-        .expect("flush_table called outside table");
-    let header_cells = table.header;
-    let row_cells = table.rows;
-    let alignments = table.alignments;
-
-    let build_rendered_row = |cells: &[TableCell], is_header: bool| -> Vec<RenderedTableCell> {
-        cells
-            .iter()
-            .map(|cell| {
-                if let Some(ref img) = cell.image {
-                    RenderedTableCell {
-                        text_lines: img.preview.clone(),
-                        sixel: img.sixel.clone(),
-                        gif_id: img.gif_id,
-                        width: img.width_cols as usize,
-                        height: img.height_rows as usize,
-                    }
-                } else {
-                    let styled = styled_cell_text(cell, is_header);
-                    let lines: Vec<String> = styled.split('\n').map(|s| s.to_string()).collect();
-                    let width = lines
-                        .iter()
-                        .map(|l| ansi::visible_len(l))
-                        .max()
-                        .unwrap_or(0);
-                    let height = lines.len().max(1);
-                    RenderedTableCell {
-                        text_lines: lines,
-                        sixel: None,
-                        gif_id: None,
-                        width,
-                        height,
-                    }
-                }
-            })
-            .collect()
-    };
-
-    let header = header_cells.as_ref().map(|h| build_rendered_row(h, true));
-    let rows: Vec<Vec<RenderedTableCell>> = row_cells
-        .iter()
-        .map(|r| build_rendered_row(r, false))
-        .collect();
-
-    // Compute column widths
-    let col_count = alignments.len().max(
-        header
-            .iter()
-            .chain(rows.iter())
-            .map(|r| r.len())
-            .max()
-            .unwrap_or(0),
-    );
-    let mut col_widths = vec![0usize; col_count];
-    for row in header.iter().chain(rows.iter()) {
-        for (col, cell) in row.iter().enumerate() {
-            if col < col_count {
-                col_widths[col] = col_widths[col].max(cell.width);
-            }
-        }
-    }
-
-    flush_text(out, blocks, &mut state.pending_wikilinks);
-    blocks.push(OutputBlock::Table(RenderedTable {
-        col_widths,
-        alignments,
-        header,
-        rows,
-    }));
-}
-
-fn styled_cell_text(
-    cell: &TableCell,
-    is_header: bool,
-) -> String {
-    let mut s = String::new();
-    if is_header {
-        s.push_str(ansi::BOLD);
-    }
-    if cell.bold {
-        s.push_str(ansi::BOLD);
-    }
-    if cell.italic {
-        s.push_str(ansi::ITALIC);
-    }
-    if cell.code {
-        s.push_str(ansi::DIM);
-    }
-    s.push_str(&cell.text);
-    if cell.bold || cell.italic || cell.code || is_header {
-        s.push_str(ansi::RESET);
-    }
-    s
-}
 /// Output from rendering markdown, containing the text output and any
 /// images still being encoded in background threads.
 /// A rendered code block with syntax-highlighted lines.
@@ -1221,29 +286,27 @@ pub struct RenderOutput {
     pub code_blocks: Vec<CodeBlock>,
 }
 
-impl RenderOutput {
-    /// Re-wrap all text blocks at a new width without re-encoding images.
-    /// This is much cheaper than a full re-render.
-    pub fn rewrap(
-        &mut self,
-        width: u16,
-        theme: &crate::theme::Theme,
-    ) {
-        for block in &mut self.blocks {
-            if let OutputBlock::Text { wrapped, raw, .. } = block {
-                match raw {
-                    RawText::Plain(text) => {
-                        let mut new = ansi::wrap(text, width);
-                        new.push_str("\n\n");
-                        *wrapped = new;
-                    }
-                    RawText::Blockquote { text, depth } => {
-                        let mut new = wrap_blockquote(text, *depth, width, theme);
-                        new.push_str("\n\n");
-                        *wrapped = new;
-                    }
-                    RawText::Verbatim => {}
+/// Re-wrap all text blocks at a new width without re-encoding images.
+/// This is much cheaper than a full re-render.
+pub fn rewrap_output(
+    output: &mut RenderOutput,
+    width: u16,
+    theme: &crate::theme::Theme,
+) {
+    for block in &mut output.blocks {
+        if let OutputBlock::Text { wrapped, raw, .. } = block {
+            match raw {
+                RawText::Plain(text) => {
+                    let mut new = ansi::wrap(text, width);
+                    new.push_str("\n\n");
+                    *wrapped = new;
                 }
+                RawText::Blockquote { text, depth } => {
+                    let mut new = wrap_blockquote(text, *depth, width, theme);
+                    new.push_str("\n\n");
+                    *wrapped = new;
+                }
+                RawText::Verbatim => {}
             }
         }
     }
@@ -1719,72 +782,6 @@ fn end_code_block(
         max_width,
     });
     state.code_lang = None;
-}
-
-fn render_image_in_table_cell(
-    path: &std::path::Path,
-    state: &mut RenderState,
-) {
-    let max_cols: u32 = 30;
-    let max_px = max_cols * sixel::cell_pixel_width();
-
-    // Try animated encoding (video/GIF) — skip static async since
-    // table cells use synchronous encoding with height snapping
-    let animated = if sixel::is_video(path) {
-        sixel::encode_video_async(path, max_px)
-    } else {
-        sixel::encode_gif_async(path, max_px)
-    };
-    if let Some(pending) = animated {
-        let gif_id = state.pending_gifs.len();
-        let cols = pending
-            .preview
-            .first()
-            .map(|l| ansi::visible_len(l) as u32)
-            .unwrap_or(1)
-            .min(max_cols);
-        let rows = pending.estimated_rows;
-        let preview = pending.preview.clone();
-        state.pending_gifs.push(pending);
-        state.table().cell_image = Some(TableCellImage {
-            sixel: None,
-            gif_id: Some(gif_id),
-            preview,
-            width_cols: cols,
-            height_rows: rows,
-        });
-        return;
-    }
-
-    // Static image fallback — synchronous encoding with height snapping
-    let img = match image::open(path) {
-        Ok(img) => img.to_rgba8(),
-        Err(_) => return,
-    };
-
-    let img = sixel::scale_image(img, max_px);
-    let cols = sixel::preview_columns(img.width()).min(max_cols);
-
-    let snapped_h = sixel::snap_height_to_cells(img.height());
-    let rows = sixel::pixel_height_to_rows(snapped_h);
-
-    let mut padded = img.clone();
-    if snapped_h > padded.height() {
-        let mut new_img = image::RgbaImage::new(padded.width(), snapped_h);
-        image::imageops::overlay(&mut new_img, &padded, 0, 0);
-        padded = new_img;
-    }
-
-    let sixel = sixel::encode_rgba(padded.width(), snapped_h, padded.as_raw());
-    let preview = sixel::half_block_preview(&img, cols, rows);
-
-    state.table().cell_image = Some(TableCellImage {
-        sixel: Some(sixel),
-        gif_id: None,
-        preview,
-        width_cols: cols,
-        height_rows: rows,
-    });
 }
 
 /// Render markdown into a sequence of output blocks.
@@ -2355,6 +1352,8 @@ mod tests {
     }
 
     // ── css_style_to_ansi ────────────────────────────────────────
+
+    use super::html::css_style_to_ansi;
 
     #[test]
     fn css_color_to_ansi() {
